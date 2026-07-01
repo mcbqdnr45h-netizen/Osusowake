@@ -54,7 +54,7 @@ export default function StoreDetailPublic() {
   // Google Maps ルート案内リンク。 登録ピン(lat/lng)は店が手動でズレた位置に置ける(draggable)ため、
   // 表示住所と食い違うと案内先が別の場所になる。 表示している住所を基準にして一致させる。
   const mapsUrl = store?.address
-    ? `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(store.address)}`
+    ? `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${store.name} ${store.address}`)}`
     : null;
 
   if (storeLoading) {
@@ -247,7 +247,7 @@ export default function StoreDetailPublic() {
           {/* ── Googleマップで開く（サブリンク）── */}
           {mapsUrl && (
             <a
-              href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(store.address)}`}
+              href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${store.name} ${store.address}`)}`}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center justify-center gap-2 text-sm font-bold text-muted-foreground hover:text-foreground transition-colors py-2"
