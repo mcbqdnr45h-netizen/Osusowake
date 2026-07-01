@@ -29,6 +29,7 @@ import { ja } from 'date-fns/locale';
 import { ImageUpload } from '@/components/ImageUpload';
 import { BagManageCard, getBagStatus, type Bag, type BagRealStatus } from '@/components/BagManageCard';
 import { CategoryPicker } from '@/components/CategoryPicker';
+import { TimePicker } from '@/components/TimePicker';
 
 // ─── 型 ────────────────────────────────────────────────────────────────────
 type ReservationStatus = 'pending' | 'confirmed' | 'picked_up' | 'cancelled';
@@ -560,18 +561,8 @@ function PostBagModal({
                       <div>
                         <p className="text-xs font-bold text-muted-foreground mb-2">受取時間</p>
                         <div className="space-y-1.5">
-                          <input
-                            type="time"
-                            value={quickPickupStart}
-                            onChange={e => setQuickPickupStart(e.target.value)}
-                            className="w-full bg-white border-2 border-border rounded-xl px-3 py-2 font-bold text-sm focus:border-primary outline-none transition-all"
-                          />
-                          <input
-                            type="time"
-                            value={quickPickupEnd}
-                            onChange={e => setQuickPickupEnd(e.target.value)}
-                            className="w-full bg-white border-2 border-border rounded-xl px-3 py-2 font-bold text-sm focus:border-primary outline-none transition-all"
-                          />
+                          <TimePicker value={quickPickupStart} onChange={setQuickPickupStart} label="受取 開始" />
+                          <TimePicker value={quickPickupEnd} onChange={setQuickPickupEnd} label="受取 終了" />
                         </div>
                       </div>
                     </div>
@@ -884,10 +875,10 @@ function PostBagModal({
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-bold text-muted-foreground mb-1.5">{pickupNextDay ? '翌日 受取開始' : '受取開始'}</label>
-                  <div className="flex gap-1.5">
-                    <input type="time" required value={form.pickupStart}
-                      onChange={e => setForm({ ...form, pickupStart: e.target.value })}
-                      className="flex-1 min-w-0 bg-secondary/40 border-2 border-border rounded-xl px-2 py-3 font-bold focus:border-primary outline-none transition-all text-sm" />
+                  <div className="flex gap-1.5 items-start">
+                    <div className="flex-1 min-w-0">
+                      <TimePicker value={form.pickupStart} onChange={v => setForm({ ...form, pickupStart: v })} label="受取 開始" />
+                    </div>
                     <button
                       type="button"
                       onClick={() => {
@@ -896,7 +887,7 @@ function PostBagModal({
                         const mm = now.getMinutes().toString().padStart(2, '0');
                         setForm({ ...form, pickupStart: `${hh}:${mm}` });
                       }}
-                      className="shrink-0 px-2 py-1 bg-primary/10 text-primary text-[10px] font-black rounded-lg hover:bg-primary/20 active:bg-primary/30 transition-colors leading-tight text-center"
+                      className="shrink-0 px-2 py-3 bg-primary/10 text-primary text-[10px] font-black rounded-lg hover:bg-primary/20 active:bg-primary/30 transition-colors leading-tight text-center"
                     >
                       今<br />すぐ
                     </button>
@@ -904,9 +895,7 @@ function PostBagModal({
                 </div>
                 <div>
                   <label className="block text-xs font-bold text-muted-foreground mb-1.5">{twoShift ? '1部 受取終了' : '受取終了'}</label>
-                  <input type="time" required value={form.pickupEnd}
-                    onChange={e => setForm({ ...form, pickupEnd: e.target.value })}
-                    className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-3 font-bold focus:border-primary outline-none transition-all" />
+                  <TimePicker value={form.pickupEnd} onChange={v => setForm({ ...form, pickupEnd: v })} label={twoShift ? '1部 受取終了' : '受取 終了'} />
                 </div>
               </div>
 
@@ -925,13 +914,11 @@ function PostBagModal({
                   <div className="grid grid-cols-2 gap-3 mt-3">
                     <div>
                       <label className="block text-xs font-bold text-muted-foreground mb-1.5">2部 受取開始</label>
-                      <input type="time" value={pickupStart2} onChange={e => setPickupStart2(e.target.value)}
-                        className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-3 font-bold focus:border-primary outline-none transition-all" />
+                      <TimePicker value={pickupStart2} onChange={setPickupStart2} label="2部 受取開始" />
                     </div>
                     <div>
                       <label className="block text-xs font-bold text-muted-foreground mb-1.5">2部 受取終了</label>
-                      <input type="time" value={pickupEnd2} onChange={e => setPickupEnd2(e.target.value)}
-                        className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-3 font-bold focus:border-primary outline-none transition-all" />
+                      <TimePicker value={pickupEnd2} onChange={setPickupEnd2} label="2部 受取終了" />
                     </div>
                   </div>
                 )}
@@ -1208,15 +1195,13 @@ function EditBagModal({
           <div>
             <label className="text-xs font-black text-muted-foreground uppercase tracking-widest mb-1.5 block">受け取り時間</label>
             <div className="flex items-center gap-3">
-              <input type="time" value={form.pickupStart}
-                onChange={e => setForm(f => ({ ...f, pickupStart: e.target.value }))}
-                className="flex-1 border border-border rounded-xl px-3 py-3 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-primary/40 bg-background"
-              />
+              <div className="flex-1">
+                <TimePicker value={form.pickupStart} onChange={v => setForm(f => ({ ...f, pickupStart: v }))} label="受取 開始" />
+              </div>
               <span className="text-muted-foreground font-bold">〜</span>
-              <input type="time" value={form.pickupEnd}
-                onChange={e => setForm(f => ({ ...f, pickupEnd: e.target.value }))}
-                className="flex-1 border border-border rounded-xl px-3 py-3 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-primary/40 bg-background"
-              />
+              <div className="flex-1">
+                <TimePicker value={form.pickupEnd} onChange={v => setForm(f => ({ ...f, pickupEnd: v }))} label="受取 終了" />
+              </div>
             </div>
           </div>
 
