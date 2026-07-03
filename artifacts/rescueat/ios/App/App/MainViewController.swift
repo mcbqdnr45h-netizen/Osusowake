@@ -53,8 +53,17 @@ class MainViewController: CAPBridgeViewController {
         installCover()
         configureWebViewIfPossible()
 
-        // フェイルセーフ: 何があってもカバーは最大 8s で必ず外す (永久カバー防止)。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+        // ★★ カバーは「黒フラッシュを隠す」ためだけの短命オーバーレイ。
+        //   黒フラッシュは WebContent が初回ペイントを返すまでの ~0.6〜1.0s だけ。
+        //   しかも webView(with:) で isOpaque=false + cream 背景を焼き込んでいるので、
+        //   カバーが無くても最悪 cream が見えるだけで「黒」は物理的に出ない。
+        //   → カバーを全リソース読込完了 (estimatedProgress 0.98) まで保持する必要は一切なく、
+        //     それをやると リモートの cold load でカバーが 20〜25s も画面を覆い、
+        //     背後で数秒で動いている React アプリを隠してしまう (App Store 版=カバー無しは即表示なので
+        //     「新ビルドだけ異様に遅い」の正体)。 よって短い固定タイマー (1.5s) で必ず剥がす。
+        //   ※ 0.98 到達時の早期撤去 (configureWebViewIfPossible の observer) は温存 →
+        //     warm load ではさらに早く綺麗に消える。 cold load はこの 1.5s が上限。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.removeCover(afterDelay: 0)
         }
     }
