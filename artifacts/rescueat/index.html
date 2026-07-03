@@ -132,6 +132,18 @@
           splash.classList.add('__hide');
           setTimeout(function () {
             if (splash && splash.parentNode) splash.parentNode.removeChild(splash);
+            // ★ web スプラッシュを DOM から「完全除去した後」に、iOS ネイティブ cover へ
+            //   除去を許可する (MainViewController が coverOff を待って cover を外す)。
+            //   この時点で画面の下地は React 本体のみ＝スプラッシュのロゴは存在しない。
+            //   よって cover を外しても「落ちるロゴ」が物理的に無く、位置ズレに関係なく
+            //   ドロップは構造的に発生しない。 cover 保持中(それまで)は web の初回描画も
+            //   全て隠れているので、黒/白/ズレは一切見えない。
+            //   非iOS (Android/PWA) では webkit.messageHandlers が無いので何も起きない。
+            try {
+              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.coverOff) {
+                window.webkit.messageHandlers.coverOff.postMessage('off');
+              }
+            } catch (e) {}
           }, 400);
         };
         var root = document.getElementById('root');

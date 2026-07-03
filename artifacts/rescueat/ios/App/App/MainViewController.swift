@@ -1,5 +1,6 @@
 import UIKit
 import Capacitor
+import WebKit
 
 // ★ 起動時の黒画面対策専用のブリッジ VC サブクラス。
 //
@@ -13,7 +14,7 @@ import Capacitor
 //   WebView の上に敷き、リモートページのロード完了 (estimatedProgress≒1.0) まで
 //   保持する。LaunchScreen とピクセル一致するのでハンドオフはシームレス。
 //   → 起動〜Web 初回ペイントまで一貫してクリーム。黒フレームが物理的に出ない。
-class MainViewController: CAPBridgeViewController {
+class MainViewController: CAPBridgeViewController, WKScriptMessageHandler {
 
     private let brand = UIColor(red: 0.984, green: 0.973, blue: 0.957, alpha: 1.0)
     private var coverView: UIView?
@@ -33,11 +34,28 @@ class MainViewController: CAPBridgeViewController {
     //   ここ(生成点)で非不透明化すれば、WebView は一度も不透明黒を持たない。
     //   → 起動ズーム〜Web 初回ペイントまで、下地の cream が透けて黒フレームが物理的に出ない。
     override func webView(with frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
+        // ★ web (index.html) が「React 描画完了 & web スプラッシュ DOM 除去完了」時に
+        //   投げる postMessage("coverOff") を受ける口を、WKWebView 生成前に登録する。
+        //   これが cover を外す唯一のトリガー (下の userContentController で処理)。
+        configuration.userContentController.add(self, name: "coverOff")
         let wv = super.webView(with: frame, configuration: configuration)
         wv.isOpaque = false
         wv.backgroundColor = brand
         wv.scrollView.backgroundColor = brand
         return wv
+    }
+
+    // ★★ 保証の核心: cover を外すのは「web が coverOff を投げた瞬間」だけ。
+    //   web は React 本体を #root に描画し、かつ web スプラッシュを DOM から完全除去した
+    //   "後" に coverOff を投げる (index.html)。 つまりこの通知が来た時点で、cover の
+    //   下地は React アプリ本体のみ＝「落ちるロゴ」が画面に物理的に存在しない。
+    //   だから cover をここで外しても、位置ズレの有無に関係なくドロップは構造的に不可能。
+    //   (従来の estimatedProgress≥0.98 トリガーは React マウント前に発火し得てズレた
+    //    web スプラッシュを露出させる元凶だったので撤去した。)
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "coverOff" {
+            removeCover(afterDelay: 0)
+        }
     }
 
     // ★ webView 生成直後・hierarchy 追加前に呼ばれる最早フック。ここでも冪等に固める。
@@ -102,15 +120,10 @@ class MainViewController: CAPBridgeViewController {
         wv.isOpaque = false
         wv.backgroundColor = brand
         wv.scrollView.backgroundColor = brand
-        // 進捗監視は一度だけ。
-        if !webViewConfigured {
-            webViewConfigured = true
-            progressObs = wv.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
-                if webView.estimatedProgress >= 0.98 {
-                    self?.removeCover(afterDelay: 0.35)
-                }
-            }
-        }
+        // ★ cover 除去は coverOff (web→native) のみが担う。 estimatedProgress≥0.98 は
+        //   React マウント前に発火してズレた web スプラッシュを露出させる元凶だったので
+        //   トリガーから撤去。 万一 coverOff が届かない異常系は viewDidLoad の 8s 失効が拾う。
+        _ = webViewConfigured
     }
 
     // LaunchScreen.storyboard と同一構成: 全画面クリーム + 物理スクリーン全体に敷いた aspectFit ロゴ。
