@@ -5,6 +5,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { rateLimit, ipKeyGenerator } from "express-rate-limit";
 import router from "./routes";
+import { seoRouter } from "./seo";
 
 const app: Express = express();
 
@@ -127,6 +128,11 @@ app.use((req, res, next) => {
 });
 
 app.use("/api", router);
+
+// ── SEO: robots.txt + sitemap.xml (SPA フォールバックより前に必須) ─────────────
+// 下の app.get(/^\/(?!api\/).*/) が非 /api GET を全部 index.html で返すため、これを
+// 先にマウントしないと /robots.txt /sitemap.xml も HTML になりクローラが認識できない。
+app.use(seoRouter);
 
 // ── SPA 静的配信 (Fly.io 単一オリジン用) ──────────────────────────────────────
 // Dockerfile が rescueat の dist/public を /app/public にコピーし STATIC_DIR を渡す。
