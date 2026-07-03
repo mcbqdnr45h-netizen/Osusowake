@@ -68,34 +68,54 @@
       自動で fade out → 完全消滅させる。
     -->
     <style>
+      /* ★ Web 側の初回ペイントをクリームに固定 (白/黒フラッシュ防止)。
+         WebView 背景 (#FBF8F4) / ネイティブ LaunchScreen とも同色でシームレス。 */
+      html, body { margin: 0; padding: 0; background: #FBF8F4; }
       #__splash {
         position: fixed; inset: 0; z-index: 999999;
-        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        display: flex; align-items: center; justify-content: center;
         background: #FBF8F4;
         transition: opacity .35s ease-out;
         pointer-events: none;
       }
       #__splash.__hide { opacity: 0; }
+      /* ★ ネイティブ (LaunchScreen.storyboard / MainViewController) と完全一致させる。
+         ネイティブは正方形 Splash 画像 (cream 背景 + 中央ロゴ) を scaleAspectFit で
+         全画面表示している。 Web も「同一の正方形画像」を object-fit:contain で全画面
+         表示する → 画面上のロゴ位置・サイズがネイティブとピクセル完全一致。
+         これで native→web ハンドオフ時に「ロゴが落ちる/ずれる/サイズが飛ぶ」が
+         物理的に発生しない (同じ画像を同じ規則で描くだけなので差分ゼロ)。
+         ※ 旧版は logo-192.png を 33vw 中央寄せしていたが、ネイティブ Splash 画像内で
+           ロゴが縦中央より 13% 上にあったため、中央寄せの web と縦位置がズレて
+           「下にストンと落ちる」現象が出ていた (2026-07-04 実測・修正)。 */
       #__splash img {
-        width: 96px; height: 96px; border-radius: 28px;
-        box-shadow: 0 12px 28px -10px rgba(232,120,108,.35);
-        animation: __splashPulse 1.6s ease-in-out infinite;
-      }
-      #__splash .__brand {
-        margin-top: 18px; font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
-        font-weight: 900; font-size: 15px; color: #2A2623; letter-spacing: .04em;
-      }
-      @keyframes __splashPulse {
-        0%, 100% { transform: scale(1);    opacity: 1;    }
-        50%      { transform: scale(1.05); opacity: .85;  }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        #__splash img { animation: none; }
+        width: 100%; height: 100%; object-fit: contain;
       }
     </style>
     <div id="__splash" aria-hidden="true">
-      <img src="/images/logo-192.png" alt="" />
+      <img src="/images/splash-square.png" alt="" />
     </div>
+    <script>
+      // ★ ネイティブ StatusBar.overlaysWebView:false のため、WKWebView はステータスバー
+      //   ストリップの「下」に配置され、画面より (screen.height - innerHeight) だけ縦に短い。
+      //   #__splash は position:fixed;inset:0 でこの「短い WebView」の中央にロゴを置くため、
+      //   真の画面中央より (screen.height - innerHeight)/2 px だけ下にずれる (実機で +80 device px)。
+      //   ネイティブ LaunchScreen は全画面 (edge-to-edge) で真の 50% に描くので、web だけが下がる。
+      //   → ロゴを同量だけ上へ平行移動し、ネイティブと画面上でピクセル一致させる。
+      //   (実測 beacon: fixOff=27css → imgTop=-27 → logo center=437=874/2 で完全中央)
+      (function () {
+        var img = document.querySelector('#__splash img');
+        if (!img) return;
+        function center() {
+          var off = Math.max(0, (window.screen.height - window.innerHeight) / 2);
+          img.style.transform = 'translateY(' + (-off) + 'px)';
+        }
+        center();
+        window.addEventListener('resize', center);
+        window.addEventListener('orientationchange', center);
+        if (window.visualViewport) window.visualViewport.addEventListener('resize', center);
+      })();
+    </script>
 
     <div id="root"></div>
     <script>
