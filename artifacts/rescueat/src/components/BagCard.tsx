@@ -90,9 +90,10 @@ function CompactCardBody({
   const distM = (coords && bag.store.lat && bag.store.lng)
     ? haversineMeters(coords.lat, coords.lng, bag.store.lat, bag.store.lng)
     : null;
-  const distLabel = distM != null
-    ? distM < 50 ? 'すぐそこ' : distM < 1000 ? `${Math.round(distM / 10) * 10}m` : `${(distM / 1000).toFixed(1)}km`
-    : null;
+  // ★ 距離表示は全画面で formatDistanceLabel に統一(徒歩◯分ベース)。
+  //   以前ここだけ独自ロジックで「◯◯m/◯◯km」を出しており、詳細画面の「徒歩◯分」と
+  //   食い違って「カードの距離が実際と違う」と誤解される原因になっていた。
+  const distLabel = distM != null ? formatDistanceLabel(distM) : null;
   const distMinutes = distM != null ? Math.round(distM / 67) : 99;
   const pickupDay = getPickupDateLabel((bag as { createdAt?: string }).createdAt, (bag as { pickupNextDay?: boolean }).pickupNextDay);
 
@@ -284,6 +285,11 @@ export function BagCard({ bag, compact = false }: BagCardProps) {
   const discountPercent = getDisplayDiscountPercent(bag.originalPrice, bag.discountedPrice);
   const isSoldOut  = bag.stockCount <= 0;
   const isLowStock = bag.stockCount > 0 && bag.stockCount <= 2;
+  // ★ 「もう買えない」理由。 ended-today API が endReason を返す:
+  //   sold_out = 本当に完売 / ended = 受取時間切れ(完売ではない)。
+  //   店に嘘をつかない(=売れてないのに完売表示しない)ため、 バッジ文言を出し分ける。
+  const isEnded    = isSoldOut && (bag as { endReason?: 'sold_out' | 'ended' }).endReason === 'ended';
+  const closedLabel = isEnded ? '本日終了' : '完売御礼';
   const { isFavorite, toggle } = useFavorites();
   const { user } = useAuth();
   const { toast } = useToast();
@@ -417,8 +423,8 @@ export function BagCard({ bag, compact = false }: BagCardProps) {
                 {discountPercent}% OFF
               </span>
             )}
-            {/* 右上: 評価 + ハート */}
-            <div className="absolute top-2 right-2 flex flex-col items-end gap-1">
+            {/* 右上: 評価 + ハート (完売オーバーレイより上に置いてタップを拾わせる) */}
+            <div className="absolute top-2 right-2 z-10 flex flex-col items-end gap-1">
               {avgRating && !isSoldOut && (
                 <button
                   type="button"
@@ -442,10 +448,10 @@ export function BagCard({ bag, compact = false }: BagCardProps) {
                   ${favorited ? 'fill-white stroke-white' : 'fill-none stroke-rose-400'}`} />
               </button>
             </div>
-            {/* 完売オーバーレイ */}
+            {/* 完売オーバーレイ (表示のみ。 pointer-events-none でハート/評価ボタンのタップを塞がない) */}
             {isSoldOut && (
-              <div className="absolute inset-0 flex items-center justify-center bg-black/30">
-                <span className="bg-white/90 text-foreground text-[10px] font-black px-2 py-1 rounded-lg">完売御礼 🌸</span>
+              <div className="absolute inset-0 flex items-center justify-center bg-black/30 pointer-events-none">
+                <span className="bg-white/90 text-foreground text-[10px] font-black px-2 py-1 rounded-lg">{closedLabel} {isEnded ? '🌙' : '🌸'}</span>
               </div>
             )}
           </>
@@ -486,7 +492,7 @@ export function BagCard({ bag, compact = false }: BagCardProps) {
               </button>
               {isSoldOut ? (
                 <div className="bg-gray-800/75 text-white/85 font-bold px-2.5 py-0.5 rounded-full text-[10px] backdrop-blur-sm">
-                  完売
+                  {isEnded ? '本日終了' : '完売'}
                 </div>
               ) : (
                 <>
@@ -508,13 +514,15 @@ export function BagCard({ bag, compact = false }: BagCardProps) {
                 </>
               )}
             </div>
-            {/* 完売スタンプ */}
+            {/* 完売 / 本日終了 スタンプ (時間切れは嘘にならないよう文言・色を変える) */}
             {isSoldOut && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <div className="border-[3px] border-red-500/70 rounded-xl px-4 py-2 rotate-[-12deg] backdrop-blur-[1px]">
-                  <span className="text-red-400/90 text-2xl font-black tracking-widest leading-none block text-center drop-shadow"
+                <div className={`border-[3px] rounded-xl px-4 py-2 rotate-[-12deg] backdrop-blur-[1px]
+                  ${isEnded ? 'border-indigo-400/60' : 'border-red-500/70'}`}>
+                  <span className={`text-2xl font-black tracking-widest leading-none block text-center drop-shadow
+                    ${isEnded ? 'text-indigo-300/90' : 'text-red-400/90'}`}
                     style={{ fontFamily: 'Outfit, sans-serif' }}>
-                    完売御礼
+                    {closedLabel}
                   </span>
                 </div>
               </div>

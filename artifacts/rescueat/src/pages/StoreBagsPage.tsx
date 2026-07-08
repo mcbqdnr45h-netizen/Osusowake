@@ -5,10 +5,11 @@ import { StoreSelector } from '@/components/StoreSelector';
 import { useListStoreBags, useCreateBag, getListStoreBagsQueryKey } from '@workspace/api-client-react';
 import {
   Plus, Minus, Package2, AlertCircle, Loader2,
-  ChevronUp, ChevronDown, Zap, Lock, Clock,
+  ChevronUp, ChevronDown, Zap, Lock, Clock, Eye,
 } from 'lucide-react';
 import { ImageUpload } from '@/components/ImageUpload';
 import { CategoryPicker } from '@/components/CategoryPicker';
+import { BagPreviewSheet } from '@/components/BagPreviewSheet';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useToast } from '@/hooks/use-toast';
 import { useQueryClient } from '@tanstack/react-query';
@@ -47,6 +48,8 @@ export default function StoreBagsPage() {
   const [adjustingId, setAdjustingId] = useState<number | null>(null);
   const [confirmId, setConfirmId]     = useState<number | null>(null);
   const [imageUrl, setImageUrl]       = useState<string | null>(null);
+  const [showPreview, setShowPreview]     = useState(false); // 新規出品のお客様画面プレビュー
+  const [showEditPreview, setShowEditPreview] = useState(false); // 受取時間編集のお客様画面プレビュー
 
   // ★ 受取時間編集モーダル: 「編集して公開」 導線で開かれる軽量編集 UI。
   //   pickupStart/pickupEnd を更新しつつ isActive=true に切替えて即公開する。
@@ -679,6 +682,12 @@ export default function StoreBagsPage() {
                 aiSuggested={aiSuggested}
               />
 
+              {/* お客様画面プレビュー: 写真の見切り・文字の折り返しを出品前に確認 */}
+              <button type="button" onClick={() => setShowPreview(true)}
+                className="w-full py-3 rounded-xl border border-primary/40 text-primary font-bold text-sm flex items-center justify-center gap-1.5">
+                <Eye className="w-4 h-4" />お客様の画面でプレビュー
+              </button>
+
               <div className="flex gap-3">
                 <button type="button" onClick={() => setShowForm(false)}
                   className="flex-1 py-3 rounded-xl border-2 border-border font-bold text-muted-foreground hover:bg-muted transition-colors">
@@ -693,6 +702,24 @@ export default function StoreBagsPage() {
           )}
         </AnimatePresence>
 
+        {/* 新規出品のお客様画面プレビュー */}
+        <BagPreviewSheet
+          open={showPreview}
+          onOpenChange={setShowPreview}
+          storeName={store?.name ?? ''}
+          data={{
+            title: form.title,
+            originalPrice: form.originalPrice,
+            discountedPrice: form.discountedPrice,
+            stockCount: form.stockCount,
+            pickupStart: form.pickupStart,
+            pickupEnd: form.pickupEnd,
+            imageUrl,
+            category: bagCategory,
+            itemType: form.itemType,
+          }}
+        />
+
         {/* ── 受取時間編集モーダル (編集して公開 導線) ── */}
         <AnimatePresence>
           {editBag && (
@@ -700,7 +727,7 @@ export default function StoreBagsPage() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              className="fixed inset-0 z-50 bg-black/50 flex items-end sm:items-center justify-center p-4"
+              className="fixed inset-0 z-[100] bg-black/50 flex flex-col justify-end sm:items-center sm:justify-center"
               onClick={() => !editSubmitting && setEditBag(null)}
             >
               <motion.div
@@ -708,42 +735,56 @@ export default function StoreBagsPage() {
                 animate={{ y: 0, opacity: 1 }}
                 exit={{ y: 40, opacity: 0 }}
                 onClick={e => e.stopPropagation()}
-                className="bg-white w-full max-w-md rounded-2xl p-5 space-y-4 shadow-2xl"
+                className="bg-white w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl shadow-2xl max-h-[88dvh] flex flex-col overflow-hidden"
               >
-                <div>
-                  <h3 className="font-black text-foreground">
-                    {editAndPublish ? '受取時間を編集して公開' : '受取時間を編集'}
-                  </h3>
-                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
-                    {editAndPublish
-                      ? 'この商品は受取時間が過ぎているため、 新しい受取時間に更新してから公開します。'
-                      : '受取時間を更新します。'}
-                  </p>
-                  <p className="text-xs font-bold text-foreground mt-2">{editBag.title}</p>
+                {/* スクロール可能な本文 */}
+                <div className="overflow-y-auto px-5 pt-5 pb-3 space-y-4">
+                  <div>
+                    <h3 className="font-black text-foreground">
+                      {editAndPublish ? '受取時間を編集して公開' : '受取時間を編集'}
+                    </h3>
+                    <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                      {editAndPublish
+                        ? 'この商品は受取時間が過ぎているため、 新しい受取時間に更新してから公開します。'
+                        : '受取時間を更新します。'}
+                    </p>
+                    <p className="text-xs font-bold text-foreground mt-2">{editBag.title}</p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-muted-foreground mb-1.5">受取開始</label>
+                      <input
+                        type="time"
+                        value={editPickupStart}
+                        onChange={e => setEditPickupStart(e.target.value)}
+                        className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-2.5 font-bold focus:border-primary outline-none transition-all"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-muted-foreground mb-1.5">受取終了</label>
+                      <input
+                        type="time"
+                        value={editPickupEnd}
+                        onChange={e => setEditPickupEnd(e.target.value)}
+                        className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-2.5 font-bold focus:border-primary outline-none transition-all"
+                      />
+                    </div>
+                  </div>
+
+                  {/* お客様画面プレビュー: 新しい受取時間での見え方を確認 */}
+                  <button type="button" onClick={() => setShowEditPreview(true)}
+                    className="w-full py-2.5 rounded-xl border border-primary/40 text-primary font-bold text-sm flex items-center justify-center gap-1.5">
+                    <Eye className="w-4 h-4" />お客様の画面でプレビュー
+                  </button>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-bold text-muted-foreground mb-1.5">受取開始</label>
-                    <input
-                      type="time"
-                      value={editPickupStart}
-                      onChange={e => setEditPickupStart(e.target.value)}
-                      className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-2.5 font-bold focus:border-primary outline-none transition-all"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-bold text-muted-foreground mb-1.5">受取終了</label>
-                    <input
-                      type="time"
-                      value={editPickupEnd}
-                      onChange={e => setEditPickupEnd(e.target.value)}
-                      className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-2.5 font-bold focus:border-primary outline-none transition-all"
-                    />
-                  </div>
-                </div>
-
-                <div className="flex gap-3 pt-1">
+                {/* ★ 常時表示の固定フッター (sticky footer)。 セーフエリア分の余白を確保し、
+                      本文が長くても下タブバーやホームインジケーターに絶対に隠れないようにする。 */}
+                <div
+                  className="shrink-0 flex gap-3 px-5 pt-3 border-t border-border bg-white"
+                  style={{ paddingBottom: 'max(1.25rem, env(safe-area-inset-bottom))' }}
+                >
                   <button
                     type="button"
                     onClick={() => setEditBag(null)}
@@ -767,6 +808,29 @@ export default function StoreBagsPage() {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {/* 受取時間編集のお客様画面プレビュー(編集中の新しい受取時間で再現) */}
+        {editBag && (
+          <BagPreviewSheet
+            open={showEditPreview}
+            onOpenChange={setShowEditPreview}
+            storeName={store?.name ?? ''}
+            data={{
+              title: editBag.title,
+              description: editBag.description,
+              originalPrice: editBag.originalPrice,
+              discountedPrice: editBag.discountedPrice,
+              stockCount: editBag.stockCount,
+              pickupStart: editPickupStart,
+              pickupEnd: editPickupEnd,
+              imageUrl: editBag.imageUrl,
+              category: editBag.category,
+              allergyInfo: editBag.allergyInfo,
+              pickupNote: editBag.pickupNote,
+              itemType: (editBag.itemType === 'item' ? 'item' : 'bag'),
+            }}
+          />
+        )}
 
         {/* ── 50円未満バッグ警告バナー ── */}
         {!isLoading && (() => {
@@ -823,6 +887,7 @@ export default function StoreBagsPage() {
                 onStockAdjust={handleStockAdjust}
                 onConfirmChange={setConfirmId}
                 onEdit={openEditModal}
+                hideEditItem
               />
             ))}
           </div>

@@ -4,6 +4,7 @@ import { releaseExpiredCartReservations, cancelStaleUnpaidReservations } from ".
 import { sendPickupReminders } from "./lib/pickup-reminder.js";
 import { runDailyEngagementNotifications } from "./lib/daily-engagement.js";
 import { publishDueRecurringListings } from "./lib/recurring-publisher.js";
+import { remindUnlistedStores } from "./lib/unlisted-store-reminder.js";
 
 // ── 起動時マイグレーション（冪等・全て Supabase PostgreSQL 対象）──────────────
 async function runMigrations() {
@@ -106,35 +107,18 @@ async function runMigrations() {
       console.warn('[migration] users.display_name skipped:', e.message?.split('\n')[0]);
     }
 
-    // ── users テーブル: phone_number UNIQUE 制約 ──────────────────────────────
+    // ── users テーブル: phone_number UNIQUE 制約を撤廃 ─────────────────────────
+    //   ★ 2026-07-07: 電話番号のグローバル UNIQUE は「過去に電話番号を登録した正規
+    //     ユーザーの再登録」を永久ブロックしていた（サポート報告: 電話番号が既に登録
+    //     済みと出るが紐づくメールが分からず詰む）。 電話番号は NULL 可・任意入力で
+    //     不正防止効果はほぼ無い一方、 正規の出店/登録を止める致命傷だったため撤廃する。
+    //     本人性はメール(auth.users)が担保。 電話番号は連絡先として保持するのみ。
+    //     冪等: 制約が無ければ何もしない。 起動毎に実行されても安全。
     try {
-      // 1) 重複している phone_number を NULL にする（初回のみ有効・冪等）
-      await client.query(`
-        UPDATE public.users u
-        SET phone_number = NULL
-        WHERE phone_number IS NOT NULL
-          AND id NOT IN (
-            SELECT DISTINCT ON (phone_number) id
-            FROM public.users
-            WHERE phone_number IS NOT NULL
-            ORDER BY phone_number, created_at ASC
-          );
-      `);
-      // 2) UNIQUE 制約を追加（既にあればスキップ）
-      await client.query(`
-        DO $$ BEGIN
-          IF NOT EXISTS (
-            SELECT 1 FROM pg_constraint
-            WHERE conname = 'users_phone_number_key'
-              AND conrelid = 'public.users'::regclass
-          ) THEN
-            ALTER TABLE public.users ADD CONSTRAINT users_phone_number_key UNIQUE (phone_number);
-          END IF;
-        END $$;
-      `);
-      console.log('[migration] users.phone_number UNIQUE ✅');
+      await client.query(`ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_phone_number_key;`);
+      console.log('[migration] users.phone_number UNIQUE dropped ✅');
     } catch (e: any) {
-      console.warn('[migration] users.phone_number skipped:', e.message?.split('\n')[0]);
+      console.warn('[migration] users.phone_number drop skipped:', e.message?.split('\n')[0]);
     }
 
     // ── stores 各種追加列 ─────────────────────────────────────────────────────
@@ -306,6 +290,40 @@ async function runMigrations() {
       CREATE INDEX IF NOT EXISTS fcm_user_id_idx ON fcm_registrations (user_id);
     `);
     console.log('[migration] fcm_registrations table ✅');
+
+    // ── anonymous_push_devices テーブル (会員登録前の端末プッシュ用) ────────────
+    //   ログイン前でも通知許可さえ取れれば APNs/FCM のデバイストークンは取れる。
+    //   それを userId 無しで保存し、デイリー通知(出品中◯件)を非会員にも届ける。
+    //   ログイン時に /push/device-token 側で同一 device_token をここから削除して
+    //   apns_registrations へ移すので、二重送信は起きない。
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS anonymous_push_devices (
+        id           SERIAL PRIMARY KEY,
+        device_token TEXT NOT NULL UNIQUE,
+        platform     TEXT NOT NULL DEFAULT 'ios',
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS apd_platform_idx ON anonymous_push_devices (platform);
+    `);
+    console.log('[migration] anonymous_push_devices table ✅');
+
+    // ── anonymous_web_push_subscriptions テーブル (会員登録前のWebプッシュ用) ──
+    //   ブラウザ/PWA で通知許可が取れた非会員の購読を userId 無しで保存。
+    //   ログイン時に /web-push/subscribe 側で同一 endpoint をここから削除して昇格。
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS anonymous_web_push_subscriptions (
+        id         SERIAL PRIMARY KEY,
+        endpoint   TEXT NOT NULL UNIQUE,
+        p256dh     TEXT NOT NULL,
+        auth       TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    console.log('[migration] anonymous_web_push_subscriptions table ✅');
 
     // ── store_status enum に suspended を追加 ─────────────────────────────────
     await client.query(`ALTER TYPE store_status ADD VALUE IF NOT EXISTS 'suspended'`);
@@ -673,6 +691,41 @@ async function runMigrations() {
     `);
     console.log('[migration] users.notif_daily_engagement ✅');
 
+    // ── users.notif_new_listing: 「お気に入り外の新規出品(全体配信)」OPT-OUT 用カラム
+    //   OFF にすると new-listing-broadcast の全体配信がその人だけスキップされる。
+    await client.query(`
+      ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS notif_new_listing BOOLEAN NOT NULL DEFAULT true;
+    `);
+    console.log('[migration] users.notif_new_listing ✅');
+
+    // ── users.notif_favorite_update: 「お気に入り店舗の更新」通知 OPT-OUT 用カラム
+    //   OFF にすると お気に入り店の新出品プッシュ(手動出品/定期出品の初回公開)が
+    //   その人だけスキップされる。 以前は localStorage のみで実配信が止まっていなかった。
+    await client.query(`
+      ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS notif_favorite_update BOOLEAN NOT NULL DEFAULT true;
+    `);
+    console.log('[migration] users.notif_favorite_update ✅');
+
+    // ── users.notif_unlisted_reminder: 店オーナー向け「未出品リマインド」OPT-OUT 用カラム
+    //   OFF にすると unlisted-store-reminder のリマインドがそのオーナーだけスキップされる。
+    await client.query(`
+      ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS notif_unlisted_reminder BOOLEAN NOT NULL DEFAULT true;
+    `);
+    console.log('[migration] users.notif_unlisted_reminder ✅');
+
+    // ── users.notif_new_order: 店オーナー向け「新規注文の通知(bag_sold)」OPT-OUT 用カラム
+    //   OFF にすると 自店に注文が入った際の push(payment/stripe-webhook の bag_sold)が
+    //   そのオーナーだけスキップされる。 アプリ内ベル(注文履歴)は残すので注文は取りこぼさない。
+    //   以前は設定トグルが localStorage のみで実配信を止められていなかった(見せかけ)。
+    await client.query(`
+      ALTER TABLE public.users
+      ADD COLUMN IF NOT EXISTS notif_new_order BOOLEAN NOT NULL DEFAULT true;
+    `);
+    console.log('[migration] users.notif_new_order ✅');
+
     // ── 管理者 role seed (#6 フェーズ B): ハードコード email を廃止し、 env
     // INITIAL_ADMIN_EMAILS (カンマ区切り) で初期 admin を seed する。
     // env が未設定なら何もしない (fail-safe)。 既に DB に admin が居る環境では
@@ -784,36 +837,51 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-runMigrations().then(() => {
-  // ★ Fly.io 等で fly-proxy から到達可能にするため 0.0.0.0 で明示 bind。
-  //   host 引数を省略すると環境によっては ::1 / 127.0.0.1 にしか bind されず
-  //   "app is not listening on the expected address" 警告で外部アクセス不能になる。
-  app.listen(port, "0.0.0.0", () => {
-    console.log(`Server listening on 0.0.0.0:${port} — DB: Supabase PostgreSQL`);
-  });
-
-  // 期限切れ仮押さえを1分ごとに自動解放（在庫復元）
-  setInterval(() => {
-    releaseExpiredCartReservations().catch(() => {});
-  }, 60_000);
-
-  // 受取1時間前リマインダーを5分ごとに送信
-  setInterval(() => {
-    sendPickupReminders().catch(() => {});
-  }, 5 * 60_000);
-
-  // 毎日のエンゲージメント通知（昼前11:30・夕方17:30 JST）を1分ごとにチェック
-  setInterval(() => {
-    runDailyEngagementNotifications().catch(() => {});
-  }, 60_000);
-
-  // 定期出品（店が設定した公開時刻になったら翌日分を自動公開）を1分ごとにチェック
-  setInterval(() => {
-    publishDueRecurringListings().catch(() => {});
-  }, 60_000);
-
-  // 未決済のまま放置された予約（pending+unpaid・30分超）を5分ごとに自動キャンセル
-  setInterval(() => {
-    cancelStaleUnpaidReservations().catch(() => {});
-  }, 5 * 60_000);
+// ★ 先に listen する（DB 非依存で即応答）。
+//   旧実装は runMigrations().then(listen) で、DB/Supabase 障害時に migration が
+//   ハングすると app.listen() に到達せず public/healthz/SPA まで全滅していた
+//   (ローンチ当日の全面ダウンの原因)。 サーバー起動は DB 状態から切り離す。
+//
+//   ★ Fly.io 等で fly-proxy から到達可能にするため 0.0.0.0 で明示 bind。
+//     host 引数を省略すると環境によっては ::1 / 127.0.0.1 にしか bind されず
+//     "app is not listening on the expected address" 警告で外部アクセス不能になる。
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Server listening on 0.0.0.0:${port} — DB: Supabase PostgreSQL`);
 });
+
+// マイグレーションはバックグラウンドで実行（listen をブロックしない）。
+// DB が一時的に不達でもサーバーは public/SPA/healthz を配信し続ける。
+// スキーマ追加は冪等なので、DB 回復後の次回ブート or この非同期完了時に反映される。
+runMigrations().catch((err) => {
+  console.error("[migration] background run failed (server still serving):", err);
+});
+
+// 期限切れ仮押さえを1分ごとに自動解放（在庫復元）
+setInterval(() => {
+  releaseExpiredCartReservations().catch(() => {});
+}, 60_000);
+
+// 受取1時間前リマインダーを5分ごとに送信
+setInterval(() => {
+  sendPickupReminders().catch(() => {});
+}, 5 * 60_000);
+
+// 毎日のエンゲージメント通知（昼前11:45・夕方16:30 JST）を1分ごとにチェック
+setInterval(() => {
+  runDailyEngagementNotifications().catch(() => {});
+}, 60_000);
+
+// 定期出品（店が設定した公開時刻になったら翌日分を自動公開）を1分ごとにチェック
+setInterval(() => {
+  publishDueRecurringListings().catch(() => {});
+}, 60_000);
+
+// 未決済のまま放置された予約（pending+unpaid・30分超）を5分ごとに自動キャンセル
+setInterval(() => {
+  cancelStaleUnpaidReservations().catch(() => {});
+}, 5 * 60_000);
+
+// 未出品の店へ「今日まだ出品してませんよ」を毎日リマインド（既定 JST 15時台に1回）を1分ごとにチェック
+setInterval(() => {
+  remindUnlistedStores().catch(() => {});
+}, 60_000);

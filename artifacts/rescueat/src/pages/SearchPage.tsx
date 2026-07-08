@@ -13,8 +13,9 @@ import {
   ArrowUpDown, MapPin, Clock, Package, ChevronRight, ShoppingBag, Navigation2,
   Croissant, Utensils, Coffee, ShoppingCart, Store as StoreIcon,
   Candy, Wheat, Sparkles, History, RefreshCw, Loader2, PackageOpen, Navigation,
-  RotateCcw, Apple, Fish, UtensilsCrossed, GlassWater, Gift, Heart,
+  RotateCcw, Apple, Fish, UtensilsCrossed, GlassWater, Gift, Heart, Star,
 } from 'lucide-react';
+import { StoreReviewSheet } from '@/components/StoreReviewSheet';
 import { useFavorites } from '@/hooks/useFavorites';
 import { motion, AnimatePresence, PanInfo } from 'framer-motion';
 import { Link } from 'wouter';
@@ -23,24 +24,6 @@ import { normalizeBrand } from '@/lib/brand-text';
 import { pickupWindowsLabel } from '@/lib/utils';
 import { useUserLocation, updateCachedCoords, haversineMeters, metersToWalkMinutes, formatDistanceLabel } from '@/hooks/use-user-location';
 import { getDisplayPrice, getDisplayDiscountPercent } from '@/lib/price-display';
-
-// ─── 距離計算 ─────────────────────────────────────────────────────────────────
-function calcDistanceM(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371000;
-  const toRad = (d: number) => d * Math.PI / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function formatDistance(m: number): string {
-  if (m < 50)   return 'すぐそこ';
-  if (m < 1000) return `${Math.round(m / 10) * 10}m`;
-  return `${(m / 1000).toFixed(1)}km`;
-}
 
 type ViewMode = 'list' | 'map';
 type SortKey  = 'default' | 'distance' | 'price_asc' | 'price_desc' | 'stock_desc';
@@ -116,6 +99,24 @@ function StoreBottomSheet({
   const { isFavorite, toggle: toggleFavorite } = useFavorites();
   const favorited = isFavorite(store.id);
 
+  // ★ レビュー(口コミ): 地図の店舗シートにも★平均評価＋件数を表示し、タップで口コミ一覧を開く。
+  //   BagCard と同じ StoreReviewSheet を再利用。avgRating/count はこのシート単体で取得する
+  //   (地図の store payload には評価が含まれないため)。
+  const [reviewInfo, setReviewInfo] = useState<{ avgRating: number | null; count: number } | null>(null);
+  const [showReviews, setShowReviews] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    const base = (import.meta.env.BASE_URL as string).replace(/\/$/, '');
+    fetch(`${base}/api/stores/${store.id}/reviews`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        if (!alive || !d) return;
+        setReviewInfo({ avgRating: d.avgRating ?? null, count: d.count ?? 0 });
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [store.id]);
+
   const allStoreBags = bags.filter(b => b.store.id === store.id);
   const storeBags = [...allStoreBags].sort((a, b) => {
     if ((a.stockCount > 0) === (b.stockCount > 0)) return 0;
@@ -128,12 +129,6 @@ function StoreBottomSheet({
   //     よってフロントの bags 配列では判定不能 → バックエンド /stores の soldOutToday を使う。
   //     (store オブジェクトに soldOutToday: boolean が付いてくる)
   const soldOutToday = !hasBags && Boolean((store as { soldOutToday?: boolean }).soldOutToday);
-
-  const distanceLabel = useMemo(() => {
-    if (!userPos || !store.lat || !store.lng) return null;
-    const m = calcDistanceM(userPos.lat, userPos.lng, store.lat, store.lng);
-    return formatDistance(m);
-  }, [userPos, store.lat, store.lng]);
 
   const walkLabel = useMemo(() => {
     if (!userPos || !store.lat || !store.lng) return null;
@@ -286,21 +281,11 @@ function StoreBottomSheet({
                     {store.address || '住所未設定'}
                   </span>
                 </div>
-                {(distanceLabel || walkLabel) && (
+                {walkLabel && (
                   <div className="flex items-center gap-1.5 mt-1 pl-5">
-                    {distanceLabel && (
-                      <span className="inline-flex items-center gap-0.5 text-[11px] font-black text-primary whitespace-nowrap">
-                        <Navigation2 className="w-2.5 h-2.5" />{distanceLabel}
-                      </span>
-                    )}
-                    {distanceLabel && walkLabel && (
-                      <span className="text-[10px] text-muted-foreground/50">·</span>
-                    )}
-                    {walkLabel && (
-                      <span className="text-[11px] font-medium text-muted-foreground whitespace-nowrap">
-                        {walkLabel}
-                      </span>
-                    )}
+                    <span className="inline-flex items-center gap-0.5 text-[11px] font-black text-primary whitespace-nowrap">
+                      <Navigation2 className="w-2.5 h-2.5" />{walkLabel}
+                    </span>
                   </div>
                 )}
               </div>
@@ -318,6 +303,24 @@ function StoreBottomSheet({
               )}
             </div>
           </div>
+
+          {/* レビュー(口コミ) — ★平均評価＋件数。タップで口コミ一覧を開く。
+              評価が付いている店のみ表示 (0件の店では出さない)。 */}
+          {reviewInfo && reviewInfo.avgRating != null && reviewInfo.count > 0 && (
+            <div className="px-4 mb-3">
+              <button
+                onClick={() => setShowReviews(true)}
+                className="w-full flex items-center gap-2 bg-secondary/60 border border-border/60 rounded-2xl px-3.5 py-2.5 tap-scale hover:bg-amber-50 hover:border-amber-200 transition-colors"
+              >
+                <Star className="w-4 h-4 text-amber-500 fill-amber-500 shrink-0" />
+                <span className="text-sm font-black text-amber-500">{reviewInfo.avgRating.toFixed(1)}</span>
+                <span className="text-xs text-muted-foreground font-medium">
+                  お客様の口コミ {reviewInfo.count}件
+                </span>
+                <ChevronRight className="w-4 h-4 text-muted-foreground ml-auto shrink-0" />
+              </button>
+            </div>
+          )}
 
           {/* 店主からのメッセージ — 出品なしの店だけ「上」に表示
               (出品ありの店ではバッグ一覧の下に表示される、下記参照) */}
@@ -457,6 +460,19 @@ function StoreBottomSheet({
           )}
         </div>
       </motion.div>
+
+      {/* 口コミシート (BagCard と同じコンポーネントを再利用) */}
+      <AnimatePresence>
+        {showReviews && reviewInfo && reviewInfo.avgRating != null && (
+          <StoreReviewSheet
+            storeId={store.id}
+            storeName={store.name}
+            avgRating={reviewInfo.avgRating}
+            reviewCount={reviewInfo.count}
+            onClose={() => setShowReviews(false)}
+          />
+        )}
+      </AnimatePresence>
     </>
   );
 }

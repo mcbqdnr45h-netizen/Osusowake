@@ -3,7 +3,7 @@ import { Layout } from '@/components/Layout';
 import { useUserId } from '@/hooks/use-user';
 import { useMyStores } from '@/hooks/use-my-stores';
 import { useListReservations, getListReservationsQueryKey, useGetMonthlyRanking, getGetMonthlyRankingQueryKey } from '@workspace/api-client-react';
-import { User, Leaf, ShoppingBag, Heart, ChevronRight, Settings, HelpCircle, LogOut, Store as StoreIcon, CreditCard, Receipt, Mail, Scale, Star, Clock, XCircle, FileCheck, Camera, MessageSquare, Bell, Megaphone, CheckCircle, Flag, ShieldCheck, AlertTriangle, Trash2, Trophy, BookOpen } from 'lucide-react';
+import { User, Leaf, ShoppingBag, Heart, ChevronRight, Settings, HelpCircle, LogOut, Store as StoreIcon, CreditCard, Receipt, Mail, Scale, Star, Clock, XCircle, FileCheck, Camera, MessageSquare, Bell, Megaphone, CheckCircle, CheckCheck, Flag, ShieldCheck, AlertTriangle, Trash2, Trophy, BookOpen } from 'lucide-react';
 import { ShareAppCard } from '@/components/ShareAppCard';
 import { ImpactShareButton } from '@/components/ImpactShareButton';
 import { DeleteAccountModal } from '@/components/DeleteAccountModal';
@@ -103,14 +103,14 @@ export default function MyPage() {
 
   const fetchNotifications = useCallback(() => {
     if (!userId || !session?.access_token) return;
-    // 複数店舗オーナーの場合、現在選択中の店舗の通知のみ表示
-    // store_id=NULL の全体通知（管理者お知らせ等）は常に含まれる
-    const storeFilter = storeId ? `?storeId=${storeId}` : '';
-    authedFetch(`${BASE_URL}/api/notifications${storeFilter}`)
+    // ★ ヘッダーのベル (NotificationsBell) と完全に同じ「全通知」を取得する。
+    //   以前は storeId で絞っていたが、ヘッダーのベルは絞らないため未読数がズレ、
+    //   「2つのベルが連動していない」ように見えていた → フィルタ撤廃で単一ソース化。
+    authedFetch(`${BASE_URL}/api/notifications`)
       .then(r => r.ok ? r.json() : { notifications: [], unreadCount: 0 })
       .then(d => { setNotifications(d.notifications || []); setUnreadCount(d.unreadCount || 0); })
       .catch((err) => { console.warn('[MyPage] notifications fetch failed', err); });
-  }, [userId, session?.access_token, storeId]);
+  }, [userId, session?.access_token]);
 
   useEffect(() => { fetchNotifications(); }, [fetchNotifications]);
 
@@ -132,6 +132,20 @@ export default function MyPage() {
       window.dispatchEvent(new CustomEvent('notifications:changed', { detail: { id, read: true } }));
     } catch (err) {
       console.warn('[MyPage] markRead failed', err);
+    }
+  }, [session?.access_token]);
+
+  // ★ 「すべて既読」: サーバーの read-all はユーザー全体を既読化する（storeId 非依存）。
+  //   楽観更新 + broadcast でヘッダーのベル (NotificationsBell) とも即同期。
+  const markAllNotificationsRead = useCallback(async () => {
+    if (!session?.access_token) return;
+    setNotifications(prev => prev.map(n => ({ ...n, read: true })));
+    setUnreadCount(0);
+    try {
+      await authedFetch(`${BASE_URL}/api/notifications/read-all`, { method: 'PATCH' });
+      window.dispatchEvent(new CustomEvent('notifications:changed', { detail: { all: true } }));
+    } catch (err) {
+      console.warn('[MyPage] markAllRead failed', err);
     }
   }, [session?.access_token]);
 
@@ -273,7 +287,16 @@ export default function MyPage() {
               <span className="font-black text-sm text-foreground flex items-center gap-1.5">
                 <Bell className="w-4 h-4 text-primary" />お知らせ
               </span>
-              <button onClick={() => setShowNotifications(false)} className="text-xs text-muted-foreground hover:text-foreground">閉じる</button>
+              <div className="flex items-center gap-2">
+                {unreadCount > 0 && (
+                  <button
+                    onClick={markAllNotificationsRead}
+                    className="inline-flex items-center gap-1 text-xs font-bold text-primary hover:text-primary/80 transition-colors">
+                    <CheckCheck className="w-3.5 h-3.5" />すべて既読
+                  </button>
+                )}
+                <button onClick={() => setShowNotifications(false)} className="text-xs text-muted-foreground hover:text-foreground">閉じる</button>
+              </div>
             </div>
             {notifications.length === 0 ? (
               <div className="py-8 text-center">

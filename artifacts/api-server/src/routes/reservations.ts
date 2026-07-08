@@ -9,7 +9,7 @@ import {
   notificationsTable,
   insertReservationSchema,
 } from "@workspace/db/schema";
-import { eq, and, sql, lt, isNotNull, inArray } from "drizzle-orm";
+import { eq, and, sql, lt, isNotNull, inArray, desc } from "drizzle-orm";
 import { requireAuth } from "../middlewares/auth.js";
 import { isReviewDemoOwner } from "../lib/app-review.js";
 import { supabaseAdmin } from "../lib/supabase.js";
@@ -462,7 +462,9 @@ router.get("/reservations", requireAuth, async (req, res) => {
       .innerJoin(surpriseBagsTable, eq(reservationsTable.bagId, surpriseBagsTable.id))
       .innerJoin(storesTable, eq(reservationsTable.storeId, storesTable.id))
       .leftJoin(reviewsTable, eq(reviewsTable.reservationId, reservationsTable.id))
-      .where(conditions.length > 0 ? and(...conditions) : undefined);
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      // 購入履歴は新しい予約を上に（新規順）
+      .orderBy(desc(reservationsTable.createdAt), desc(reservationsTable.id));
 
     res.json(rows.map((r) => ({
       ...r,
@@ -775,6 +777,70 @@ router.post("/reservations/:reservationId/pickup", requireAuth, async (req, res)
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "internal_error", message: "Failed to confirm pickup" });
+  }
+});
+
+// ─── Pickup の取り消し（誤タップ救済）───────────────────────────────────────
+// 「受取済み」を間違えて押した時に、店側で自分で confirmed に戻せるようにする。
+//   認可: buyer 本人 または 店舗オーナー（pickup と同じ）。
+//   安全策:
+//     ・picked_up 以外は戻さない。
+//     ・決済/入金には一切触れない（入金は購入時のStripe destination chargeで確定済み、
+//       受取は履行フラグのみ）。よって返金も在庫変更も発生しない＝安全に戻せる。
+//     ・過去記録の改ざん防止に「受取から24時間以内」だけ許可。 それより古い/時刻不明は
+//       運営(神モード)に依頼させる。
+const UNDO_PICKUP_WINDOW_MS = 24 * 60 * 60 * 1000;
+router.post("/reservations/:reservationId/pickup/undo", requireAuth, async (req, res) => {
+  try {
+    const id = parseInt(String(req.params.reservationId ?? ""), 10);
+    if (!id) { res.status(400).json({ error: "bad_request", message: "Invalid id" }); return; }
+
+    const owners = await loadReservationOwners(id);
+    if (!owners) {
+      res.status(404).json({ error: "not_found", message: "Reservation not found" });
+      return;
+    }
+    const me = req.authUser!.id;
+    if (owners.userId !== me && owners.storeOwnerId !== me) {
+      res.status(403).json({ error: "forbidden", message: "この予約を操作する権限がありません" });
+      return;
+    }
+
+    const [existing] = await db
+      .select()
+      .from(reservationsTable)
+      .where(eq(reservationsTable.id, id));
+
+    if (!existing) {
+      res.status(404).json({ error: "not_found", message: "Reservation not found" });
+      return;
+    }
+    if (existing.status !== "picked_up") {
+      res.status(409).json({ error: "not_picked_up", message: "この予約は受取済みではありません" });
+      return;
+    }
+
+    // 24時間の取り消し猶予。 pickedUpAt が無い or 古い場合は運営に依頼させる。
+    const pickedAtMs = existing.pickedUpAt ? new Date(existing.pickedUpAt).getTime() : null;
+    if (pickedAtMs == null || Date.now() - pickedAtMs > UNDO_PICKUP_WINDOW_MS) {
+      res.status(409).json({
+        error: "undo_window_expired",
+        message: "受取から24時間を過ぎたため、こちらでは取り消せません。運営(DM)までご連絡ください。",
+      });
+      return;
+    }
+
+    await db
+      .update(reservationsTable)
+      .set({ status: "confirmed", pickedUpAt: null })
+      .where(eq(reservationsTable.id, id));
+
+    console.log(`[pickup-undo] reservation ${id} を picked_up→confirmed に戻した (by ${owners.storeOwnerId === me ? "store" : "buyer"})`);
+    const updated = await getReservationWithDetails(id);
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal_error", message: "Failed to undo pickup" });
   }
 });
 

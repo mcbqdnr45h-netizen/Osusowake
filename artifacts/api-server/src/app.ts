@@ -6,6 +6,7 @@ import fs from "node:fs";
 import { rateLimit, ipKeyGenerator } from "express-rate-limit";
 import router from "./routes";
 import { seoRouter } from "./seo";
+import { createCrawlerSeoMiddleware } from "./seo-prerender";
 
 const app: Express = express();
 
@@ -168,6 +169,11 @@ if (STATIC_DIR && fs.existsSync(STATIC_DIR)) {
       },
     })
   );
+  // 1.5) SEO: クローラー(bot)UA の時だけ index.html に本文/メタ/JSON-LD を注入して
+  //   返す (dynamic rendering)。 実ユーザー・Capacitor WebView は bot UA でないため
+  //   next() で下の catch-all (素の index.html) に必ずフォールスルーする。
+  app.use(createCrawlerSeoMiddleware(indexPath));
+
   // 2) SPA フォールバック: /api/* 以外の GET は全部 index.html を返す
   app.get(/^\/(?!api\/).*/, (_req, res, next) => {
     res.sendFile(indexPath, (err) => {
@@ -178,5 +184,19 @@ if (STATIC_DIR && fs.existsSync(STATIC_DIR)) {
 } else if (STATIC_DIR) {
   console.warn(`[static] STATIC_DIR=${STATIC_DIR} but directory does not exist`);
 }
+
+// ── グローバルエラーハンドラ ──────────────────────────────────────────────────
+// ★ セキュリティ修正 (2026-07-08): 個々のルートが err.message をそのままクライアント
+//   に返しており、DB のカラム名・内部パス・スタック片などが漏れうる。最終防波堤として
+//   全捕捉し、サーバー側には詳細ログを残しつつ、クライアントには汎用メッセージのみ返す。
+//   (4引数シグネチャが Express にエラーハンドラと認識される条件なので next は必須)
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error(`[error] ${req.method} ${req.originalUrl}:`, err?.stack ?? err?.message ?? err);
+  if (res.headersSent) return;
+  res.status(err?.status && Number.isInteger(err.status) ? err.status : 500).json({
+    error: "internal_error",
+    message: "サーバーでエラーが発生しました。しばらくしてからお試しください。",
+  });
+});
 
 export default app;

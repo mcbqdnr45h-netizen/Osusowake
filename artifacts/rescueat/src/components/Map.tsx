@@ -25,14 +25,8 @@ export interface BagMapInfo {
 // ★ Googleマップのデフォルト観光地アイコン (古墳・神社・天満宮など) を非表示。
 //    自店舗のピンを見やすくするため、 POIアイコンを抑制する。
 //    ラベル(地名テキスト)は残してアイコンのみ消す指定。
-const MAP_STYLES: google.maps.MapTypeStyle[] = [
-  { featureType: 'poi.attraction',       elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
-  { featureType: 'poi.place_of_worship', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
-  { featureType: 'poi.business',         elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
-  { featureType: 'poi.government',       elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
-  { featureType: 'poi.attraction',       elementType: 'labels.text', stylers: [{ visibility: 'off' }] },
-  { featureType: 'poi.place_of_worship', elementType: 'labels.text', stylers: [{ visibility: 'off' }] },
-];
+export { MAP_STYLES } from '@/lib/map-styles';
+import { MAP_STYLES } from '@/lib/map-styles';
 
 // ── カスタムアイコン用フレームピン (店舗 iconUrl をピンの「滴」内にはめ込む) ──
 //   オレンジ枠 (active) / グレー枠 (inactive) の2バリアント。
@@ -61,6 +55,37 @@ function safeIconHref(rawUrl: string): string | null {
 //   ★ メモリ肥大化防止のため LRU 風に最大 200 件で頭から evict する。
 const __ICON_CACHE_MAX = 200;
 const __iconBase64Cache = new Map<string, Promise<string | null>>();
+
+// ── 解決済み base64 の「同期」キャッシュ ───────────────────────────────
+//   目的: マーカー初回描画時に、すでに base64 化済みのアイコンがあれば
+//   絵文字ピンを一切挟まず最初からカスタムピンで描く（"一瞬イラストになる"
+//   フラッシュを消す）。メモリ + localStorage の 2 段で端末に永続化する。
+const __iconResolvedCache = new Map<string, string>();
+const __ICON_LS_PREFIX = 'osw:icon:v1:';
+// localStorage に載せる base64 の上限（quota 圧迫防止 / 概ね ~220KB 相当まで）
+const __ICON_LS_MAX_LEN = 300 * 1024;
+function __loadIconFromLS(url: string): string | null {
+  try {
+    const v = localStorage.getItem(__ICON_LS_PREFIX + url);
+    return v && v.startsWith('data:') ? v : null;
+  } catch { return null; }
+}
+function __saveIconToLS(url: string, dataUrl: string): void {
+  try {
+    if (dataUrl.length > __ICON_LS_MAX_LEN) return;   // 大きすぎるものは永続化しない
+    localStorage.setItem(__ICON_LS_PREFIX + url, dataUrl);
+  } catch { /* quota 超過等は黙って無視（メモリキャッシュのみで動作） */ }
+}
+// 解決済み data URL を同期で返す（メモリ → localStorage の順）。無ければ null。
+function getResolvedIconSync(rawUrl: string): string | null {
+  if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) return null;
+  const mem = __iconResolvedCache.get(rawUrl);
+  if (mem) return mem;
+  const ls = __loadIconFromLS(rawUrl);
+  if (ls) { __iconResolvedCache.set(rawUrl, ls); return ls; }
+  return null;
+}
+
 function fetchIconAsDataUrl(rawUrl: string): Promise<string | null> {
   if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) return Promise.resolve(null);
   const cached = __iconBase64Cache.get(rawUrl);
@@ -79,12 +104,15 @@ function fetchIconAsDataUrl(rawUrl: string): Promise<string | null> {
       // ★ 5MB まで許容: 店舗オーナがアップロードしたアイコン (832KB 等) を確実に取り込めるよう緩和。
       //    マーカーは 1 店舗 1 アイコンのみ (cluster で重複なし) なので OOM リスクは限定的。
       if (blob.size > 5 * 1024 * 1024) return null;
-      return await new Promise<string | null>((resolve) => {
+      const dataUrl = await new Promise<string | null>((resolve) => {
         const reader = new FileReader();
         reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
         reader.onerror = () => resolve(null);
         reader.readAsDataURL(blob);
       });
+      // 次回以降フラッシュ無しで描けるよう同期キャッシュ + 端末永続化に載せる
+      if (dataUrl) { __iconResolvedCache.set(rawUrl, dataUrl); __saveIconToLS(rawUrl, dataUrl); }
+      return dataUrl;
     } catch {
       return null;
     }
@@ -303,6 +331,11 @@ export const MapView = forwardRef<MapViewHandle, MapViewProps>(function MapView(
   const [status,          setStatus]         = useState<'loading' | 'ready' | 'error'>(
     () => (typeof window !== 'undefined' && (window as any).__gmAuthFailed) ? 'error' : 'loading'
   );
+  // ★ スピナーは遅延表示。 温起動/プリウォーム済みの通常ケース (数百ms で ready)
+  //   ではクルクルを一切出さず「一瞬で地図が出た」体感にする。 本当に遅い時
+  //   (オフライン/低速) だけ 700ms 後にスピナーを出してフィードバックする。
+  const [showSpinner, setShowSpinner] = useState(false);
+  const spinnerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ─── Maps API auth failure (RefererNotAllowedMapError 等) を検知 ──────────
   //   loadGoogleMapsScript() 自体は成功するが、 タイル取得時に 403 が返り
@@ -518,6 +551,12 @@ export const MapView = forwardRef<MapViewHandle, MapViewProps>(function MapView(
     if (!containerRef.current) return;
     let cancelled = false;
 
+    // ★ 700ms 経ってもまだ ready でなければスピナーを出す (遅延表示)。
+    //   温起動はこの前に ready 化するのでクルクルは出ない=一瞬に見える。
+    spinnerTimerRef.current = setTimeout(() => {
+      if (!cancelled) setShowSpinner(true);
+    }, 700);
+
     async function init() {
       try {
         const startCenter = mapCenter;
@@ -623,40 +662,33 @@ export const MapView = forwardRef<MapViewHandle, MapViewProps>(function MapView(
           });
         });
 
-        // ★★★ 「マップを開くと最初ぼやけて後から綺麗になる」根本対策 ★★★
-        //   旧実装は tilesloaded → resize → setStatus('ready') の順だったが、
-        //   resize がタイルを再フェッチするため ready 化した瞬間には
-        //   まだ古い低解像度タイルが残っていて「ぼやけて → 鮮明」が発生していた。
+        // ★★★ 体感速度優先: 最初のタイルが乗った瞬間にオーバーレイを剥がす ★★★
+        //   旧実装は「1回目 tilesloaded → resize → 2回目 tilesloaded を待って ready」
+        //   という二段待ちで、その間ずっと全画面ローディングを出していた（＝
+        //   "地図を読み込んでいます..." が体感で長い原因）。
         //
-        //   修正: resize は最初の tilesloaded ハンドラ内で先に発火し、
-        //         そこから「2回目」の tilesloaded (= DPR補正後の高解像度タイル
-        //         が全部揃った瞬間) を待ってから ready 化する。
-        //         これで初期表示が常に最終解像度のタイルで描画される。
+        //   DPR(iOS Retina)補正の resize は既に地図生成直後の rAF (上記 606 行付近)
+        //   で発火済みなので、ここで 2回目を待つ必要はない。最初の tilesloaded で
+        //   即 ready 化して地図を見せ、鮮明化(resize 再フェッチ)はオーバーレイの
+        //   裏で 1 回だけ非ブロッキングに走らせる。
         //
-        //   セーフティ:
-        //     - 2回目の tilesloaded が 400ms 来なければ強制 ready
-        //       (Wi-Fi/4G では 200-300ms でタイル到着するので 400ms で十分。
-        //        体感 0.5 秒短縮: 2.0s → 1.5s。 低速回線では稀にぼやけ残るが
-        //        全体 safety 2.5s より前に必ず復旧する)
-        //     - 全体として 2.5 秒以内に必ず ready (オフライン対策)
+        //   セーフティ: タイルが来なくても 1.8 秒で必ず地図UIを出す（オフライン対策）。
         let readyFired = false;
         const finalReady = () => {
           if (readyFired || cancelled) return;
           readyFired = true;
+          if (spinnerTimerRef.current) { clearTimeout(spinnerTimerRef.current); spinnerTimerRef.current = null; }
           if (!authFailedRef.current) setStatus('ready');
         };
         const onFirstTilesLoaded = () => {
           if (cancelled) return;
-          // 2回目の tilesloaded (resize 後の高解像度タイル) を先にリッスン
-          gMaps.event.addListenerOnce(map, 'tilesloaded', finalReady);
-          // DPR (iOS Retina) 補正のため resize を発火 → タイル再フェッチ
+          finalReady();                                   // ← 即オーバーレイを剥がす
+          // 念のため DPR 補正をもう一度だけ発火（表示済みマップの裏で鮮明化）
           try { gMaps.event.trigger(map, 'resize'); } catch { /* noop */ }
-          // 2回目セーフティ: 400ms 内に来なければ強制 ready (Wi-Fi/4G に最適化)
-          setTimeout(finalReady, 400);
         };
         gMaps.event.addListenerOnce(map, 'tilesloaded', onFirstTilesLoaded);
-        // 全体セーフティ: 2.5 秒で強制 ready (オフライン・低速回線向け)
-        readySafetyTimerRef.current = setTimeout(finalReady, 2500);
+        // 全体セーフティ: 1.8 秒で強制 ready (オフライン・低速回線向け)
+        readySafetyTimerRef.current = setTimeout(finalReady, 1800);
       } catch (e) {
         console.error('Google Maps load error:', e);
         if (!cancelled) setStatus('error');
@@ -680,6 +712,11 @@ export const MapView = forwardRef<MapViewHandle, MapViewProps>(function MapView(
       if (readySafetyTimerRef.current) {
         clearTimeout(readySafetyTimerRef.current);
         readySafetyTimerRef.current = null;
+      }
+      // ★ 遅延スピナータイマも解除
+      if (spinnerTimerRef.current) {
+        clearTimeout(spinnerTimerRef.current);
+        spinnerTimerRef.current = null;
       }
     };
   }, []);
@@ -733,18 +770,31 @@ export const MapView = forwardRef<MapViewHandle, MapViewProps>(function MapView(
 
       // ★ 店舗が独自アイコン (iconUrl) を設定している場合はそれを優先表示。
       //   ただし iOS Safari は data:image/svg+xml の中で外部 https 画像を描画できないため、
-      //   初期表示はカテゴリ絵文字ピンで描画 → fetchIconAsDataUrl で base64 化が完了次第
-      //   marker.setIcon でカスタムピンへ差し替える (中身が真っ白問題への根本対策)。
+      //   base64 化してから <image href> に埋め込む必要がある。
+      //   → 一度でも base64 化済み (メモリ or localStorage) なら "最初から" カスタムピンで
+      //     描画し、絵文字ピンの一瞬フラッシュを消す。未キャッシュの初回のみ
+      //     絵文字ピン → fetchIconAsDataUrl 完了後に marker.setIcon で差し替える。
       const hasCustomIcon = !!store.iconUrl;
-      const fallbackUrl   = isActive ? makeActivePinUrl(store.category) : makeGrayPinUrl(store.category);
-      const [fw, fh, fax, fay] = isActive ? [52, 66, 26, 59] : [44, 56, 22, 50];
+      // 解決済み base64 があれば初回描画からカスタムピンにする
+      const preResolved   = hasCustomIcon && store.iconUrl ? getResolvedIconSync(store.iconUrl) : null;
+      const preCustomPin  = preResolved ? makeIconPinUrl(preResolved, isActive) : null;
+
+      let initIconUrl: string;
+      let iw: number, ih: number, iax: number, iay: number;
+      if (preCustomPin) {
+        initIconUrl = preCustomPin;
+        [iw, ih, iax, iay] = isActive ? [56, 70, 28, 63] : [48, 60, 24, 54];
+      } else {
+        initIconUrl = isActive ? makeActivePinUrl(store.category) : makeGrayPinUrl(store.category);
+        [iw, ih, iax, iay] = isActive ? [52, 66, 26, 59] : [44, 56, 22, 50];
+      }
 
       const marker = new gMaps.Marker({
         position: { lat: store.lat, lng: store.lng },
         icon: {
-          url:        fallbackUrl,
-          scaledSize: new gMaps.Size(fw, fh),
-          anchor:     new gMaps.Point(fax, fay),
+          url:        initIconUrl,
+          scaledSize: new gMaps.Size(iw, ih),
+          anchor:     new gMaps.Point(iax, iay),
         },
         title:  store.name,
         zIndex: isActive ? 10 : 5,
@@ -752,8 +802,8 @@ export const MapView = forwardRef<MapViewHandle, MapViewProps>(function MapView(
         map: isActive ? undefined : map,
       });
 
-      // 非同期で iconUrl を data URL 化してから差し替え (失敗時は絵文字ピンのまま)
-      if (hasCustomIcon && store.iconUrl) {
+      // 未キャッシュ (初回) のみ: 非同期で base64 化してから差し替え (失敗時は絵文字ピンのまま)
+      if (hasCustomIcon && store.iconUrl && !preCustomPin) {
         fetchIconAsDataUrl(store.iconUrl).then(dataUrl => {
           if (!dataUrl) return;
           const customPinUrl = makeIconPinUrl(dataUrl, isActive);
@@ -1030,12 +1080,17 @@ export const MapView = forwardRef<MapViewHandle, MapViewProps>(function MapView(
 
   return (
     <div className="w-full h-full relative">
-      <div ref={containerRef} className="w-full h-full" />
+      {/* ★ コンテナに最初からベージュ背景を敷く。 これで地図生成前の白チラつきを
+          無くし、 0ms でベージュ (=地図と同色) が出る → タイルがその上に乗るだけの
+          「一瞬で地図が出た」体感になる。 */}
+      <div ref={containerRef} className="w-full h-full bg-[#f2f0eb]" />
 
-      {status === 'loading' && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#f2f0eb] gap-3">
-          <div className="w-9 h-9 border-[3px] border-primary border-t-transparent rounded-full animate-spin" />
-          <p className="text-xs text-muted-foreground font-medium">地図を読み込んでいます...</p>
+      {/* ★ ローディング用の全画面オーバーレイは廃止。 status==='loading' でも地図
+          コンテナ (ベージュ) をそのまま見せる。 本当に遅い時 (700ms 超) だけ、
+          地図を覆わない控えめなスピナーを右下に小さく出す。 */}
+      {status === 'loading' && showSpinner && (
+        <div className="absolute bottom-4 right-4 pointer-events-none">
+          <div className="w-7 h-7 border-[3px] border-primary border-t-transparent rounded-full animate-spin" />
         </div>
       )}
 

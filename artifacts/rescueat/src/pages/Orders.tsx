@@ -9,6 +9,7 @@ import { useListReservations, getListReservationsQueryKey } from '@workspace/api
 import { useQuery } from '@tanstack/react-query';
 import { authedFetch } from '@/lib/authed-fetch';
 import { normalizeBrand } from '@/lib/brand-text';
+import { pickupWindowsLabel } from '@/lib/utils';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   ChevronLeft, Receipt, ShoppingBag, CheckCircle2, XCircle,
@@ -66,6 +67,27 @@ function formatDateShort(dateStr?: string | null) {
   const d = new Date(dateStr);
   if (isNaN(d.getTime())) return '—';
   return d.toLocaleDateString('ja-JP', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+// ── 受け取り「日付＋時間帯」を bag から算出 ─────────────────────────────
+//   ★ 2026-07-03 事故対応: 前日出品（pickupNextDay=夜に公開して受取は翌日）のバッグで、
+//     購入履歴が「購入日」しか出しておらず、お客様が“見た日＝受取日”と誤解して
+//     まだ開いてない前日に来店→受け取れない事故が発生（anpan）。
+//   対策: 購入履歴・受取コード欄に「実際の受取日（前日出品は +1日）＋受取時間帯」を明示する。
+//   bag.createdAt = 公開日（JST）。pickupNextDay の受取日は公開日の翌日。同日出品は公開日当日。
+const PICKUP_WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
+function pickupInfo(bag: any): { dateLabel: string; window: string; nextDay: boolean } | null {
+  if (!bag || !bag.createdAt) return null;
+  const created = new Date(bag.createdAt);
+  if (isNaN(created.getTime())) return null;
+  // 公開日を JST の暦日で確定し（getPickupDateLabel と同一ロジック）、前日出品なら +1 日。
+  // デバイスのタイムゾーンに依存しないよう UTC で日付演算する。
+  const jstYmd = created.toLocaleDateString('en-CA', { timeZone: 'Asia/Tokyo' }); // YYYY-MM-DD
+  const [y, m, d] = jstYmd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + (bag.pickupNextDay ? 1 : 0)));
+  const dateLabel = `${dt.getUTCMonth() + 1}月${dt.getUTCDate()}日(${PICKUP_WEEKDAYS[dt.getUTCDay()]})`;
+  const window = pickupWindowsLabel(bag.pickupStart, bag.pickupEnd, bag.pickupStart2, bag.pickupEnd2);
+  return { dateLabel, window, nextDay: !!bag.pickupNextDay };
 }
 
 // ── 6桁受取コード（OrderTicket.tsx の toDisplayCode と同一ロジック）──────────
@@ -551,12 +573,20 @@ export default function Orders() {
 
   const isStoreOwner = profile?.role === 'store_owner';
 
-  const filtered = (reservations || []).filter(r => {
-    if (filter === 'all') return true;
-    if (filter === 'picked_up') return r.status === 'picked_up';
-    if (filter === 'cancelled') return r.status === 'cancelled' || (r.status as string) === 'no_show';
-    return true;
-  });
+  const filtered = (reservations || [])
+    .filter(r => {
+      if (filter === 'all') return true;
+      if (filter === 'picked_up') return r.status === 'picked_up';
+      if (filter === 'cancelled') return r.status === 'cancelled' || (r.status as string) === 'no_show';
+      return true;
+    })
+    // 新規順（新しい購入を上に）。createdAt 同着は id 降順で安定化。
+    .sort((a, b) => {
+      const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      if (tb !== ta) return tb - ta;
+      return (b.id ?? 0) - (a.id ?? 0);
+    });
 
   // 領収書は受取完了 (picked_up) のみ発行可能。 キャンセル/no_show/未受取は不可。
   const selectedRaw = reservations?.find(r => r.id === selectedId);
@@ -640,6 +670,7 @@ export default function Orders() {
               {filtered.map(r => {
                 const status = (r.status as ReservationStatus) || 'pending';
                 const meta = STATUS_META[status] || STATUS_META.pending;
+                const pi = pickupInfo(r.bag);
                 return (
                   <motion.button
                     key={r.id}
@@ -671,12 +702,24 @@ export default function Orders() {
                         </div>
                         {/* Row 2: bag title */}
                         <p className="text-xs text-muted-foreground truncate min-w-0">{normalizeBrand(r.bag?.title) || 'おすそわけバッグ'}</p>
-                        {/* Row 3: date + price */}
-                        <div className="flex items-center justify-between mt-2">
-                          <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                            <Store className="w-3 h-3 shrink-0" />
-                            <span className="shrink-0">{formatDateShort(r.createdAt)}</span>
-                          </div>
+                        {/* Row 3: 受取日時 + price
+                            ★ 以前は購入日(createdAt)を出していて、前日出品バッグで
+                              「受取日」と誤解される事故があった。実際の受取日+時間帯を出す。 */}
+                        <div className="flex items-center justify-between gap-2 mt-2">
+                          {pi ? (
+                            <div className="flex items-center gap-1 text-xs text-muted-foreground min-w-0">
+                              <Clock className="w-3 h-3 shrink-0 text-primary" />
+                              <span className="truncate">
+                                <span className="font-bold text-foreground">受取 {pi.dateLabel}</span>
+                                {pi.window && <span className="ml-1">{pi.window}</span>}
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-1 text-xs text-muted-foreground min-w-0">
+                              <Store className="w-3 h-3 shrink-0" />
+                              <span className="shrink-0">{formatDateShort(r.createdAt)}</span>
+                            </div>
+                          )}
                           <div className="flex items-center gap-1.5 shrink-0">
                             {status === 'picked_up' && (
                               <span className="flex items-center gap-0.5 bg-primary/10 text-primary text-[10px] font-black px-1.5 py-0.5 rounded-full border border-primary/20">
@@ -697,14 +740,28 @@ export default function Orders() {
                         濱島さん報告対応: お店で提示する6桁コードを購入履歴からすぐ見つけられるように。
                         受取完了・キャンセルは提示不要なので出さない。 */}
                     {(status === 'pending' || status === 'confirmed') && (
-                      <div className="mx-4 mb-3 -mt-1 flex items-center justify-between gap-2 bg-primary/5 border border-primary/20 rounded-xl px-3 py-2">
-                        <span className="flex items-center gap-1.5 text-[11px] font-bold text-primary/80 shrink-0">
-                          <QrCode className="w-3.5 h-3.5" />
-                          お店に見せる受取コード
-                        </span>
-                        <span className="font-mono font-black text-xl tracking-[0.25em] text-primary tabular-nums whitespace-nowrap">
-                          {toDisplayCode((r as any).pickupCode, r.id)}
-                        </span>
+                      <div className="mx-4 mb-3 -mt-1 space-y-2">
+                        {/* ★ 受け取り日時を最優先で明示（前日出品で来店日を誤解する事故の再発防止） */}
+                        {pi && (
+                          <div className="flex items-start gap-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-300/60 dark:border-amber-700/40 rounded-xl px-3 py-2">
+                            <Clock className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                            <div className="min-w-0">
+                              <p className="text-[10px] font-bold text-amber-700/80 dark:text-amber-400/80 leading-tight">受け取り日時（この日時にご来店ください）</p>
+                              <p className="text-sm font-black text-amber-800 dark:text-amber-300 leading-tight mt-0.5">
+                                {pi.dateLabel}{pi.window && <span className="ml-1.5">{pi.window}</span>}
+                              </p>
+                            </div>
+                          </div>
+                        )}
+                        <div className="flex items-center justify-between gap-2 bg-primary/5 border border-primary/20 rounded-xl px-3 py-2">
+                          <span className="flex items-center gap-1.5 text-[11px] font-bold text-primary/80 shrink-0">
+                            <QrCode className="w-3.5 h-3.5" />
+                            お店に見せる受取コード
+                          </span>
+                          <span className="font-mono font-black text-xl tracking-[0.25em] text-primary tabular-nums whitespace-nowrap">
+                            {toDisplayCode((r as any).pickupCode, r.id)}
+                          </span>
+                        </div>
                       </div>
                     )}
                   </motion.button>

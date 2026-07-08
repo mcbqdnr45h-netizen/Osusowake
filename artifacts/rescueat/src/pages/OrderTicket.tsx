@@ -2,7 +2,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useRoute, useLocation } from 'wouter';
 import { Layout } from '@/components/Layout';
 import { useGetReservation } from '@workspace/api-client-react';
-import { formatPickupTime } from '@/lib/utils';
+import { formatPickupTime, effectivePickupDate } from '@/lib/utils';
 import { normalizeBrand } from '@/lib/brand-text';
 import { useQueryClient } from '@tanstack/react-query';
 import { motion, useMotionValue, useTransform, animate, AnimatePresence } from 'framer-motion';
@@ -460,7 +460,7 @@ export default function OrderTicket() {
             <div className="grid grid-cols-2 gap-2">
               <div className="bg-secondary/60 rounded-xl px-3 py-2 flex items-center gap-2">
                 <Clock className="w-3.5 h-3.5 text-primary shrink-0" />
-                <span className="text-xs font-bold">{formatPickupTime(reservation.bag?.pickupStart, reservation.bag?.pickupEnd, reservation.createdAt)}</span>
+                <span className="text-xs font-bold">{formatPickupTime(reservation.bag?.pickupStart, reservation.bag?.pickupEnd, effectivePickupDate((reservation.bag as { createdAt?: string })?.createdAt, (reservation.bag as { pickupNextDay?: boolean })?.pickupNextDay) ?? reservation.createdAt)}</span>
               </div>
               <div className="bg-secondary/60 rounded-xl px-3 py-2 flex items-center gap-2 overflow-hidden">
                 <MapPin className="w-3.5 h-3.5 text-primary shrink-0" />

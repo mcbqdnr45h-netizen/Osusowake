@@ -5,7 +5,7 @@ import {
   ChevronRight, Home, Copy, Check, Sparkles, Receipt,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
-import { formatPickupTime } from '@/lib/utils';
+import { formatPickupTime, pickupWindowsLabel, getPickupDateLabel } from '@/lib/utils';
 import confetti from 'canvas-confetti';
 import { useQueryClient } from '@tanstack/react-query';
 import { useUserId } from '@/hooks/use-user';
@@ -21,6 +21,10 @@ interface OrderReceipt {
   totalPrice: number;
   pickupStart: string | null;
   pickupEnd: string | null;
+  pickupStart2?: string | null;
+  pickupEnd2?: string | null;
+  pickupNextDay?: boolean | null;
+  bagCreatedAt?: string | null;
 }
 
 function fireConfetti() {
@@ -231,20 +235,42 @@ export default function CheckoutSuccess() {
               </div>
             )}
 
-            {(receipt?.pickupStart || receipt?.pickupEnd) && (
-              <div className="flex items-start gap-3">
-                <div className="w-9 h-9 rounded-xl bg-amber-100 flex items-center justify-center shrink-0">
-                  <Clock className="w-4 h-4 text-amber-600" />
+            {(receipt?.pickupStart || receipt?.pickupEnd) && (() => {
+              // ★ 受取「日付」も明示する（前日出品バッグで来店日を誤解する事故の再発防止）。
+              //   bagCreatedAt(公開日・JST) + pickupNextDay で実際の受取日を算出。
+              const label = getPickupDateLabel(receipt.bagCreatedAt, receipt.pickupNextDay ?? false);
+              let dateLabel = '';
+              if (receipt.bagCreatedAt) {
+                const created = new Date(receipt.bagCreatedAt);
+                if (!isNaN(created.getTime())) {
+                  const jstYmd = created.toLocaleDateString('en-CA', { timeZone: 'Asia/Tokyo' });
+                  const [yy, mm, dd] = jstYmd.split('-').map(Number);
+                  const dt = new Date(Date.UTC(yy, mm - 1, dd + (receipt.pickupNextDay ? 1 : 0)));
+                  const wd = ['日', '月', '火', '水', '木', '金', '土'][dt.getUTCDay()];
+                  dateLabel = `${dt.getUTCMonth() + 1}月${dt.getUTCDate()}日(${wd})`;
+                }
+              }
+              const windowLabel = pickupWindowsLabel(receipt.pickupStart, receipt.pickupEnd, receipt.pickupStart2, receipt.pickupEnd2) || formatPickupTime(receipt.pickupStart, receipt.pickupEnd);
+              return (
+                <div className="flex items-start gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-amber-100 flex items-center justify-center shrink-0">
+                    <Clock className="w-4 h-4 text-amber-600" />
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
+                      受け取り日時
+                      {label.isTomorrow && (
+                        <span className="normal-case tracking-normal text-[10px] font-black text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded-full">🌙 明日</span>
+                      )}
+                    </p>
+                    <p className="font-black text-foreground text-base text-amber-700">
+                      {dateLabel && <span>{dateLabel} </span>}{windowLabel}
+                    </p>
+                    <p className="text-[10px] text-muted-foreground mt-0.5">この日時にご来店ください</p>
+                  </div>
                 </div>
-                <div>
-                  <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">受取時間</p>
-                  <p className="font-black text-foreground text-base text-amber-700">
-                    {formatPickupTime(receipt.pickupStart, receipt.pickupEnd)}
-                  </p>
-                  <p className="text-[10px] text-muted-foreground mt-0.5">この時間内にお受取りください</p>
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {receipt?.totalPrice !== undefined && (
               <div className="flex items-center justify-between pt-4 border-t border-border/60">

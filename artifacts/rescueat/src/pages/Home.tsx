@@ -8,8 +8,10 @@ import {
   useListReservations,
   getListAllBagsQueryKey,
   getListReservationsQueryKey,
+  customFetch,
   SurpriseBagWithStore,
 } from '@workspace/api-client-react';
+import { useQuery } from '@tanstack/react-query';
 import {
   Search, Store, MapPin, Zap, Flame, Moon, Navigation2,
   SlidersHorizontal, ChevronDown, X, PackageOpen, Loader2, Map as MapIcon,
@@ -30,22 +32,13 @@ import { useAppSettings } from '@/hooks/use-app-settings';
 import { useToast } from '@/hooks/use-toast';
 import { Capacitor } from '@capacitor/core';
 import { loadGoogleMapsScript } from '@/lib/maps-loader';
+import { prewarmMap } from '@/lib/map-prewarm';
 
 // ─── 日次シードシャッフル ─────────────────────────────────────────────────
 // 毎日異なる順番になるが、同じ日の中はリフレッシュしても同じ順番を維持する
 function getDailySeed(): number {
   const d = new Date();
   return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
-}
-function seededShuffle<T>(arr: T[], seed: number): T[] {
-  const a = [...arr];
-  let s = seed;
-  for (let i = a.length - 1; i > 0; i--) {
-    s = ((s * 1664525 + 1013904223) | 0) >>> 0;
-    const j = s % (i + 1);
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
 }
 
 // ─── カテゴリーピル ────────────────────────────────────────────────────────
@@ -207,7 +200,12 @@ function NationwideBanner({ onAllow }: { onAllow: () => void }) {
 function FloatingMapButton() {
   useEffect(() => {
     let cancelled = false;
-    const trigger = () => { if (!cancelled) loadGoogleMapsScript().catch(() => { /* noop */ }); };
+    const trigger = () => {
+      if (cancelled) return;
+      loadGoogleMapsScript().catch(() => { /* noop */ });
+      // スクリプト先読みに続けて、裏で隠しMapを1回だけ温める（初回オープンを即時化）。
+      prewarmMap();
+    };
     const ric = (window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number }).requestIdleCallback;
     const cic = (window as unknown as { cancelIdleCallback?: (id: number) => void }).cancelIdleCallback;
     const id: number = ric ? ric(trigger, { timeout: 2500 }) : window.setTimeout(trigger, 1500);
@@ -220,6 +218,8 @@ function FloatingMapButton() {
 
   const prefetch = useCallback(() => {
     loadGoogleMapsScript().catch(() => { /* noop */ });
+    // ★ スクリプトだけでなくタイルも温める (意図プリフェッチ)。 prewarmMap は多重呼び出し安全。
+    prewarmMap();
   }, []);
 
   return (
@@ -333,6 +333,17 @@ export default function Home() {
   const userId = useUserId();
   const { data: bags, isLoading: isLoadingBags } = useListAllBags({
     query: { queryKey: getListAllBagsQueryKey(), refetchInterval: 60_000, staleTime: 30_000 },
+  });
+
+  // ── 本日分の「完売・受取終了」バッグ ──
+  //   /api/bags は notExpired で時間切れを弾くため、時間切れバッグ(松村製麺所など)は取れない。
+  //   専用エンドポイント /api/bags/ended-today が「今日出品・完売 or 時間切れ」を返す
+  //   (stockCount は一律0で返るので BagCard が自動で完売表示)。
+  const { data: endedTodayBags } = useQuery<SurpriseBagWithStore[]>({
+    queryKey: ['bags', 'ended-today'],
+    queryFn: () => customFetch<SurpriseBagWithStore[]>('/api/bags/ended-today'),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
   });
 
   // 未決済の予約を取得（仮押さえ廃止後は期限なし — 未払いのまま残る）
@@ -456,6 +467,37 @@ export default function Home() {
   // 日次シードは1日中固定（ページリフレッシュしても同じ順番）
   const dailySeed = useMemo(() => getDailySeed(), []);
 
+  // ── セクション横断の「先頭かぶり」防止 ──
+  //   問題: 各セクションが独立に seededShuffle していると、たまたま同じ商品が
+  //   全セクション（今日のおすすめ/今夜/朝/カテゴリ…）の先頭を独占し得る（実際に発生）。
+  //   対策: 1日固定のマスター順を1本だけ作り、セクションごとに rank を回転させて
+  //   並べる。 セクション k は「マスター rank == k」の商品を先頭に寄せるので、
+  //   同一商品が先頭に来るのは高々1セクション → 全セクション独占が構造的に不可能。
+  //   （シャッフル方式は維持。日次シードで1日中安定。）
+  const masterRank = useMemo(() => {
+    // ★ 各バッグの順位を「id × 日次シード」の決定論ハッシュで固定する。
+    //   旧実装は seededShuffle (インデックス基準の Fisher-Yates) で入力配列の
+    //   長さ・並びに依存していたため、在庫0/完売/期限切れ/新着で集合が1件でも
+    //   増減するたびに順列が総取り替えになり、無関係な商品まで発見ページから
+    //   「出たり消えたり」する原因になっていた (inStockOnly 既定ON=在庫が動く度に発症)。
+    //   ハッシュ順なら集合が変わっても生存アイテムの相対順序は不変 →
+    //   実際に増減した1件だけが出入りし、全体のチラつきが消える。日次固定も維持。
+    const hash = (id: number) => (((id ^ dailySeed) * 1664525 + 1013904223) | 0) >>> 0;
+    const order = [...visibleBags].sort((a, b) => hash(a.id) - hash(b.id) || a.id - b.id);
+    const m = new Map<number, number>();
+    order.forEach((b, i) => m.set(b.id, i));
+    return m;
+  }, [visibleBags, dailySeed]);
+
+  const diversify = useCallback(
+    (arr: SurpriseBagWithStore[], sectionOffset: number) => {
+      const n = Math.max(masterRank.size, 1);
+      const rot = (id: number) => (((masterRank.get(id) ?? 0) - sectionOffset) % n + n) % n;
+      return [...arr].sort((a, b) => rot(a.id) - rot(b.id));
+    },
+    [masterRank],
+  );
+
   // ── 現在時刻 (ms) を 60 秒ごとに更新 (もうすぐ終わるセクションの動的判定用) ──
   //   旧版は HH:MM 文字列比較だったため "02:00" < "23:59" の辞書順逆転で
   //   「23:59 終了の商品が 02:00 終了の商品より後ろになる」不具合が起きていた。
@@ -519,6 +561,18 @@ export default function Home() {
     return applySortKey(result);
   }, [visibleBags, searchQuery, activeCategory, halfOff, under500, urgent30, applySortKey, isUrgent30]);
 
+  // 「明日受け取り」(翌日公開・pickup_next_day)のバッグ判定。
+  //   今日向けの各セクション(今夜/朝/半額/近く/カテゴリ/新着)からは除外し、
+  //   専用「明日の受け取り」セクションだけに出す。 これが無いと pickup 時刻(HH:MM)だけで
+  //   時間帯バケツに振り分けられ、 明日07:00〜18:30 の袋が「朝(5〜10)」「今夜(17〜24)」に誤って混入する。
+  const isTomorrowBag = useCallback(
+    (b: unknown) => getPickupDateLabel(
+      (b as { createdAt?: string }).createdAt,
+      (b as { pickupNextDay?: boolean }).pickupNextDay,
+    ).isTomorrow,
+    [],
+  );
+
   // ── ① もうすぐ終わるおすそわけ ──
   //   判定: 受付終了まで「0ms 以上 〜 180 分以内」
   //   並び: 「もうすぐ終わる」 セクションは sortKey に関係なく必ず残り時間が短い順で固定。
@@ -543,10 +597,10 @@ export default function Home() {
     const filtered = sortedVisibleBags.filter(b => b.stockCount > 0 &&
       !getPickupDateLabel((b as { createdAt?: string }).createdAt, (b as { pickupNextDay?: boolean }).pickupNextDay).isTomorrow);
     if (sortKey === 'default') {
-      return seededShuffle(filtered, dailySeed).slice(0, 8);
+      return diversify(filtered, 0).slice(0, 8);
     }
     return applySortKey(filtered).slice(0, 8);
-  }, [sortedVisibleBags, applySortKey, sortKey, dailySeed]);
+  }, [sortedVisibleBags, applySortKey, sortKey, diversify]);
 
   // ── 明日の受け取り ── 翌日受け取りの出品（定期出品の前日公開分など）をまとめる
   const tomorrowBags = useMemo(() => {
@@ -566,19 +620,20 @@ export default function Home() {
         map.set(b.id, haversineMeters(userCoords.lat, userCoords.lng, b.store.lat!, b.store.lng!));
       }
     }
-    // nearbyBags: 在庫あり・近い順TOP8
+    // nearbyBags: 在庫あり・近い順TOP8（明日受け取りは専用セクションへ除外）
     const withDist = visibleBags
-      .filter(b => b.stockCount > 0 && b.store.lat != null && b.store.lng != null)
+      .filter(b => b.stockCount > 0 && !isTomorrowBag(b) && b.store.lat != null && b.store.lng != null)
       .map(b => ({ bag: b, d: map.get(b.id)! }))
       .sort((a, b) => a.d - b.d)
       .slice(0, 8)
       .map(x => x.bag);
     return { nearbyBags: withDist, distMap: map };
-  }, [visibleBags, userCoords]);
+  }, [visibleBags, userCoords, isTomorrowBag]);
 
   // ── ④ 今夜の受け取り（17:00〜翌02:00、深夜またぎ含む） ──
-  const eveningBags = useMemo(
-    () => applySortKey(sortedVisibleBags.filter(b => {
+  const eveningBags = useMemo(() => {
+    const filtered = sortedVisibleBags.filter(b => {
+      if (isTomorrowBag(b)) return false; // 明日受け取りは専用セクションへ
       const start = b.pickupStart || '';
       const end   = b.pickupEnd   || '';
       if (!start) return false;
@@ -586,9 +641,10 @@ export default function Home() {
       if (end && end < start) return true;
       // 通常: 開始が24:00以前 かつ 終了が17:00以降
       return start <= '23:59' && (!end || end >= '17:00');
-    })).slice(0, 8),
-    [sortedVisibleBags, applySortKey]
-  );
+    });
+    if (sortKey === 'default') return diversify(filtered, 1).slice(0, 8);
+    return applySortKey(filtered).slice(0, 8);
+  }, [sortedVisibleBags, applySortKey, sortKey, diversify, isTomorrowBag]);
 
   // ── ⑤ 半額以上のお得（discount >= 50%） ──
   //   ★ カードの「% OFF」 バッジは getDisplayDiscountPercent (表示価格ベース) なので、
@@ -596,17 +652,19 @@ export default function Home() {
   const halfOffSectionBags = useMemo(() => {
     const filtered = sortedVisibleBags.filter(b =>
       b.stockCount > 0 &&
+      !isTomorrowBag(b) &&
       b.originalPrice > 0 &&
       getDisplayDiscountPercent(b.originalPrice, b.discountedPrice) >= 50
     );
-    if (sortKey === 'default') return seededShuffle(filtered, dailySeed + 4).slice(0, 10);
+    if (sortKey === 'default') return diversify(filtered, 3).slice(0, 10);
     return filtered.slice(0, 10);
-  }, [sortedVisibleBags, sortKey, dailySeed]);
+  }, [sortedVisibleBags, sortKey, diversify, isTomorrowBag]);
 
   // ── ⑥ 朝の受け取り（5:00〜10:00） ──
   const morningBags = useMemo(() => {
     const filtered = sortedVisibleBags.filter(b => {
       if (b.stockCount <= 0) return false;
+      if (isTomorrowBag(b)) return false; // 明日受け取りは専用セクションへ
       const start = b.pickupStart || '';
       const end   = b.pickupEnd   || '';
       if (!start) return false;
@@ -619,40 +677,57 @@ export default function Home() {
       // 終了未定: 開始が朝時間帯
       return start >= '05:00' && start <= '10:00';
     });
-    if (sortKey === 'default') return seededShuffle(filtered, dailySeed + 6).slice(0, 10);
+    if (sortKey === 'default') return diversify(filtered, 2).slice(0, 10);
     return filtered.slice(0, 10);
-  }, [sortedVisibleBags, sortKey, dailySeed]);
+  }, [sortedVisibleBags, sortKey, diversify, isTomorrowBag]);
 
   // ── ⑦⑧⑨ カテゴリー別 ──
   const mealsBags = useMemo(() => {
-    const filtered = sortedVisibleBags.filter(b => normalizeCategory(b.category) === 'meals');
-    if (sortKey === 'default') return seededShuffle(filtered, dailySeed + 1).slice(0, 10);
+    const filtered = sortedVisibleBags.filter(b => !isTomorrowBag(b) && normalizeCategory(b.category) === 'meals');
+    if (sortKey === 'default') return diversify(filtered, 4).slice(0, 10);
     return filtered.slice(0, 10);
-  }, [sortedVisibleBags, sortKey, dailySeed]);
+  }, [sortedVisibleBags, sortKey, diversify, isTomorrowBag]);
   const bakeryBags = useMemo(() => {
-    const filtered = sortedVisibleBags.filter(b => normalizeCategory(b.category) === 'bakery_sweets');
-    if (sortKey === 'default') return seededShuffle(filtered, dailySeed + 2).slice(0, 10);
+    const filtered = sortedVisibleBags.filter(b => !isTomorrowBag(b) && normalizeCategory(b.category) === 'bakery_sweets');
+    if (sortKey === 'default') return diversify(filtered, 5).slice(0, 10);
     return filtered.slice(0, 10);
-  }, [sortedVisibleBags, sortKey, dailySeed]);
+  }, [sortedVisibleBags, sortKey, diversify, isTomorrowBag]);
   const ingredientBags = useMemo(() => {
-    const filtered = sortedVisibleBags.filter(b => normalizeCategory(b.category) === 'ingredients');
-    if (sortKey === 'default') return seededShuffle(filtered, dailySeed + 3).slice(0, 10);
+    const filtered = sortedVisibleBags.filter(b => !isTomorrowBag(b) && normalizeCategory(b.category) === 'ingredients');
+    if (sortKey === 'default') return diversify(filtered, 6).slice(0, 10);
     return filtered.slice(0, 10);
-  }, [sortedVisibleBags, sortKey, dailySeed]);
+  }, [sortedVisibleBags, sortKey, diversify, isTomorrowBag]);
 
   // ── ⑩ 新着店舗（過去7日以内に作成された店舗のバッグ） ──
   const newStoreBags = useMemo(() => {
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     const filtered = sortedVisibleBags.filter(b => {
       if (b.stockCount <= 0) return false;
+      if (isTomorrowBag(b)) return false; // 明日受け取りは専用セクションへ
       const createdAt = (b.store as { createdAt?: string | Date }).createdAt;
       if (!createdAt) return false;
       const ts = typeof createdAt === 'string' ? Date.parse(createdAt) : createdAt.getTime();
       return Number.isFinite(ts) && ts >= sevenDaysAgo;
     });
-    if (sortKey === 'default') return seededShuffle(filtered, dailySeed + 5).slice(0, 10);
+    if (sortKey === 'default') return diversify(filtered, 7).slice(0, 10);
     return filtered.slice(0, 10);
-  }, [sortedVisibleBags, sortKey, dailySeed]);
+  }, [sortedVisibleBags, sortKey, diversify, isTomorrowBag]);
+
+  // ── ⑪ 本日分「完売・受取終了」──
+  //   出品が少ない時に発見ページを実データで埋める + 「お気に入り→次回入荷通知」の導線。
+  //   /api/bags/ended-today = 今日出品・完売(stock0) or 受取時間切れ(松村製麺所など) を返す。
+  //   これで時間過ぎたバッグも含めて全部「完売」表示に残せる。
+  const soldOutBags = useMemo(() => {
+    let b = endedTodayBags ?? [];
+    if (activeItemType !== 'all') b = b.filter(x => ((x as { itemType?: string }).itemType ?? 'bag') === activeItemType);
+    return b; // ★ 全件表示（縦2列グリッド）。 完売/本日終了はカード毎に出し分け。キャップしない。
+  }, [endedTodayBags, activeItemType]);
+
+  // ── コンパクトモード判定 ──
+  //   出品が少ない時は 11個のテーマ別セクションが全部「同じ数件」を映して重複だけが増える。
+  //   在庫あり出品が閾値以下なら、テーマ別を全部畳んで「1グリッド＋完売」だけのコンパクト表示にする。
+  const COMPACT_MODE_MAX_BAGS = 8;
+  const isSparse = sortedVisibleBags.length <= COMPACT_MODE_MAX_BAGS;
 
   const activeFilterCnt = [activeCategory !== 'all', inStockOnly !== true, urgent30, halfOff, under500].filter(Boolean).length;
 
@@ -1000,6 +1075,10 @@ export default function Home() {
                     都市名はあくまで表示用ラベルであり、 位置機能の有効/無効は GPS で判断する。 */}
                 {!gpsLoading && gpsDenied && !userCoords && <NationwideBanner onAllow={handleAllowLocation} />}
 
+                {/* ─── テーマ別セクション群（出品が十分ある時だけ） ───
+                    出品が少ない時(isSparse)は全セクションが同じ数件の重複になるため丸ごと畳み、
+                    下の「すべてのおすそわけ」グリッド＋完売のみのコンパクト表示にする。 */}
+                {!isSparse && (<>
                 {/* ① もうすぐ終わるおすそわけ */}
                 {(isLoadingBags || urgentBags.length > 0) && (
                   <div className="pt-3 pb-2">
@@ -1131,6 +1210,7 @@ export default function Home() {
                     <HorizScrollRow bags={ingredientBags} loading={false} />
                   </div>
                 )}
+                </>)}
 
                 {/* 区切り & すべてのおすそわけ */}
                 {!isLoadingBags && (
@@ -1197,6 +1277,31 @@ export default function Home() {
                     </motion.div>
                   )}
                 </div>
+
+                {/* ⑪ 本日分完売（お気に入りで次回入荷通知）
+                    受付中グリッドの“下”に配置＝買える商品を先に見せる。 コンパクトモード時も
+                    テーマ別が畳まれるため、 1件のすぐ下でちゃんと見える。
+                    inStockOnly ON の時だけ表示。 OFF の時は完売バッグが上のグリッドに既に出るため二重表示を防ぐ。 */}
+                {!isLoadingBags && inStockOnly && soldOutBags.length > 0 && (
+                  <div className="pt-4 pb-2">
+                    <SectionHeader
+                      icon={<span className="text-sm leading-none">🌸</span>}
+                      title="本日分は終了しました"
+                      count={soldOutBags.length}
+                    />
+                    <p className="px-4 -mt-1.5 mb-2 text-[11px] text-muted-foreground font-medium leading-snug">
+                      お店をお気に入り登録すると、このお店の出品を見逃さず通知でお知らせします
+                    </p>
+                    {/* ★ 縦2列グリッド + compact カード(いつもの出品カードと同じ小型レイアウト)。
+                        各カードが endReason で「完売御礼🌸/本日終了🌙」を出し分ける。
+                        compact にすると店舗名は画像下にテキスト表示・「応援する」も1行でコンパクト。 */}
+                    <div className="grid grid-cols-2 gap-2 px-4">
+                      {soldOutBags.map(bag => (
+                        <BagCard key={String(bag.id)} bag={bag} compact />
+                      ))}
+                    </div>
+                  </div>
+                )}
               </motion.div>
             )}
           </AnimatePresence>

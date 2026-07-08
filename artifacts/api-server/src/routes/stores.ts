@@ -7,6 +7,7 @@ import { escapeHtml } from "../lib/escape.js";
 import { requireAuth, requireStoreOwner } from "../middlewares/auth.js";
 import { requireAdmin } from "./admin.js";
 import { bagVisibleSql } from "../lib/bag-visibility.js";
+import { cached, invalidate } from "../lib/ttl-cache.js";
 import {
   ListStoresQueryParams,
   CreateStoreBody,
@@ -324,13 +325,16 @@ router.get("/stores", async (req, res) => {
   try {
     ListStoresQueryParams.parse(req.query);
 
+    // ★ 公開一覧: 全ユーザー同一結果 & 秒間多数の refetch → 10 秒メモリキャッシュ。
+    //   店舗の承認/出品/在庫変化時は該当ミューテーションで invalidate("stores:list") 済み。
+    const stores = await cached("stores:list", 10_000, async () =>
     // ★ 公開エンドポイント: PII を含まない publicStoreSelectFields を使用 (#3)
     // show_on_map = true は管理者が手動で立てる強制表示フラグ。
     //   → 承認・口座設定・出品の有無に関わらず、is_active のみを条件にマップに表示する
     // それ以外は通常の「承認済み + 口座OK」ルール
     // 注: Stripe が無効化された場合は webhook で stripe_charges_enabled=false かつ
     //     show_on_map=false を同時に設定するため、自動的にマップから消える。
-    const stores = await db
+      db
       .select(publicStoreSelectFields)
       // ★ 性能: マーカーの個数集計(totalBagsAvailable / soldOutToday)は「今日/昨日作成」のバッグしか
       //   対象にならない(bagVisibleSql の全CASE が created today/yesterday 前提)。 なので結合自体を
@@ -345,7 +349,8 @@ router.get("/stores", async (req, res) => {
         coalesce(${storesTable.showOnMap}, false) = true
         OR (${storesTable.status} = 'approved' AND coalesce(${storesTable.stripeChargesEnabled}, false) = true)
       )`)
-      .groupBy(storesTable.id);
+      .groupBy(storesTable.id)
+    );
 
     res.json(stores);
   } catch (err) {
@@ -818,14 +823,30 @@ router.post("/stores/upload-document", requireAuth, async (req, res) => {
     }
 
     // Extract MIME type and raw base64 data
-    const match = imageBase64.match(/^data:(image\/[\w+]+);base64,(.+)$/s);
-    if (!match) {
-      return res.status(400).json({ error: "bad_request", message: "無効な画像データ形式です" });
+    // ★ セキュリティ修正 (2026-07-08): 旧正規表現 image/[\w+]+ は image/svg+xml も
+    //   許可していた。SVG は <script> を埋め込めるため、審査で管理者がプレビュー
+    //   した瞬間にストアド XSS になりうる。ラスター画像のみの厳格 allowlist にする。
+    const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+    const match = imageBase64.match(/^data:([\w./+-]+);base64,(.+)$/s);
+    if (!match || !ALLOWED_IMAGE_TYPES.has(match[1])) {
+      return res.status(400).json({ error: "bad_request", message: "対応していない画像形式です（JPEG / PNG / WebP のみ）" });
     }
 
     const contentType = match[1];
     const ext = contentType === "image/png" ? "png" : contentType === "image/webp" ? "webp" : "jpg";
     const buffer = Buffer.from(match[2], "base64");
+
+    // ★ マジックナンバー検証: 宣言 MIME と実バイトが一致するか確認し、
+    //   拡張子/Content-Type を偽装した実行可能ファイルのアップロードを防ぐ。
+    const sigOk =
+      (contentType === "image/jpeg" && buffer.length > 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) ||
+      (contentType === "image/png"  && buffer.length > 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) ||
+      (contentType === "image/webp" && buffer.length > 12 &&
+        buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+        buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50);
+    if (!sigOk) {
+      return res.status(400).json({ error: "bad_request", message: "画像データが破損しているか、形式が一致しません" });
+    }
 
     // fileType はクライアント入力。 そのままパスに使うと "../" 等でバケット内の
     //   他ユーザ領域へ書き込めてしまうため、 英数とハイフン/アンダースコアのみ許可。
@@ -1018,6 +1039,10 @@ router.post("/admin/stores/:storeId/approve", requireAdmin, async (req, res) => 
       return;
     }
 
+    // ★ 承認で公開対象が変わる → 一覧キャッシュを破棄（承認店が即マップに出るように）。
+    //   これが無いと最大10秒 approved 済みの店がマップに出ず「承認したのに見えない」事故。
+    invalidate("stores:list"); invalidate("bags:list");
+
     // ── Stripe 連携状態をチェック（承認とは独立して確認）──
     let stripeStatus: {
       ok: boolean;
@@ -1136,6 +1161,9 @@ router.post("/admin/stores/:storeId/reject", requireAdmin, async (req, res) => {
       res.status(404).json({ error: "not_found", message: "Store not found" });
       return;
     }
+
+    // ★ 却下で公開対象から外れる → 一覧キャッシュを破棄（停止店が即マップから消えるように）。
+    invalidate("stores:list"); invalidate("bags:list");
 
     // ── 店舗オーナーへの通知 & メール ──────────────────────────────
     try {
@@ -1634,6 +1662,35 @@ router.post("/stores/:storeId/reviews", requireAuth, async (req, res) => {
     }).returning();
 
     res.status(201).json({ success: true, review });
+
+    // 店舗オーナーへ「新しい口コミ」をアプリ内ベル通知（push は使わない＝マロ指示）。
+    //   - ベルは無条件で insert（レビューを取りこぼさない）。
+    //   - 重複レビューは上流で 409 済み＝このブロックは 1 レビューにつき 1 回だけ走る。
+    //   - 応答後に非同期・失敗は握り潰す（保存本体には影響させない）。
+    try {
+      const [store] = await db
+        .select({ ownerId: storesTable.ownerId })
+        .from(storesTable)
+        .where(eq(storesTable.id, storeId))
+        .limit(1);
+      if (store?.ownerId) {
+        const stars = "★".repeat(rating) + "☆".repeat(5 - rating);
+        const trimmed = comment?.trim();
+        const body = trimmed
+          ? `${stars}「${trimmed.length > 40 ? trimmed.slice(0, 40) + "…" : trimmed}」`
+          : `${stars} の評価をいただきました`;
+        await db.insert(notificationsTable).values({
+          userId: store.ownerId,
+          type: "new_review",
+          title: "新しい口コミが投稿されました",
+          body,
+          storeId,
+        });
+      }
+    } catch (notifyErr) {
+      console.error("[stores] review notify error (non-fatal):", notifyErr);
+    }
+    return;
   } catch (err) {
     console.error("Review error:", err);
     res.status(500).json({ error: "internal_error", message: "Failed to save review" });
@@ -3076,7 +3133,10 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
     // BG ではなく同期で実行することでエラーを即座に検知できる
     let syncPersonId: string | null = null;
     if (businessType === "company") {
-      console.log(`[bank-setup] STEP4b (sync) — kycData: firstName="${k.firstNameKanji}" lastName="${k.lastNameKanji}" phone="${k.phone}" dob=${k.dobYear}/${k.dobMonth}/${k.dobDay} postal="${k.postalCode}"`);
+      // ★ セキュリティ修正 (2026-07-08): 代表者の氏名/電話/生年月日/郵便番号 (KYC PII) を
+      //   平文で Fly ログに残さない。ログ閲覧権限が漏れた場合の個人情報流出を防ぐため、
+      //   デバッグに必要な「各項目が存在するか」の boolean だけを出力する。
+      console.log(`[bank-setup] STEP4b (sync) — kycData present: nameKanji=${!!(k.firstNameKanji && k.lastNameKanji)} phone=${!!k.phone} dob=${!!(k.dobYear && k.dobMonth && k.dobDay)} postal=${!!k.postalCode}`);
 
       const repPayload: Record<string, any> = {};
       if (k.firstNameKana?.trim())  repPayload.first_name_kana  = toFullWidthKana(k.firstNameKana.trim());

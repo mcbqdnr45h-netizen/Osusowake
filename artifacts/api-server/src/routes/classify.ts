@@ -3,9 +3,10 @@ import OpenAI from "openai";
 
 const router: IRouter = Router();
 
+// 本番Flyは OPENAI_API_KEY、 ローカル開発は AI_INTEGRATIONS_* を使う。
 const openai = new OpenAI({
-  baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
-  apiKey:  process.env.AI_INTEGRATIONS_OPENAI_API_KEY ?? "dummy",
+  baseURL: process.env.OPENAI_BASE_URL || process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || undefined,
+  apiKey:  process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY || "dummy",
 });
 
 const VALID_CATEGORIES = [

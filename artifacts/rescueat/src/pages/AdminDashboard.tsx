@@ -197,6 +197,50 @@ interface SalesLead {
   createdAt: string;
 }
 
+type RecurringStatus = 'live' | 'pending' | 'soldout' | 'alert' | 'withdrawn' | 'off' | 'ended';
+interface RecurringMonitorListing {
+  id: number;
+  storeId: number;
+  storeName: string;
+  storeStatus: string;
+  title: string;
+  status: RecurringStatus;
+  publishTime: string;
+  daysOfWeek: number;
+  pickupNextDay: boolean;
+  carryOverStock: boolean;
+  isActive: boolean;
+  pickupStart: string | null;
+  pickupEnd: string | null;
+  pickupStart2: string | null;
+  pickupEnd2: string | null;
+  discountedPrice: number;
+  originalPrice: number;
+  stockCount: number;
+  liveStock: number;
+  liveBags: number;
+  todayStock: number | null;
+  latestStock: number | null;
+  reservedQty: number;
+  paidQty: number;
+  lastPublishedDate: string | null;
+  publishedToday: boolean;
+  scheduledToday: boolean;
+  skippedToday: boolean;
+  nextPublishDate: string | null;
+  updatedJst: string;
+  createdJst: string;
+}
+interface RecurringMonitor {
+  today: string;
+  nowTime: string;
+  summary: {
+    total: number; live: number; pending: number; soldout: number; alert: number;
+    withdrawn: number; off: number; ended: number; liveStock: number; reservedQty: number;
+  };
+  listings: RecurringMonitorListing[];
+}
+
 /** 正規化: 全角→半角・小文字化・記号空白除去 (重複店舗検出用) */
 function normalizeStoreText(s: string | null | undefined): string {
   if (!s) return '';
@@ -227,6 +271,28 @@ function statusBadge(store: AdminStore) {
     case 'suspended':     return { label: '停止中',    cls: 'bg-red-100 text-red-700' };
     default:              return { label: store.status, cls: 'bg-secondary text-muted-foreground' };
   }
+}
+
+// ── 定期出品モニターの状態表示設定 ──
+const RECURRING_STATUS_META: Record<RecurringStatus, { label: string; emoji: string; cls: string; dot: string; order: number }> = {
+  alert:     { label: '未公開アラート', emoji: '⚠️', cls: 'bg-red-100 text-red-700 border-red-300',        dot: 'bg-red-500',    order: 0 },
+  live:      { label: '出品中',        emoji: '🟢', cls: 'bg-emerald-100 text-emerald-700 border-emerald-300', dot: 'bg-emerald-500', order: 1 },
+  pending:   { label: '公開予定',      emoji: '🔵', cls: 'bg-blue-100 text-blue-700 border-blue-300',      dot: 'bg-blue-500',   order: 2 },
+  soldout:   { label: '完売',          emoji: '🔴', cls: 'bg-rose-100 text-rose-700 border-rose-300',      dot: 'bg-rose-500',   order: 3 },
+  withdrawn: { label: '停止(取消)',    emoji: '⚫', cls: 'bg-gray-200 text-gray-700 border-gray-300',      dot: 'bg-gray-500',   order: 4 },
+  ended:     { label: '本日終了',      emoji: '🏁', cls: 'bg-slate-100 text-slate-600 border-slate-300',   dot: 'bg-slate-400',  order: 5 },
+  off:       { label: '休み',          emoji: '🟡', cls: 'bg-amber-50 text-amber-700 border-amber-200',    dot: 'bg-amber-400',  order: 6 },
+};
+const DOW_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
+/** daysOfWeek bitmask(bit0=日..bit6=土) を「毎日」「月〜金」等の短い日本語に。 */
+function formatDaysOfWeek(mask: number): string {
+  if ((mask & 127) === 127) return '毎日';
+  const days: number[] = [];
+  for (let i = 0; i < 7; i++) if (mask & (1 << i)) days.push(i);
+  if (days.length === 0) return '曜日未設定';
+  // 連続範囲をまとめる（例: 月火水木金 → 月〜金）
+  const labels = days.map((d) => DOW_LABELS[d]);
+  return labels.join('・');
 }
 
 function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
@@ -286,6 +352,46 @@ function DetailRow({
   );
 }
 
+// ── Growth God Mode（成長の神モード）データ型 ──
+interface GrowthDeadStore {
+  id: number;
+  name: string;
+  city: string;
+  orders: number;
+  gmv: number;
+  liveBags: number;
+  lastBagAt: string | null;
+  daysSinceLastBag: number | null;
+}
+interface GrowthData {
+  funnel: {
+    registered: number;
+    favorited: number;
+    buyers: number;
+    repeatBuyers: number;
+    newUsers7d: number;
+    newUsers30d: number;
+    rates: {
+      registerToFav: number;
+      favToBuy: number;
+      registerToBuy: number;
+      buyToRepeat: number;
+    };
+  };
+  hotLeads: {
+    favNoPurchase: number;
+    registered7dNoPurchase: number;
+  };
+  deadStores: GrowthDeadStore[];
+  supply: {
+    approvedActiveStores: number;
+    storesWithLiveBags: number;
+    liveBags: number;
+    liveStockUnits: number;
+  };
+  weeklyTrend: { week: string; newUsers: number; buyers: number; gmv: number }[];
+}
+
 export default function AdminDashboard() {
   const { user, session, signOut, isLoading: authLoading, isAdmin } = useAuth();
   const [, navigate] = useLocation();
@@ -305,6 +411,10 @@ export default function AdminDashboard() {
   const [stores, setStores]               = useState<AdminStore[]>([]);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [salesLeads, setSalesLeads]       = useState<SalesLead[]>([]);
+  const [recurringMon, setRecurringMon]   = useState<RecurringMonitor | null>(null);
+  const [recurringFilter, setRecurringFilter] = useState<RecurringStatus | 'all'>('all');
+  const [growth, setGrowth]               = useState<GrowthData | null>(null);
+  const [reengageSeg, setReengageSeg]     = useState<'fav_no_purchase' | 'registered_no_purchase_7d' | null>(null);
   const [loading, setLoading]             = useState(true);
   const [actionLoading, setActionLoading] = useState<number | null>(null);
 
@@ -365,13 +475,17 @@ export default function AdminDashboard() {
     if (!token) return;
     setLoading(true);
     try {
-      const [mRes, sRes, aRes, lRes, liRes] = await Promise.all([
+      const [mRes, sRes, aRes, lRes, liRes, rmRes, gRes] = await Promise.all([
         authedFetch(`${BASE}/api/admin/metrics?excludeTest=${excludeTest ? '1' : '0'}`, { headers: {} }),
         authedFetch(`${BASE}/api/admin/stores`,         { headers: {} }),
         authedFetch(`${BASE}/api/admin/announcements`,  { headers: {} }),
         authedFetch(`${BASE}/api/admin/sales-leads`,    { headers: {} }),
         authedFetch(`${BASE}/api/admin/license-issues`, { headers: {} }),
+        authedFetch(`${BASE}/api/admin/recurring-monitor`, { headers: {} }),
+        authedFetch(`${BASE}/api/admin/growth`,         { headers: {} }),
       ]);
+      if (gRes.ok) setGrowth(await gRes.json());
+      if (rmRes.ok) setRecurringMon(await rmRes.json());
       if (mRes.ok) setMetrics(await mRes.json());
       if (liRes.ok) {
         const li = await liRes.json();
@@ -436,6 +550,47 @@ export default function AdminDashboard() {
       setReuploadLoading(null);
     }
   }, [token, fetchAll]);
+
+  // ── ホットリード再エンゲージ Push ──
+  const reengageSegment = useCallback(async (
+    segment: 'fav_no_purchase' | 'registered_no_purchase_7d',
+    label: string,
+  ) => {
+    const presets: Record<string, { title: string; body: string }> = {
+      fav_no_purchase: {
+        title: 'お気に入りのお店に空きが出ました🍞',
+        body: '気になっていたお店のサプライズバッグ、今すぐチェック！売り切れ前に受け取ろう。',
+      },
+      registered_no_purchase_7d: {
+        title: 'はじめてのおすそわけ、待ってます🎁',
+        body: 'あなたの街のお店が余った美味しいものをお得に。近くのバッグを見てみよう！',
+      },
+    };
+    const p = presets[segment];
+    const title = window.prompt(`【${label}】に送るPush通知のタイトル`, p.title);
+    if (title === null) return;
+    if (!title.trim()) { alert('タイトルは必須です'); return; }
+    const body = window.prompt('本文（任意）', p.body) ?? '';
+    if (!confirm(`「${label}」の見込み客に Push を送信します。よろしいですか？`)) return;
+    setReengageSeg(segment);
+    try {
+      const res = await authedFetch(`${BASE}/api/admin/growth/reengage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ segment, title: title.trim(), body: body.trim(), url: '/' }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        toast({ title: '✅ 送信しました', description: `${data.targeted ?? 0} 人に配信` });
+      } else {
+        toast({ title: '❌ 送信失敗', description: `HTTP ${res.status}`, variant: 'destructive' });
+      }
+    } catch (e: any) {
+      toast({ title: '❌ エラー', description: e?.message ?? '不明なエラー', variant: 'destructive' });
+    } finally {
+      setReengageSeg(null);
+    }
+  }, [token, toast]);
 
   async function saveSettings() {
     setSettingsSaving(true);
@@ -929,6 +1084,7 @@ export default function AdminDashboard() {
             { key: 'stale',    label: '24h+ pending',          n: a?.stalePendingCount ?? 0,         color: 'amber',  icon: Clock,       anchor: '#anomalies-section' },
             { key: 'leads',    label: '新規お店通報',         n: a?.newSalesLeadsCount ?? 0,        color: 'sky',    icon: AlertCircle, anchor: '#leads-section' },
             { key: 'cancel',   label: 'キャンセル多発店',     n: a?.highCancelStores.length ?? 0,   color: 'red',    icon: TrendingDown, anchor: '#anomalies-section' },
+            { key: 'recurAlert', label: '定期出品の公開漏れ',  n: recurringMon?.summary.alert ?? 0,  color: 'red',    icon: Calendar,    anchor: '#recurring-section' },
           ];
           const visible = items.filter(i => i.n > 0);
           const totalAlerts = visible.reduce((sum, i) => sum + i.n, 0);
@@ -1027,6 +1183,193 @@ export default function AdminDashboard() {
             </motion.div>
           );
         })()}
+
+        {/* ═══ 📈 GROWTH GOD MODE（成長の神モード） ═══ */}
+        <div id="growth-section" />
+        {growth && (
+          <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }}>
+            <div className="rounded-2xl border-2 border-emerald-200 bg-gradient-to-b from-emerald-50/60 to-white p-3 shadow-sm space-y-4">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-full bg-emerald-100 flex items-center justify-center">
+                  <TrendingUp className="w-4 h-4 text-emerald-600" />
+                </div>
+                <h2 className="text-sm font-black text-gray-900">📈 成長コックピット</h2>
+                <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">GOD MODE</span>
+              </div>
+
+              {/* ① 供給の脈拍 — 今この瞬間、買える在庫があるか */}
+              {(() => {
+                const s = growth.supply;
+                const healthy = s.storesWithLiveBags >= 10;
+                return (
+                  <div className={`rounded-xl border-2 p-3 ${healthy ? 'border-emerald-200 bg-emerald-50/50' : 'border-amber-300 bg-amber-50/60'}`}>
+                    <div className="flex items-center gap-1.5 mb-2">
+                      <Zap className={`w-3.5 h-3.5 ${healthy ? 'text-emerald-600' : 'text-amber-600'}`} />
+                      <p className="text-[10px] font-black uppercase tracking-widest text-gray-600">供給の脈拍（いま買える在庫）</p>
+                    </div>
+                    <div className="grid grid-cols-4 gap-2 text-center">
+                      <div>
+                        <p className={`text-2xl font-black leading-none ${healthy ? 'text-emerald-600' : 'text-amber-600'}`}>{s.storesWithLiveBags}</p>
+                        <p className="text-[9px] font-bold text-gray-500 mt-1">出品中の店</p>
+                      </div>
+                      <div>
+                        <p className="text-2xl font-black leading-none text-gray-800">{s.liveBags}</p>
+                        <p className="text-[9px] font-bold text-gray-500 mt-1">ライブ袋</p>
+                      </div>
+                      <div>
+                        <p className="text-2xl font-black leading-none text-gray-800">{s.liveStockUnits}</p>
+                        <p className="text-[9px] font-bold text-gray-500 mt-1">在庫個数</p>
+                      </div>
+                      <div>
+                        <p className="text-2xl font-black leading-none text-gray-400">{s.approvedActiveStores}</p>
+                        <p className="text-[9px] font-bold text-gray-500 mt-1">承認済み店</p>
+                      </div>
+                    </div>
+                    {!healthy && (
+                      <p className="text-[10px] font-bold text-amber-700 mt-2 leading-snug">
+                        ⚠️ ライブ在庫の店が少ない。開いたユーザーに「何もない」を見せると離脱する。下の死に店を叩き起こそう。
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* ② アクティベーション・ファネル */}
+              {(() => {
+                const fn = growth.funnel;
+                const steps = [
+                  { label: '登録ユーザー', n: fn.registered, sub: `直近7日 +${fn.newUsers7d}`, color: 'bg-slate-500' },
+                  { label: 'お気に入り登録', n: fn.favorited, sub: `登録の ${fn.rates.registerToFav}%`, color: 'bg-sky-500' },
+                  { label: '初回購入', n: fn.buyers, sub: `登録の ${fn.rates.registerToBuy}%`, color: 'bg-emerald-500' },
+                  { label: 'リピーター', n: fn.repeatBuyers, sub: `購入者の ${fn.rates.buyToRepeat}%`, color: 'bg-amber-500' },
+                ];
+                const max = Math.max(fn.registered, 1);
+                return (
+                  <div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-gray-600 mb-2">アクティベーション・ファネル</p>
+                    <div className="space-y-1.5">
+                      {steps.map((st) => (
+                        <div key={st.label} className="flex items-center gap-2">
+                          <div className="w-20 text-[10px] font-bold text-gray-600 text-right shrink-0">{st.label}</div>
+                          <div className="flex-1 bg-gray-100 rounded-full h-6 overflow-hidden relative">
+                            <div className={`${st.color} h-full rounded-full transition-all flex items-center`}
+                              style={{ width: `${Math.max((st.n / max) * 100, 4)}%` }} />
+                            <div className="absolute inset-0 flex items-center px-2 gap-1.5">
+                              <span className="text-[11px] font-black text-gray-900">{st.n.toLocaleString()}</span>
+                              <span className="text-[9px] font-bold text-gray-500">{st.sub}</span>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ③ ホットリード → ワンタップ再エンゲージ */}
+              {(() => {
+                const hl = growth.hotLeads;
+                const leads = [
+                  {
+                    seg: 'fav_no_purchase' as const,
+                    label: 'お気に入り済み・未購入',
+                    n: hl.favNoPurchase,
+                    hint: '興味を示したのに買ってない層。刈り取れば即GMV。',
+                  },
+                  {
+                    seg: 'registered_no_purchase_7d' as const,
+                    label: '直近7日登録・未購入',
+                    n: hl.registered7dNoPurchase,
+                    hint: '新鮮なうちに背中を押すべき層。',
+                  },
+                ];
+                return (
+                  <div>
+                    <div className="flex items-center gap-1.5 mb-2">
+                      <Flame className="w-3.5 h-3.5 text-orange-500" />
+                      <p className="text-[10px] font-black uppercase tracking-widest text-gray-600">ホットリード（あと一押しで買う）</p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {leads.map((ld) => (
+                        <div key={ld.seg} className="rounded-xl border-2 border-orange-200 bg-orange-50/50 p-2.5 flex flex-col">
+                          <p className="text-2xl font-black text-orange-600 leading-none">{ld.n}<span className="text-xs font-bold text-gray-400 ml-1">人</span></p>
+                          <p className="text-[10px] font-bold text-gray-700 mt-1 leading-tight">{ld.label}</p>
+                          <p className="text-[9px] text-gray-500 mt-0.5 leading-snug flex-1">{ld.hint}</p>
+                          <button
+                            disabled={ld.n === 0 || reengageSeg !== null}
+                            onClick={() => reengageSegment(ld.seg, ld.label)}
+                            className="mt-2 min-h-[38px] rounded-lg bg-orange-500 active:bg-orange-600 disabled:opacity-40 text-white text-[11px] font-black px-2 py-1.5 flex items-center justify-center gap-1"
+                          >
+                            {reengageSeg === ld.seg ? '送信中…' : (<><Send className="w-3 h-3" />この層にPush</>)}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ④ 週次成長トレンド */}
+              {growth.weeklyTrend.length > 0 && (
+                <div>
+                  <p className="text-[10px] font-black uppercase tracking-widest text-gray-600 mb-2">週次トレンド（新規登録 / 購入者 / GMV）</p>
+                  <ResponsiveContainer width="100%" height={140}>
+                    <BarChart data={growth.weeklyTrend} margin={{ top: 4, right: 4, left: -24, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#eee" vertical={false} />
+                      <XAxis dataKey="week" tick={{ fontSize: 9 }} />
+                      <YAxis tick={{ fontSize: 9 }} />
+                      <Tooltip contentStyle={{ fontSize: 11 }} />
+                      <Bar dataKey="newUsers" name="新規登録" fill="#94a3b8" radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="buyers" name="購入者" fill="#10b981" radius={[2, 2, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+
+              {/* ⑤ 死に店舗アラート — 営業フォロー対象 */}
+              {(() => {
+                const dead = growth.deadStores;
+                if (dead.length === 0) {
+                  return <p className="text-[11px] font-bold text-emerald-700 bg-emerald-50 rounded-lg py-2 text-center">✨ 承認済み店はすべて稼働中</p>;
+                }
+                return (
+                  <div>
+                    <div className="flex items-center gap-1.5 mb-2">
+                      <TrendingDown className="w-3.5 h-3.5 text-red-500" />
+                      <p className="text-[10px] font-black uppercase tracking-widest text-gray-600">
+                        死に店舗 <span className="text-red-600">{dead.length}</span> 店（承認済みだが未稼働＝営業フォロー対象）
+                      </p>
+                    </div>
+                    <div className="space-y-1.5 max-h-72 overflow-y-auto">
+                      {dead.map((d) => {
+                        const zeroSales = d.orders === 0;
+                        const noBag = d.liveBags === 0;
+                        return (
+                          <div key={d.id} className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white p-2">
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[12px] font-bold text-gray-900 truncate">{d.name}</p>
+                              <p className="text-[9px] text-gray-500">{d.city}・#{d.id}</p>
+                            </div>
+                            <div className="flex gap-1 shrink-0">
+                              {zeroSales && <span className="text-[9px] font-black text-red-600 bg-red-50 border border-red-200 rounded px-1.5 py-0.5">売上0</span>}
+                              {noBag && <span className="text-[9px] font-black text-amber-600 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5">在庫なし</span>}
+                              {d.daysSinceLastBag != null && d.daysSinceLastBag >= 1 && (
+                                <span className="text-[9px] font-black text-gray-500 bg-gray-100 rounded px-1.5 py-0.5">{d.daysSinceLastBag}日出品なし</span>
+                              )}
+                              {d.lastBagAt == null && (
+                                <span className="text-[9px] font-black text-gray-500 bg-gray-100 rounded px-1.5 py-0.5">出品履歴なし</span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </motion.div>
+        )}
 
         {/* ── 🚨 営業許可証 問題バナー ── */}
         <div id="license-section" />
@@ -1392,6 +1735,168 @@ export default function AdminDashboard() {
                   </Link>
                 ))}
               </div>
+            </div>
+          </motion.div>
+        )}
+
+        {/* ── 定期出品モニター（神モード：全店の自動出品を今日の状態付きで監視）── */}
+        <div id="recurring-section" />
+        {recurringMon && recurringMon.listings.length > 0 && (
+          <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.04 }}>
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-xs font-black uppercase tracking-widest text-muted-foreground flex items-center gap-1.5">
+                <Calendar className="w-3.5 h-3.5" />定期出品モニター
+              </h2>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-muted-foreground tabular-nums">
+                  {recurringMon.today} {recurringMon.nowTime} 時点
+                </span>
+                <button
+                  onClick={fetchAll}
+                  className="text-[10px] font-bold px-2 py-1 rounded-lg bg-secondary text-muted-foreground hover:bg-border transition-colors flex items-center gap-1"
+                >
+                  <RefreshCw className="w-3 h-3" />更新
+                </button>
+              </div>
+            </div>
+
+            {/* 未公開アラート バナー（公開時刻を過ぎたのにバッグが無い＝公開漏れ） */}
+            {recurringMon.summary.alert > 0 && (
+              <div className="mb-3 rounded-xl bg-red-50 border border-red-300 px-3 py-2.5 flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <p className="text-xs font-black text-red-800">
+                    {recurringMon.summary.alert}件が公開時刻を過ぎても未公開です
+                  </p>
+                  <p className="text-[10px] text-red-600 leading-relaxed">
+                    自動公開が漏れている可能性があります。 該当テンプレの店舗ステータス・在庫・休み設定を確認してください。
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* KPI サマリー（タップで絞り込み） */}
+            <div className="grid grid-cols-4 sm:grid-cols-7 gap-1.5 mb-4">
+              {([
+                { key: 'all' as const,       label: '全て',   val: recurringMon.summary.total },
+                { key: 'alert' as const,     label: '未公開', val: recurringMon.summary.alert },
+                { key: 'live' as const,      label: '出品中', val: recurringMon.summary.live },
+                { key: 'pending' as const,   label: '予定',   val: recurringMon.summary.pending },
+                { key: 'soldout' as const,   label: '完売',   val: recurringMon.summary.soldout },
+                { key: 'withdrawn' as const, label: '停止',   val: recurringMon.summary.withdrawn },
+                { key: 'off' as const,       label: '休み',   val: recurringMon.summary.off },
+              ]).map((kpi) => {
+                const active = recurringFilter === kpi.key;
+                const meta = kpi.key === 'all' ? null : RECURRING_STATUS_META[kpi.key];
+                return (
+                  <button
+                    key={kpi.key}
+                    onClick={() => setRecurringFilter(active ? 'all' : kpi.key)}
+                    className={`rounded-xl border px-2 py-2 text-center transition-all ${
+                      active ? 'ring-2 ring-offset-1 ring-primary bg-white' : 'bg-white/60 hover:bg-white'
+                    } ${meta ? meta.cls : 'border-border text-foreground'}`}
+                  >
+                    <div className="text-lg font-black leading-none tabular-nums">{kpi.val}</div>
+                    <div className="text-[9px] font-bold mt-1 flex items-center justify-center gap-0.5">
+                      {meta && <span className={`w-1.5 h-1.5 rounded-full ${meta.dot}`} />}
+                      {kpi.label}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* 一覧（状態優先→公開時刻順）*/}
+            <div className="space-y-2">
+              {[...recurringMon.listings]
+                .filter((l) => recurringFilter === 'all' || l.status === recurringFilter)
+                .sort((a, b) => {
+                  const oa = RECURRING_STATUS_META[a.status].order;
+                  const ob = RECURRING_STATUS_META[b.status].order;
+                  if (oa !== ob) return oa - ob;
+                  return a.publishTime.localeCompare(b.publishTime);
+                })
+                .map((l) => {
+                  const meta = RECURRING_STATUS_META[l.status];
+                  const pickup = l.pickupStart && l.pickupEnd
+                    ? `${l.pickupStart}–${l.pickupEnd}${l.pickupStart2 && l.pickupEnd2 ? ` / ${l.pickupStart2}–${l.pickupEnd2}` : ''}`
+                    : null;
+                  return (
+                    <div key={l.id} className={`rounded-xl border bg-white overflow-hidden ${
+                      l.status === 'alert' ? 'border-red-300' : 'border-border'
+                    }`}>
+                      <div className="flex items-stretch">
+                        {/* 状態カラーバー */}
+                        <div className={`w-1.5 shrink-0 ${meta.dot}`} />
+                        <div className="flex-1 min-w-0 p-2.5">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className={`text-[10px] font-black px-1.5 py-0.5 rounded-md border ${meta.cls}`}>
+                                  {meta.emoji} {meta.label}
+                                </span>
+                                <span className="text-[10px] text-muted-foreground truncate">
+                                  <Store className="w-3 h-3 inline -mt-0.5 mr-0.5" />
+                                  {l.storeName}
+                                  <span className="text-muted-foreground/50"> #{l.storeId}</span>
+                                </span>
+                              </div>
+                              <p className="text-sm font-bold text-foreground mt-1 truncate">{l.title}</p>
+                            </div>
+                            <div className="text-right shrink-0">
+                              <div className="text-xs font-black text-foreground tabular-nums flex items-center gap-1 justify-end">
+                                <Clock className="w-3 h-3 text-muted-foreground" />{l.publishTime}
+                              </div>
+                              <div className="text-[9px] text-muted-foreground mt-0.5">{formatDaysOfWeek(l.daysOfWeek)}</div>
+                            </div>
+                          </div>
+
+                          {/* メタ行：属性チップ */}
+                          <div className="flex items-center gap-1 flex-wrap mt-2">
+                            {l.pickupNextDay
+                              ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600">前日出品→翌日受取</span>
+                              : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-secondary text-muted-foreground">当日出品→当日受取</span>}
+                            {l.carryOverStock && <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-50 text-purple-600">在庫持ち越し</span>}
+                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-secondary text-muted-foreground tabular-nums">¥{fmt(l.discountedPrice)}</span>
+                            {pickup && <span className="text-[9px] px-1.5 py-0.5 rounded bg-secondary text-muted-foreground tabular-nums">受取 {pickup}</span>}
+                          </div>
+
+                          {/* ステータス別 詳細行 */}
+                          <div className="mt-2 text-[11px] text-foreground/80 leading-relaxed">
+                            {l.status === 'live' && (
+                              <span>在庫 <b className="tabular-nums">{l.liveStock}</b> 個公開中
+                                {l.reservedQty > 0 && <> ・予約 <b className="tabular-nums">{l.reservedQty}</b>個（決済済 {l.paidQty}）</>}
+                              </span>
+                            )}
+                            {l.status === 'pending' && (
+                              <span className="text-blue-700">本日 <b>{l.publishTime}</b> に自動公開予定（在庫 {l.stockCount}個）</span>
+                            )}
+                            {l.status === 'soldout' && (
+                              <span className="text-rose-700">本日分は完売（在庫0）{l.carryOverStock && <>・在庫を入れ直すと再開</>}</span>
+                            )}
+                            {l.status === 'alert' && (
+                              <span className="text-red-700 font-bold">
+                                {l.publishTime} を過ぎても未公開。 店舗ステータス={l.storeStatus}
+                                {l.lastPublishedDate && <>・最終公開 {l.lastPublishedDate}</>}
+                              </span>
+                            )}
+                            {l.status === 'withdrawn' && (
+                              <span className="text-gray-600">店がテンプレを停止中（{l.updatedJst} 更新）。 再開するまで自動公開されません</span>
+                            )}
+                            {l.status === 'ended' && (
+                              <span className="text-slate-500">本日は公開済み・受取窓終了。 次回 {l.nextPublishDate ?? '—'}</span>
+                            )}
+                            {l.status === 'off' && (
+                              <span className="text-amber-700">
+                                {l.skippedToday ? '本日は休みに設定' : '本日は公開曜日ではありません'}・次回 {l.nextPublishDate ?? '—'}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
             </div>
           </motion.div>
         )}

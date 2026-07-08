@@ -14,7 +14,7 @@ import {
 import {
   Plus, Minus, Clock, CheckCircle2, Package2, X, ChevronUp, ChevronDown,
   Loader2, AlertCircle, BarChart2, RefreshCw, Ticket, Eye, ArrowRight,
-  History, CreditCard, Zap, Pencil, Trash2, Save, Store, XCircle, Search,
+  History, CreditCard, Zap, Pencil, Trash2, Save, Store, XCircle, Search, RotateCcw,
 } from 'lucide-react';
 import { Link, useLocation } from 'wouter';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -50,6 +50,7 @@ interface Reservation {
     pickupEnd: string | null;
     discountedPrice: number;
     originalPrice: number;
+    pickupNextDay?: boolean | null;
   } | null;
 }
 
@@ -79,9 +80,28 @@ function todayJSTStr(): string {
   return toJSTDateStr(new Date().toISOString());
 }
 
-/** 予約が「今日（JST）」に作成されたかを判定する */
-function isTodaysReservation(r: Reservation) {
-  try { return toJSTDateStr(r.createdAt) === todayJSTStr(); } catch { return false; }
+/** "YYYY-MM-DD" に n 日加算した "YYYY-MM-DD" を返す */
+function addJstDay(dateStr: string, n: number): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+
+/**
+ * 予約の「受取日(JST)」を返す。
+ *  ★ 前日出品(pickupNextDay=true)は 作成日の翌日 が受取日。
+ *    これを createdAt そのままで判定すると、 前夜に売れた「明日受取」の注文を
+ *    受取当日に「本日の注文」として表示できず、 店が受取対応を見落とす原因になる。
+ */
+function pickupDateJST(r: Reservation): string {
+  const created = toJSTDateStr(r.createdAt);
+  return r.bag?.pickupNextDay ? addJstDay(created, 1) : created;
+}
+
+/** 受取日が既に過ぎた（＝対応漏れ・要フォロー）予約か。 未来の受取(明日)は含めない。 */
+function isPastPickupReservation(r: Reservation) {
+  try { return pickupDateJST(r) < todayJSTStr(); } catch { return false; }
 }
 
 function formatPurchasedAt(iso: string) {
@@ -607,6 +627,15 @@ function PostBagModal({
                       />
                     </div>
 
+                    {/* お客様画面プレビュー: 写真の見切り・文字の折り返しを出品前に確認 */}
+                    <button
+                      type="button"
+                      onClick={() => setShowPreview(true)}
+                      className="w-full py-3 rounded-2xl border border-primary/40 text-primary font-bold text-sm flex items-center justify-center gap-1.5"
+                    >
+                      <Eye className="w-4 h-4" />お客様の画面でプレビュー
+                    </button>
+
                     {/* 出品ボタン */}
                     <button
                       type="button"
@@ -998,23 +1027,40 @@ function PostBagModal({
         open={showPreview}
         onOpenChange={setShowPreview}
         storeName={storeName}
-        data={{
-          title: form.title,
-          description: form.description,
-          originalPrice: form.originalPrice,
-          discountedPrice: form.discountedPrice,
-          stockCount: form.stockCount,
-          pickupStart: form.pickupStart,
-          pickupEnd: form.pickupEnd,
-          pickupStart2: twoShift ? pickupStart2 : null,
-          pickupEnd2: twoShift ? pickupEnd2 : null,
-          pickupNextDay,
-          imageUrl,
-          category: bagCategory,
-          allergyInfo: form.allergyInfo,
-          pickupNote: form.pickupNote,
-          itemType,
-        }}
+        // ★ クイック出品(過去出品から選択)と手動入力でフォーム状態が別物なので、
+        //   モードごとに現在の入力値をプレビューに渡す。
+        data={mode === 'quick'
+          ? {
+              title: pastBag?.title ?? '',
+              description: null,
+              originalPrice: pastBag?.originalPrice,
+              discountedPrice: pastBag?.discountedPrice ?? 0,
+              stockCount: qty,
+              pickupStart: quickPickupStart,
+              pickupEnd: quickPickupEnd,
+              imageUrl,
+              category: bagCategory,
+              allergyInfo: quickAllergyInfo,
+              pickupNote: quickPickupNote,
+              itemType: (pastBag?.itemType === 'item' ? 'item' : 'bag'),
+            }
+          : {
+              title: form.title,
+              description: form.description,
+              originalPrice: form.originalPrice,
+              discountedPrice: form.discountedPrice,
+              stockCount: form.stockCount,
+              pickupStart: form.pickupStart,
+              pickupEnd: form.pickupEnd,
+              pickupStart2: twoShift ? pickupStart2 : null,
+              pickupEnd2: twoShift ? pickupEnd2 : null,
+              pickupNextDay,
+              imageUrl,
+              category: bagCategory,
+              allergyInfo: form.allergyInfo,
+              pickupNote: form.pickupNote,
+              itemType,
+            }}
       />
     </motion.div>
   );
@@ -1024,6 +1070,7 @@ function PostBagModal({
 function EditBagModal({
   bag,
   storeId,
+  storeName,
   BASE,
   onClose,
   onSaved,
@@ -1031,6 +1078,7 @@ function EditBagModal({
 }: {
   bag: Bag;
   storeId: number;
+  storeName: string;
   BASE: string;
   onClose: () => void;
   onSaved: () => void;
@@ -1045,10 +1093,14 @@ function EditBagModal({
     originalPrice:  bag.originalPrice,
     discountedPrice: bag.discountedPrice,
     itemType:       (bag.itemType ?? 'bag') as 'bag' | 'item',
+    description:    bag.description  ?? '',
+    allergyInfo:    bag.allergyInfo  ?? '',
+    pickupNote:     bag.pickupNote   ?? '',
   });
   const [saving,   setSaving]   = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [confirmDelete, setConfirmDelete] = React.useState(false);
+  const [showPreview, setShowPreview] = React.useState(false); // お客様画面プレビュー
 
   async function handleSave() {
     setSaving(true);
@@ -1064,6 +1116,9 @@ function EditBagModal({
           originalPrice:   form.originalPrice,
           discountedPrice: form.discountedPrice,
           itemType:        form.itemType,
+          description:     form.description.trim(),
+          allergyInfo:     form.allergyInfo.trim(),
+          pickupNote:      form.pickupNote.trim(),
         }),
       });
       if (!res.ok) {
@@ -1262,6 +1317,39 @@ function EditBagModal({
             )}
           </div>
 
+          {/* バッグの内容（説明） */}
+          <div>
+            <label className="text-xs font-black text-muted-foreground uppercase tracking-widest mb-1.5 block">バッグの内容</label>
+            <textarea rows={3}
+              value={form.description}
+              onChange={e => setForm(f => ({ ...f, description: e.target.value }))}
+              placeholder="例：焼きたてパンの詰め合わせ（種類はおまかせ）"
+              className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-2.5 text-sm focus:border-primary outline-none transition-all resize-none"
+            />
+          </div>
+
+          {/* アレルギー情報 */}
+          <div>
+            <label className="text-xs font-black text-muted-foreground uppercase tracking-widest mb-1.5 block">アレルギー情報</label>
+            <textarea rows={2}
+              value={form.allergyInfo}
+              onChange={e => setForm(f => ({ ...f, allergyInfo: e.target.value }))}
+              placeholder="例：小麦、卵、乳を含む可能性があります"
+              className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-2.5 text-sm focus:border-primary outline-none transition-all resize-none"
+            />
+          </div>
+
+          {/* 受取メモ */}
+          <div>
+            <label className="text-xs font-black text-muted-foreground uppercase tracking-widest mb-1.5 block">受取メモ</label>
+            <textarea rows={2}
+              value={form.pickupNote}
+              onChange={e => setForm(f => ({ ...f, pickupNote: e.target.value }))}
+              placeholder="例：店頭でスタッフにアプリ画面をご提示ください"
+              className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-2.5 text-sm focus:border-primary outline-none transition-all resize-none"
+            />
+          </div>
+
           {/* 削除 */}
           <div className="pt-2 border-t border-border/60">
             {confirmDelete ? (
@@ -1290,14 +1378,39 @@ function EditBagModal({
         </div>
 
         {/* 保存ボタン */}
-        <div className="px-5 pb-6 pt-3 shrink-0 border-t border-border/60 bg-background"
+        <div className="px-5 pb-6 pt-3 shrink-0 border-t border-border/60 bg-background space-y-2.5"
           style={{ paddingBottom: 'max(1.5rem, env(safe-area-inset-bottom))' }}>
+          {/* お客様画面プレビュー: 写真の見切り・文字の折り返しを保存前に確認 */}
+          <button type="button" onClick={() => setShowPreview(true)}
+            className="w-full py-3 rounded-2xl border border-primary/40 text-primary font-bold text-sm flex items-center justify-center gap-1.5">
+            <Eye className="w-4 h-4" />お客様の画面でプレビュー
+          </button>
           <button type="button" onClick={handleSave} disabled={saving || !form.title.trim()}
             className="w-full py-4 rounded-2xl bg-primary text-white font-black text-base flex items-center justify-center gap-2 hover:bg-primary/90 active:scale-[0.98] transition-all disabled:opacity-50 shadow-md shadow-primary/20">
             {saving ? <Loader2 className="w-5 h-5 animate-spin" /> : <><Save className="w-5 h-5" />変更を保存する</>}
           </button>
         </div>
       </motion.div>
+
+      <BagPreviewSheet
+        open={showPreview}
+        onOpenChange={setShowPreview}
+        storeName={storeName}
+        data={{
+          title: form.title,
+          description: form.description,
+          originalPrice: form.originalPrice,
+          discountedPrice: form.discountedPrice,
+          stockCount: form.stockCount,
+          pickupStart: form.pickupStart,
+          pickupEnd: form.pickupEnd,
+          imageUrl: bag.imageUrl,
+          category: bag.category,
+          allergyInfo: form.allergyInfo,
+          pickupNote: form.pickupNote,
+          itemType: form.itemType,
+        }}
+      />
     </motion.div>
   );
 }
@@ -1307,11 +1420,13 @@ function ReservationCard({
   res,
   onPickedUp,
   onCancel,
+  onUndoPickup,
   loading,
 }: {
   res: Reservation;
   onPickedUp: (id: number) => void;
   onCancel: (id: number) => void;
+  onUndoPickup?: (id: number) => void;
   loading: boolean;
 }) {
   const badge = statusLabel(res.status);
@@ -1384,6 +1499,22 @@ function ReservationCard({
             className="w-full mt-2 flex items-center justify-center gap-1.5 py-2 rounded-xl border border-rose-200 text-rose-600 bg-rose-50/60 font-bold text-[12px] hover:bg-rose-100 active:scale-[0.98] transition-all disabled:opacity-60"
           >
             この予約をキャンセル{res.paymentStatus === 'paid' ? '・返金' : ''}
+          </button>
+        </div>
+      )}
+
+      {/* 受取済みの取り消し（誤タップ救済）。 受取から24h以内のみ。 返金には関与しない＝集計フラグを戻すだけ。 */}
+      {res.status === 'picked_up' && onUndoPickup && (
+        <div className="px-4 pb-4">
+          <button
+            onClick={() => onUndoPickup(res.id)}
+            disabled={loading}
+            className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-gray-200 text-gray-600 bg-gray-50 font-bold text-[12px] hover:bg-gray-100 active:scale-[0.98] transition-all disabled:opacity-60"
+          >
+            {loading
+              ? <Loader2 className="w-4 h-4 animate-spin" />
+              : <><RotateCcw className="w-3.5 h-3.5" />受取済みを取り消す（誤タップ用）</>
+            }
           </button>
         </div>
       )}
@@ -1499,16 +1630,18 @@ export default function StoreDashboard() {
   const updateStatus = useUpdateReservationStatus();
 
   // 今日の未受取予約（★決済完了済みのみ表示。未払い=決済待ちは一覧に出さない）
+  //   ★ 受取日が今日以降(!isPastPickup)＝ 前日出品の「今日受取」も、 前夜に売れた「明日受取」も拾う。
+  //     受取日で判定することで、 前日出品(pickupNextDay)の注文を店が見落とさない。
   const todayPending = (reservations as Reservation[]).filter(
-    r => isTodaysReservation(r) && r.paymentStatus === 'paid' && r.status !== 'picked_up' && r.status !== 'cancelled'
+    r => !isPastPickupReservation(r) && r.paymentStatus === 'paid' && r.status !== 'picked_up' && r.status !== 'cancelled'
   );
   const todayPickedUp = (reservations as Reservation[]).filter(
-    r => isTodaysReservation(r) && r.status === 'picked_up'
+    r => !isPastPickupReservation(r) && r.status === 'picked_up'
   );
-  // 過去日付の未処理予約（決済完了済みで受取がまだのもの）
+  // 受取日が過去の未処理予約（決済完了済みで受取がまだ＝対応漏れ・要フォロー）
   // 日付フィルタに関わらず受取済みにできるようにし、売上が曖昧にならないようにする
   const oldUnprocessed = (reservations as Reservation[])
-    .filter(r => !isTodaysReservation(r) && r.paymentStatus === 'paid' && r.status !== 'picked_up' && r.status !== 'cancelled')
+    .filter(r => isPastPickupReservation(r) && r.paymentStatus === 'paid' && r.status !== 'picked_up' && r.status !== 'cancelled')
     .sort((a, b) => (a.createdAt > b.createdAt ? -1 : 1));
 
   // 受取コードで絞り込み（数字のみ抽出して部分一致）
@@ -1629,6 +1762,38 @@ export default function StoreDashboard() {
       toast({ title: '受取済みにしました ✓' });
     } catch (err: any) {
       toast({ title: err?.message ?? '更新に失敗しました', variant: 'destructive' });
+    } finally {
+      setMarkingId(null);
+    }
+  }
+
+  // 受取済みの取り消し（誤タップ救済）。 受取から24h以内のみサーバが許可。
+  //   picked_up → confirmed に戻し pickedUpAt を消すだけ。 決済/返金には一切関与しない。
+  async function handleUndoPickup(id: number) {
+    if (!window.confirm('この予約の「受取済み」を取り消して、受取予定に戻します。\n間違えて受取済みにしてしまった時だけ実行してください。よろしいですか？')) return;
+    setMarkingId(id);
+    try {
+      const res = await authedFetch(`${BASE}/api/reservations/${id}/pickup/undo`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        if (res.status === 409 && body.error === 'undo_window_expired') {
+          toast({ title: body.message ?? '受取から24時間を過ぎたため取り消せません。運営（DM）までご連絡ください。', variant: 'destructive' });
+          return;
+        }
+        if (res.status === 409 && body.error === 'not_picked_up') {
+          toast({ title: 'この予約は受取済みではありません' });
+          queryClient.invalidateQueries({ queryKey: [`/api/reservations`] });
+          return;
+        }
+        throw new Error(body.message ?? body.error ?? `取り消しに失敗しました (HTTP ${res.status})`);
+      }
+      queryClient.invalidateQueries({ queryKey: [`/api/reservations`] });
+      toast({ title: '受取済みを取り消しました ✓' });
+    } catch (err: any) {
+      toast({ title: err?.message ?? '取り消しに失敗しました', variant: 'destructive' });
     } finally {
       setMarkingId(null);
     }
@@ -2334,8 +2499,9 @@ export default function StoreDashboard() {
                         key={res.id}
                         res={res as Reservation}
                         onPickedUp={handlePickedUp}
-                  onCancel={handleCancelReservation}
-                        loading={false}
+                        onCancel={handleCancelReservation}
+                        onUndoPickup={handleUndoPickup}
+                        loading={markingId === res.id}
                       />
                     ))}
                   </div>
@@ -2383,6 +2549,7 @@ export default function StoreDashboard() {
           <EditBagModal
             bag={editingBag}
             storeId={storeId}
+            storeName={store.name}
             BASE={BASE}
             onClose={() => setEditingBag(null)}
             onSaved={() => {

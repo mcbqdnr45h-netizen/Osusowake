@@ -129,6 +129,16 @@ export default function Login() {
     }
   }
 
+  // ★ 二重防御: サーバー高負荷時に error が "{}" 等の無意味な文字列になっても
+  //   ユーザーに生表示しない（AuthContext.translateError で基本は変換済み）。
+  function displayError(raw: string): string {
+    const m = (raw ?? '').toString().trim();
+    if (m === '' || m === '{}' || m === '[object Object]' || /^[[{].*[\]}]$/.test(m)) {
+      return '接続が不安定なため、ログインに失敗しました。もう一度お試しください';
+    }
+    return m;
+  }
+
   const labelClass = "block text-xs md:text-sm font-black text-foreground/65 uppercase tracking-widest mb-2";
   const inputClass = "w-full bg-white border border-border/80 rounded-xl md:rounded-2xl pl-11 md:pl-14 pr-4 py-3.5 md:py-5 text-foreground font-medium placeholder:text-muted-foreground/45 focus:border-primary focus:ring-4 focus:ring-primary/10 outline-none transition-all text-[15px] md:text-[17px]";
 
@@ -350,7 +360,7 @@ export default function Login() {
                   exit={{ opacity: 0 }}
                   className="shake bg-destructive/8 border border-destructive/20 text-destructive text-[13px] font-semibold px-4 py-3 rounded-xl leading-snug"
                 >
-                  {error}
+                  {displayError(error)}
                 </motion.div>
               )}
             </AnimatePresence>

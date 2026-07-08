@@ -4,6 +4,74 @@ import admin from 'firebase-admin';
 import { db } from '@workspace/db';
 import { webPushSubscriptionsTable, apnsRegistrationsTable, fcmRegistrationsTable } from '@workspace/db/schema';
 import { eq } from 'drizzle-orm';
+import { supabaseAdmin } from './supabase.js';
+
+/**
+ * 「お気に入り店舗の更新」通知を OPT-OUT したユーザー(notif_favorite_update=false)を
+ * 宛先から除外して返す共通フィルタ。設定トグルを実際に効かせるために、お気に入り店の
+ * 新出品プッシュ(手動出品 / 定期出品の初回公開)の直前で通す。
+ *   ★ DB/Supabase 障害時は「除外せず全員に送る」へフェイルオープンする
+ *     (通知が黙って消えるより、多く届くほうが害が小さいため)。
+ */
+export async function filterFavoriteUpdateOptIn(userIds: string[]): Promise<string[]> {
+  if (userIds.length === 0) return [];
+  try {
+    const { data } = await supabaseAdmin
+      .from('users')
+      .select('id')
+      .eq('notif_favorite_update', false);
+    const optOut = new Set<string>();
+    for (const row of data ?? []) if (row.id) optOut.add(row.id as string);
+    if (optOut.size === 0) return userIds;
+    return userIds.filter((id) => !optOut.has(id));
+  } catch (e) {
+    console.error('[push] filterFavoriteUpdateOptIn error (fail-open):', e);
+    return userIds;
+  }
+}
+
+/**
+ * 店舗オーナー / 管理者の userId 集合を返す。 お客さん向けの「発見系」プッシュ
+ * (新着出品の全体配信 / 日次エンゲージメント) は店舗・管理者に送らないため、
+ * これを宛先から除外する。 店舗には自店の注文通知だけ届くべきで、 よそ店の
+ * 出品通知は不要 (店舗オーナー報告 2026-07-07)。
+ *   ★ 障害時は空集合へフェイルオープン (= 誰も除外しない)。 お客さんへの配信を
+ *     絶対に止めない方向に倒す。 稀に店舗へ発見通知が漏れるのは許容 (害小)。
+ */
+export async function getStoreOrAdminUserIds(): Promise<Set<string>> {
+  try {
+    const { data } = await supabaseAdmin
+      .from('users')
+      .select('id')
+      .neq('role', 'customer');
+    const ids = new Set<string>();
+    for (const row of data ?? []) if (row.id) ids.add(row.id as string);
+    return ids;
+  } catch (e) {
+    console.error('[push] getStoreOrAdminUserIds error (fail-open):', e);
+    return new Set<string>();
+  }
+}
+
+/**
+ * 店舗オーナーが「新規注文の通知(bag_sold push)」を受け取る設定か返す。
+ * notif_new_order=false のオーナーには自店注文の push を送らない (設定トグルを実際に効かせる)。
+ *   ★ アプリ内ベル(注文履歴)は別途 insert され残るので、push を止めても注文自体は取りこぼさない。
+ *   ★ 障害時は true へフェイルオープン (= 送る)。 重要な注文通知を黙って落とさない方向。
+ */
+export async function storeOrderPushEnabled(ownerId: string): Promise<boolean> {
+  try {
+    const { data } = await supabaseAdmin
+      .from('users')
+      .select('notif_new_order')
+      .eq('id', ownerId)
+      .maybeSingle();
+    return (data as { notif_new_order?: boolean | null } | null)?.notif_new_order !== false;
+  } catch (e) {
+    console.error('[push] storeOrderPushEnabled error (fail-open):', e);
+    return true;
+  }
+}
 
 const vapidPublicKey  = process.env.VAPID_PUBLIC_KEY;
 const vapidPrivateKey = process.env.VAPID_PRIVATE_KEY;
@@ -243,6 +311,73 @@ export async function setApnsBadgeForUser(userId: string, badge: number): Promis
   }
 }
 
+/**
+ * 会員登録前の匿名端末(userId 無し)へ直接 APNs 送信する。
+ *   apns_registrations を経由せず、生の deviceToken 配列に一斉送信する。
+ *   デイリー通知(出品中◯件)を非会員にも届けるための専用パス。
+ *   prod → BadEnvironment のみ sandbox フォールバック。失効トークンは呼び出し側で掃除。
+ * @returns 失効(Unregistered/BadDeviceToken)で今後掃除すべき deviceToken 配列
+ */
+export async function sendApnsPushToRawTokens(
+  tokens: string[],
+  payload: PushPayload,
+): Promise<{ sent: number; deadTokens: string[] }> {
+  const deadTokens: string[] = [];
+  if (!apnsProvider || tokens.length === 0) return { sent: 0, deadTokens };
+
+  const notification = new apn.Notification();
+  notification.expiry   = Math.floor(Date.now() / 1000) + 3600;
+  notification.badge    = 1;
+  notification.sound    = 'default';
+  notification.alert    = { title: payload.title, body: payload.body };
+  notification.topic    = APNS_BUNDLE_ID;
+  notification.payload  = { url: payload.url ?? '/', ...(payload.data ?? {}) };
+  notification.pushType = 'alert';
+  if (payload.tag) notification.collapseId = payload.tag.slice(0, 64);
+
+  let sentCount = 0;
+
+  async function trySend(provider: apn.Provider, label: 'prod' | 'sandbox', toks: string[]) {
+    try {
+      const r = await provider.send(notification, toks);
+      console.log(`[push] anon APNs[${label}] sent=${r.sent.length} failed=${r.failed.length}`);
+      return r;
+    } catch (err: any) {
+      console.error(`[push] anon APNs[${label}] send 例外:`, err?.message ?? err);
+      return null;
+    }
+  }
+
+  const prodResult = await trySend(apnsProvider, 'prod', tokens);
+  if (!prodResult) return { sent: 0, deadTokens };
+  sentCount += prodResult.sent.length;
+
+  const envMismatchTokens: string[] = [];
+  for (const fail of prodResult.failed) {
+    const reason = (fail.response as any)?.reason;
+    if (reason === 'BadEnvironmentKeyInToken' || reason === 'BadDeviceToken') {
+      envMismatchTokens.push(fail.device);
+    } else if (reason === 'Unregistered') {
+      deadTokens.push(fail.device);
+    }
+  }
+
+  if (envMismatchTokens.length > 0 && apnsProviderSandbox) {
+    const sbResult = await trySend(apnsProviderSandbox, 'sandbox', envMismatchTokens);
+    if (sbResult) {
+      sentCount += sbResult.sent.length;
+      for (const fail of sbResult.failed) {
+        const reason = (fail.response as any)?.reason;
+        if (reason === 'BadDeviceToken' || reason === 'Unregistered') {
+          deadTokens.push(fail.device);
+        }
+      }
+    }
+  }
+
+  return { sent: sentCount, deadTokens };
+}
+
 export async function sendWebPushToUser(userId: string, payload: PushPayload): Promise<void> {
   if (!vapidPublicKey || !vapidPrivateKey) return;
 
@@ -282,6 +417,51 @@ export async function sendWebPushToUser(userId: string, payload: PushPayload): P
       }
     }),
   );
+}
+
+/**
+ * 会員登録前の匿名 Web Push 購読(userId 無し)へ直接送信する。
+ *   web_push_subscriptions を経由せず、生の購読オブジェクト配列に一斉送信する。
+ * @returns 失効(410/404)で今後掃除すべき endpoint 配列
+ */
+export async function sendWebPushToRawSubs(
+  subs: { endpoint: string; p256dh: string; auth: string }[],
+  payload: PushPayload,
+): Promise<{ sent: number; deadEndpoints: string[] }> {
+  const deadEndpoints: string[] = [];
+  if (!vapidPublicKey || !vapidPrivateKey || subs.length === 0) {
+    return { sent: 0, deadEndpoints };
+  }
+
+  const notification = JSON.stringify({
+    title: payload.title,
+    body:  payload.body,
+    icon:  payload.icon ?? '/icons/icon-192.png',
+    badge: '/icons/badge-72.png',
+    tag:   payload.tag,
+    data:  { url: payload.url ?? '/', ...payload.data },
+  });
+
+  let sent = 0;
+  await Promise.allSettled(
+    subs.map(async (sub) => {
+      try {
+        await webpush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          notification,
+        );
+        sent++;
+      } catch (err: any) {
+        if (err?.statusCode === 410 || err?.statusCode === 404) {
+          deadEndpoints.push(sub.endpoint);
+        } else {
+          console.warn('[push] anon webpush error:', err?.statusCode, String(err?.body ?? '').slice(0, 80));
+        }
+      }
+    }),
+  );
+
+  return { sent, deadEndpoints };
 }
 
 // ★ 重複送信防止 (in-memory dedup):

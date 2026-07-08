@@ -6,6 +6,7 @@ import { validateNickname, normalizeNickname } from "../lib/nickname-validator";
 import { markAdminMfaVerified } from "../lib/admin-mfa";
 import { Resend } from "resend";
 import { promises as dnsPromises } from "node:dns";
+import { randomInt } from "node:crypto";
 
 // ── 使い捨てメールドメインのブロックリスト（代表例） ─────────────────────────
 const DISPOSABLE_EMAIL_DOMAINS = new Set([
@@ -101,7 +102,10 @@ interface OtpEntry {
 const adminOtpStore = new Map<string, OtpEntry>();
 
 function generateOtp(): string {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  // ★ セキュリティ修正 (2026-07-08): Math.random() は暗号論的に安全でなく、
+  //   予測可能な PRNG のため管理者 MFA の OTP には不適。crypto.randomInt で
+  //   一様・予測不能な 6 桁 (100000〜999999) を生成する。
+  return String(randomInt(100000, 1000000));
 }
 
 function buildAdminOtpHtml(code: string): string {
@@ -178,6 +182,16 @@ router.post("/auth/create-profile", async (req: Request, res: Response) => {
     res.status(400).json({ error: "role, full_name are required" });
     return;
   }
+
+  // ★★ セキュリティ修正 (2026-07-08): サインアップ時に client 指定の role を絶対に信用しない。
+  //   users_role_check は 'admin' も許可しているため、旧実装では新規ユーザが
+  //   POST /auth/create-profile {role:"admin"} を1回叩くだけで管理者に昇格できた
+  //   (INSERT 分岐は role を verbatim で書き込んでいた=権限昇格の重大脆弱性)。
+  //   サインアップで自己申告できるのは customer / store_owner のみ。想定外の値
+  //   ('admin' 含む) はすべて最小権限 customer にフェイルクローズする。
+  //   admin 付与は /admin/admins 経由 (既存 admin + MFA) のみに限定する。
+  const SIGNUP_ALLOWED_ROLES = new Set(["customer", "store_owner"]);
+  const safeRole = SIGNUP_ALLOWED_ROLES.has(role) ? role : "customer";
   // ★ T004 OAuth (Apple/Google) では provider metadata に phone が無い → 空欄を許容して NULL 保存。
   //   後から MyPage 設定 / 予約フローで補完を促す。 phone_number 列は NULL 可。
   const normalizedPhone: string | null =
@@ -213,7 +227,7 @@ router.post("/auth/create-profile", async (req: Request, res: Response) => {
     try {
       await db.execute(sql`
         INSERT INTO users (id, email, role, full_name, phone_number, display_name)
-        VALUES (${user.id}, ${user.email!}, ${role}, ${full_name.trim()}, ${normalizedPhone}, ${normalizedDisplayName})
+        VALUES (${user.id}, ${user.email!}, ${safeRole}, ${full_name.trim()}, ${normalizedPhone}, ${normalizedDisplayName})
         ON CONFLICT (id) DO UPDATE SET
           email = EXCLUDED.email,
           full_name = EXCLUDED.full_name,

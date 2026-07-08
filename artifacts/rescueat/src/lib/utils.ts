@@ -69,6 +69,22 @@ export function formatPickupTime(
   return `${m}/${d}(${w}) ${time}`;
 }
 
+// 受取日の基準 Date を返す。前日出品(pickupNextDay)なら公開日(JST暦日)の翌日、それ以外は公開日当日。
+// formatPickupTime の refDate に渡すと、受取“日付”を（購入日ではなく実受取日で）正しく表示できる。
+// ★ 2026-07-03 事故対応: 前日出品バッグで購入日=受取日と誤解される事故の再発防止。
+export function effectivePickupDate(
+  bagCreatedAt: string | Date | null | undefined,
+  pickupNextDay?: boolean | null,
+): Date | null {
+  if (!bagCreatedAt) return null;
+  const created = new Date(bagCreatedAt);
+  if (isNaN(created.getTime())) return null;
+  const jstYmd = created.toLocaleDateString('en-CA', { timeZone: 'Asia/Tokyo' }); // YYYY-MM-DD (JST)
+  const [y, m, d] = jstYmd.split('-').map(Number);
+  // 12:00 JST (03:00 UTC) に固定して暦日跨ぎの丸め事故を避ける。
+  return new Date(Date.UTC(y, m - 1, d + (pickupNextDay ? 1 : 0), 3, 0, 0));
+}
+
 /**
  * 受取時間を表示用に整形。 2部制(受取2枠)なら "11:00〜14:00 / 17:00〜19:00"、 1枠なら "11:00〜14:00"。
  * 日付プレフィックスは付けない（呼び出し側で「本日/明日」等を別途付与する想定）。

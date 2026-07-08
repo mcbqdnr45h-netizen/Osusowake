@@ -1,13 +1,15 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { surpriseBagsTable, storesTable, reservationsTable, favoritesTable, notificationsTable, reviewsTable } from "@workspace/db/schema";
-import { eq, and, ne, sql } from "drizzle-orm";
+import { eq, and, ne, sql, like } from "drizzle-orm";
 import { releaseExpiredCartReservations } from "./reservations";
-import { sendPushToUsers } from "../lib/push.js";
+import { sendPushToUsers, filterFavoriteUpdateOptIn } from "../lib/push.js";
+import { broadcastNewListing } from "../lib/new-listing-broadcast.js";
 import { requireAuth, requireStoreOwner } from "../middlewares/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { getReviewDemoOwnerIds, isReviewDemoOwner } from "../lib/app-review.js";
 import { bagVisibleSql } from "../lib/bag-visibility.js";
+import { cached, invalidate } from "../lib/ttl-cache.js";
 import {
   ListStoreBagsParams,
   CreateBagParams,
@@ -18,6 +20,23 @@ import {
 } from "@workspace/api-zod";
 
 const router: IRouter = Router();
+
+/**
+ * 出品の取り消し(非公開)・削除時に、その出品で送った「新着」通知(ベル)を消す。
+ * 通知本文末尾の [bag:ID] トークンで対象を特定する(bags.ts / recurring-publisher.ts が付与)。
+ * 既に配信済みのプッシュは取り消せないが、アプリ内の通知一覧からは消えるので
+ * 「取り消された(存在しない)出品に飛ばされる」誤誘導を防ぐ。 fail-open(失敗しても本処理は続行)。
+ */
+async function deleteNewBagNotifications(bagId: number): Promise<void> {
+  try {
+    await db.delete(notificationsTable).where(and(
+      eq(notificationsTable.type, "new_bag"),
+      like(notificationsTable.body, `%[bag:${bagId}]%`),
+    ));
+  } catch (e) {
+    console.error(`[bags] deleteNewBagNotifications failed bag=${bagId}:`, e);
+  }
+}
 
 /**
  * バッグが期限切れかどうかを判定する（深夜またぎ対応）
@@ -168,6 +187,9 @@ router.get("/bags", async (_req, res) => {
   // 期限切れ仮押さえを非同期で清算（レスポンスはブロックしない）
   releaseExpiredCartReservations().catch(() => {});
   try {
+    // ★ 公開一覧: 全ユーザー同一結果 & 秒間多数の refetch が来るため 10 秒メモリキャッシュ。
+    //   在庫は予約確定時にサーバー側で再検証されるため、数秒の鮮度落ちは許容。
+    const result = await cached("bags:list", 10_000, async () => {
     const bags = await db
       .select({
         id: surpriseBagsTable.id,
@@ -203,14 +225,104 @@ router.get("/bags", async (_req, res) => {
       ))
       .orderBy(surpriseBagsTable.id);
 
-    const result = bags.map(({ storeAvgRating, storeReviewCount, ...b }) => ({
-      ...b,
-      store: { ...b.store, totalBagsAvailable: b.stockCount, avgRating: storeAvgRating, reviewCount: storeReviewCount },
-    }));
+      return bags.map(({ storeAvgRating, storeReviewCount, ...b }) => ({
+        ...b,
+        store: { ...b.store, totalBagsAvailable: b.stockCount, avgRating: storeAvgRating, reviewCount: storeReviewCount },
+      }));
+    });
     res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "internal_error", message: "Failed to fetch bags" });
+  }
+});
+
+/**
+ * 発見ページ「本日分は完売しました」用: 今日出品されたが、 もう買えないバッグを返す。
+ *   = 完売(stock<=0) または 受取時間切れ(今 visible でない)。
+ *   ★ /api/bags は notExpired で時間切れを弾くため、 時間切れバッグ(松村製麺所など)は
+ *     ここでしか取れない。 これで「完売・終了した本日分」を発見に残せる。
+ *   ★ stockCount は一律 0 に上書きして返す → フロント BagCard が「完売御礼・薄暗・タップ無効」
+ *     で描画する(在庫残りの時間切れバッグも購入不可として正しく表示)。
+ *   ★ /api/bags/:bagId より前に登録必須(:bagId が "ended-today" を捕まえるのを防ぐ)。
+ */
+router.get("/bags/ended-today", async (_req, res) => {
+  try {
+    const result = await cached("bags:ended-today", 30_000, async () => {
+      const bags = await db
+        .select({
+          id: surpriseBagsTable.id,
+          storeId: surpriseBagsTable.storeId,
+          title: surpriseBagsTable.title,
+          description: surpriseBagsTable.description,
+          allergyInfo: surpriseBagsTable.allergyInfo,
+          pickupNote: surpriseBagsTable.pickupNote,
+          originalPrice: surpriseBagsTable.originalPrice,
+          discountedPrice: surpriseBagsTable.discountedPrice,
+          stockCount: surpriseBagsTable.stockCount,
+          pickupStart: surpriseBagsTable.pickupStart,
+          pickupEnd: surpriseBagsTable.pickupEnd,
+          pickupStart2: surpriseBagsTable.pickupStart2,
+          pickupEnd2: surpriseBagsTable.pickupEnd2,
+          imageUrl: surpriseBagsTable.imageUrl,
+          category: surpriseBagsTable.category,
+          itemType: surpriseBagsTable.itemType,
+          isActive: surpriseBagsTable.isActive,
+          createdAt: surpriseBagsTable.createdAt,
+          pickupNextDay: surpriseBagsTable.pickupNextDay,
+          store: publicStoreCols,
+          storeAvgRating: sql<number | null>`(SELECT ROUND(AVG(r.rating)::numeric, 1) FROM reviews r WHERE r.store_id = ${storesTable.id})`,
+          storeReviewCount: sql<number>`(SELECT COUNT(*)::integer FROM reviews r WHERE r.store_id = ${storesTable.id})`,
+          // ★ このバッグの「支払済み予約」件数。 stock=0 でも実際に売れたか判定に使う
+          //   (在庫0で出品/手動0編集の“売れてないバッグ”を完売と偽らないため)。
+          soldPaidCount: sql<number>`(SELECT COUNT(*)::integer FROM reservations r WHERE r.bag_id = ${surpriseBagsTable.id} AND r.payment_status = 'paid')`,
+        })
+        .from(surpriseBagsTable)
+        .innerJoin(storesTable, eq(surpriseBagsTable.storeId, storesTable.id))
+        .where(and(
+          // ★ bag.is_active=true は要求しない。 購入で完売(stock=0)すると payment.ts /
+          //   stripe-webhook.ts が自動で is_active=false にするため、 ここで true を要求すると
+          //   「ちゃんと売れて完売したバッグ」ほど弾かれる本末転倒になる。 停止店は下の store 条件で除外。
+          sql`${storesTable.status} = 'approved' AND ${storesTable.isActive} = true`,
+          // 受取日 = 今日(JST)。 pickup_next_day(前夜出品→翌日受取)は created が前日なので別扱い。
+          sql`(
+            (${surpriseBagsTable.pickupNextDay} IS NOT TRUE
+              AND DATE(${surpriseBagsTable.createdAt} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo') = DATE(NOW() AT TIME ZONE 'Asia/Tokyo'))
+            OR
+            (${surpriseBagsTable.pickupNextDay} IS TRUE
+              AND DATE(${surpriseBagsTable.createdAt} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo') = DATE(NOW() AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 day')
+          )`,
+          // もう買えない、の内訳:
+          //   (A) 本当に完売 = 在庫0 かつ 支払済み予約が1件以上(=ちゃんと売れて0になった)。
+          //       ★ 在庫0でも予約0(店が在庫0で出品/手動0編集の未販売バッグ)は完売ではない → 除外。
+          //   (B) 時間切れ = まだ有効(is_active=true)なのに受取時間外。
+          //   ★ 店が意図的に下げた未完売(is_active=false かつ stock>0)は どちらにも該当せず除外。
+          sql`(
+            (${surpriseBagsTable.stockCount} <= 0
+              AND EXISTS (SELECT 1 FROM reservations r WHERE r.bag_id = ${surpriseBagsTable.id} AND r.payment_status = 'paid'))
+            OR (${surpriseBagsTable.isActive} = true AND NOT (${bagVisibleSql}))
+          )`,
+        ))
+        .orderBy(sql`${surpriseBagsTable.id} DESC`)
+        .limit(40);
+
+      return bags.map(({ storeAvgRating, storeReviewCount, soldPaidCount, ...b }) => ({
+        // ★ 嘘をつかないためのラベル種別。 stockCount:0 で上書きする前の“元の在庫”で判定する。
+        //   完売(sold_out) = 在庫0 かつ 支払済み予約あり(=本当に売り切れて0になった)。
+        //   それ以外(ended) = 受取時間切れ。 在庫が1でも残ってるなら時間切れであって完売ではない。
+        //   ※ WHERE(B)条件で「まだ有効なのに受取時間外」の在庫残りバッグも入るので、
+        //     ここで在庫0を必須にしないと在庫残りが完売と誤表示される(実際に起きたバグ)。
+        //   フロント(BagCard)がこれで「完売御礼🌸」と「本日終了🌙」を出し分ける。
+        endReason: (Number(b.stockCount) <= 0 && Number(soldPaidCount) > 0 ? "sold_out" : "ended") as "sold_out" | "ended",
+        ...b,
+        stockCount: 0, // ★ 一律「もう買えない」扱い(BagCard が薄暗・タップ無効で描画)
+        store: { ...b.store, totalBagsAvailable: 0, avgRating: storeAvgRating, reviewCount: storeReviewCount },
+      }));
+    });
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal_error", message: "Failed to fetch ended-today bags" });
   }
 });
 
@@ -396,7 +508,7 @@ router.post("/stores/:storeId/bags", requireAuth, requireStoreOwner, async (req,
     //   応答後にリサイクルされて push が消えるのを防ぐため。）
     try {
       const [store] = await db
-        .select({ name: storesTable.name })
+        .select({ name: storesTable.name, ownerId: storesTable.ownerId })
         .from(storesTable)
         .where(eq(storesTable.id, storeId))
         .limit(1);
@@ -406,8 +518,9 @@ router.post("/stores/:storeId/bags", requireAuth, requireStoreOwner, async (req,
         .from(favoritesTable)
         .where(eq(favoritesTable.storeId, storeId));
 
+      const priceLabel = `¥${Number(body.discountedPrice).toLocaleString()}`;
+
       if (fanRows.length > 0 && store) {
-        const priceLabel = `¥${Number(body.discountedPrice).toLocaleString()}`;
         const notifTitle = `🛍️ ${store.name} が新しいおすそわけを出品`;
         const notifBodyClean = `「${body.title}」${priceLabel}〜 在庫: ${body.stockCount}個`;
         const notifBodyDb    = bag?.id ? `${notifBodyClean} [bag:${bag.id}]` : notifBodyClean;
@@ -420,19 +533,44 @@ router.post("/stores/:storeId/bags", requireAuth, requireStoreOwner, async (req,
             storeId,
           }))
         );
-        console.log(`[bags] 新出品通知ブロック開始 bag=${bag?.id} fans=${fanRows.length}`);
-        await sendPushToUsers(fanRows.map(f => f.userId), {
-          title: notifTitle,
-          body:  notifBodyClean,
-          tag:   bag?.id ? `new-bag-${bag.id}` : `new-bag-${storeId}-${Date.now()}`,
-          url:   bag?.id ? `/bags/${bag.id}` : `/stores/${storeId}`,
-        });
-        console.log(`[bags] notified ${fanRows.length} favorite users for store ${storeId}`);
+        // ★ DB通知(ベル)は全お気に入りユーザーに残す。プッシュ配信だけ
+        //   「お気に入り店舗の更新」通知OFFのユーザーを除外する(設定を本当に効かせる)。
+        const pushRecipients = await filterFavoriteUpdateOptIn(fanRows.map(f => f.userId));
+        console.log(`[bags] 新出品通知ブロック開始 bag=${bag?.id} fans=${fanRows.length} push対象=${pushRecipients.length}`);
+        if (pushRecipients.length > 0) {
+          await sendPushToUsers(pushRecipients, {
+            title: notifTitle,
+            body:  notifBodyClean,
+            tag:   bag?.id ? `new-bag-${bag.id}` : `new-bag-${storeId}-${Date.now()}`,
+            url:   bag?.id ? `/bags/${bag.id}` : `/stores/${storeId}`,
+          });
+        }
+        console.log(`[bags] notified ${pushRecipients.length}/${fanRows.length} favorite users for store ${storeId}`);
+      }
+
+      // ★ 全体配信: お気に入り未登録の全ユーザーにも新出品を通知(出品少ない今だけの初期ブースト)。
+      //   env kill スイッチ・夜間スキップ・1日上限つき。定期出品からは呼ばない(手動出品のみ)。
+      if (store) {
+        try {
+          await broadcastNewListing({
+            storeId,
+            storeName: store.name,
+            ownerUserId: store.ownerId,
+            bagId: bag?.id,
+            bagTitle: body.title,
+            priceLabel,
+            stockCount: body.stockCount,
+            excludeUserIds: fanRows.map(f => f.userId), // お気に入り勢は上で通知済み → 二重送信しない
+          });
+        } catch (broadcastErr) {
+          console.error("[bags] broadcast error (non-fatal):", broadcastErr);
+        }
       }
     } catch (notifErr) {
       console.error("[bags] notification error (non-fatal):", notifErr);
     }
 
+    invalidate("bags:list"); invalidate("stores:list");
     res.status(201).json(bag);
   } catch (err) {
     console.error(err);
@@ -509,6 +647,9 @@ router.put("/bags/:bagId", requireAuth, async (req, res) => {
       res.status(404).json({ error: "not_found", message: "Bag not found" });
       return;
     }
+    // ★ 出品取り消し(非公開化)時は、その出品で送った新着通知(ベル)も消す。
+    if (body.isActive === false) await deleteNewBagNotifications(bagId);
+    invalidate("bags:list"); invalidate("stores:list");
     res.json(updated);
   } catch (err) {
     console.error(err);
@@ -582,6 +723,9 @@ router.delete("/stores/:storeId/bags/:bagId", requireAuth, requireStoreOwner, as
         .where(eq(surpriseBagsTable.id, bagId));
     });
 
+    // ★ 出品削除時は、その出品で送った新着通知(ベル)も消す(存在しない出品への誘導防止)。
+    await deleteNewBagNotifications(bagId);
+    invalidate("bags:list"); invalidate("stores:list");
     res.status(204).send();
   } catch (err) {
     console.error(err);
@@ -721,6 +865,9 @@ router.patch("/stores/:storeId/bags/:bagId", requireAuth, requireStoreOwner, asy
       res.status(404).json({ error: "not_found", message: "Bag not found or not owned by this store" });
       return;
     }
+    // ★ 出品取り消し(非公開化)時は、その出品で送った新着通知(ベル)も消す。
+    if (body.isActive === false) await deleteNewBagNotifications(bagId);
+    invalidate("bags:list"); invalidate("stores:list");
     res.json(updated);
   } catch (err) {
     console.error(err);

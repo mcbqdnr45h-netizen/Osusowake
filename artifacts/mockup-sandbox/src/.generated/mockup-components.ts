@@ -12,13 +12,13 @@ export const modules: ModuleMap = {
   "./components/mockups/insta/Post8Area.tsx": () => import("../components/mockups/insta/Post8Area.tsx"),
   "./components/mockups/insta/Post9Download.tsx": () => import("../components/mockups/insta/Post9Download.tsx"),
   "./components/mockups/logo-colors/LogoVariants.tsx": () => import("../components/mockups/logo-colors/LogoVariants.tsx"),
+  "./components/mockups/refine-c/BagDetail.tsx": () => import("../components/mockups/refine-c/BagDetail.tsx"),
+  "./components/mockups/refine-c/Home.tsx": () => import("../components/mockups/refine-c/Home.tsx"),
+  "./components/mockups/refine-c/Welcome.tsx": () => import("../components/mockups/refine-c/Welcome.tsx"),
   "./components/mockups/refine-a/BagDetail.tsx": () => import("../components/mockups/refine-a/BagDetail.tsx"),
   "./components/mockups/refine-a/Home.tsx": () => import("../components/mockups/refine-a/Home.tsx"),
   "./components/mockups/refine-a/Welcome.tsx": () => import("../components/mockups/refine-a/Welcome.tsx"),
   "./components/mockups/refine-b/BagDetail.tsx": () => import("../components/mockups/refine-b/BagDetail.tsx"),
   "./components/mockups/refine-b/Home.tsx": () => import("../components/mockups/refine-b/Home.tsx"),
-  "./components/mockups/refine-b/Welcome.tsx": () => import("../components/mockups/refine-b/Welcome.tsx"),
-  "./components/mockups/refine-c/BagDetail.tsx": () => import("../components/mockups/refine-c/BagDetail.tsx"),
-  "./components/mockups/refine-c/Home.tsx": () => import("../components/mockups/refine-c/Home.tsx"),
-  "./components/mockups/refine-c/Welcome.tsx": () => import("../components/mockups/refine-c/Welcome.tsx")
+  "./components/mockups/refine-b/Welcome.tsx": () => import("../components/mockups/refine-b/Welcome.tsx")
 };

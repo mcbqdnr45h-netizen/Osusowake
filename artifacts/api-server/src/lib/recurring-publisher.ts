@@ -3,11 +3,8 @@ import {
   recurringListingsTable,
   surpriseBagsTable,
   storesTable,
-  favoritesTable,
-  notificationsTable,
 } from "@workspace/db/schema";
 import { eq, desc } from "drizzle-orm";
-import { sendPushToUsers } from "./push.js";
 
 /** 現在の JST 日付(YYYY-MM-DD)/時刻(HH:MM)/曜日(0=日..6=土) を返す。 */
 function getJstNow(): { date: string; time: string; dow: number } {
@@ -38,6 +35,26 @@ function addJstDay(dateStr: string, n: number): string {
   const dt = new Date(Date.UTC(y, m - 1, d));
   dt.setUTCDate(dt.getUTCDate() + n);
   return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+
+/**
+ * 店プロフィールの定休日フリーテキスト(例: "毎週水曜日・年末年始")から、
+ * 明示的な曜日 (「X曜」表記) だけを抽出して dow(0=日..6=土) の集合を返す。
+ * ★ 保守的に「曜」を伴う表記のみ拾う。 単漢字("水")は "料金"の"金" 等を誤検知しうるため拾わない
+ *   ＝ 誤検知で正常店の自動出品を止めないことを最優先。
+ * ★ 特定日 (年末年始・祝日・不定休) はここでは扱わない → skip_dates で対応する。
+ */
+const HOLIDAY_DOW: Record<string, number> = { 日: 0, 月: 1, 火: 2, 水: 3, 木: 4, 金: 5, 土: 6 };
+export function parseHolidayWeekdays(holiday: string | null | undefined): Set<number> {
+  const out = new Set<number>();
+  if (!holiday) return out;
+  const re = /([日月火水木金土])曜/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(holiday)) !== null) {
+    const d = HOLIDAY_DOW[m[1]!];
+    if (d !== undefined) out.add(d);
+  }
+  return out;
 }
 
 /**
@@ -97,6 +114,7 @@ async function runPublish(): Promise<void> {
         .select({
           name: storesTable.name,
           status: storesTable.status,
+          holiday: storesTable.holiday,
           stripeAccountId: storesTable.stripeAccountId,
           stripeChargesEnabled: storesTable.stripeChargesEnabled,
           stripePayoutsEnabled: storesTable.stripePayoutsEnabled,
@@ -116,6 +134,24 @@ async function runPublish(): Promise<void> {
       )
         continue;
 
+      // ★ 営業日ガード (二重防御): 店プロフィールの定休日(曜日)に「受取曜日」が該当するなら公開しない。
+      //   daysOfWeek/skipDates は定期テンプレ側の設定だが、 店が定休日プロフィールと
+      //   テンプレ曜日で矛盾した設定をしていると、 閉店曜日にも自動公開され受取事故になる
+      //   （客が来ても店が閉まっている）。 定休日テキストの「X曜」を受取曜日と突き合わせて防ぐ。
+      //   ・判定は「受取曜日(targetPickupDow)」基準＝客が実際に来店する曜日で見る（前日出品も正しく判定）。
+      //   ・矛盾時は定休日を優先＝閉店曜日には出さない（客保護を優先）。
+      //   ・非破壊スキップ (lastPublishedDate を更新しない) ＝定休日/曜日設定を直せば自動で再開する。
+      //   ・監査できるよう WARN ログを残す。 特定日(年末年始/祝日)は対象外→ skip_dates で対応。
+      const holidayDows = parseHolidayWeekdays(store.holiday);
+      if (holidayDows.has(targetPickupDow)) {
+        console.warn(
+          `[recurring] SKIP(holiday-guard) tpl=${tpl.id} store=${tpl.storeId}(${store.name}) ` +
+          `pickupDow=${targetPickupDow} pickupDate=${targetPickupDate} holiday="${store.holiday}" ` +
+          `— 店の定休曜日に該当のため自動公開を見送り`,
+        );
+        continue;
+      }
+
       // ── 出品する在庫数を決める ──────────────────────────────────────────────
       //   固定モード: 毎日テンプレの stockCount で出す（従来）。
       //   持ち越しモード: 前日のバッグの「残り在庫」を引き継いで出す（毎日リセットしない）。
@@ -123,7 +159,6 @@ async function runPublish(): Promise<void> {
       //     だが在庫は前日の残りを使う＝合計を超えない（過剰販売なし）。 残り0なら再出品しない。
       let stockToPublish = tpl.stockCount;
       let prevBagId: number | null = null;
-      let isFirstPublish = true;
       if (tpl.carryOverStock) {
         const [prev] = await db
           .select({ id: surpriseBagsTable.id, stockCount: surpriseBagsTable.stockCount })
@@ -134,7 +169,6 @@ async function runPublish(): Promise<void> {
         if (prev) {
           stockToPublish = prev.stockCount; // 前日の残りを引き継ぐ（リセットしない）
           prevBagId = prev.id;
-          isFirstPublish = false;
         }
         // 残り0=完売 → 再出品しない（勝手に補充しない）。 当日マークだけしてループを止める。
         if (stockToPublish <= 0) {
@@ -188,41 +222,12 @@ async function runPublish(): Promise<void> {
           .where(eq(surpriseBagsTable.id, prevBagId));
       }
 
-      // お気に入りユーザーへ通知（手動出品 createBag と同じ挙動）。
-      //   ★ 持ち越しモードの「毎日の引き継ぎ再出品」では通知しない（同じ商品で毎日通知＝スパム化を防ぐ）。
-      //     初回出品時のみ通知する（固定モードは毎日が新規扱いなので従来どおり通知）。
-      if (isFirstPublish) try {
-        const fanRows = await db
-          .select({ userId: favoritesTable.userId })
-          .from(favoritesTable)
-          .where(eq(favoritesTable.storeId, tpl.storeId));
-        if (fanRows.length > 0) {
-          const priceLabel = `¥${Number(tpl.discountedPrice).toLocaleString()}`;
-          const notifTitle = `🛍️ ${store.name} が新しいおすそわけを出品`;
-          const notifBodyClean = `「${tpl.title}」${priceLabel}〜 在庫: ${stockToPublish}個`;
-          const notifBodyDb = bag?.id ? `${notifBodyClean} [bag:${bag.id}]` : notifBodyClean;
-          await db.insert(notificationsTable).values(
-            fanRows.map((f) => ({
-              userId: f.userId,
-              type: "new_bag",
-              title: notifTitle,
-              body: notifBodyDb,
-              storeId: tpl.storeId,
-            })),
-          );
-          await sendPushToUsers(
-            fanRows.map((f) => f.userId),
-            {
-              title: notifTitle,
-              body: notifBodyClean,
-              tag: bag?.id ? `new-bag-${bag.id}` : `new-bag-${tpl.storeId}-${Date.now()}`,
-              url: bag?.id ? `/bags/${bag.id}` : `/stores/${tpl.storeId}`,
-            },
-          );
-        }
-      } catch (notifErr) {
-        console.error("[recurring] notification error (non-fatal):", notifErr);
-      }
+      // ★ 定期出品はお気に入り登録者への通知を行わない（マロ指示 2026-07-08 / Aプラン）。
+      //   定期出品は毎日同じ店が同じ商品を自動公開するため、お気に入り登録ユーザーに
+      //   毎日「新しいおすそわけを出品」プッシュ/ベルが飛び、スパム化していた。
+      //   新規性のある手動出品（bags.ts createBag）の通知は従来どおり残し、
+      //   定期出品の自動公開だけは通知を出さず静かに行う。
+      //   建てるな注意: ここに通知を戻すと定期出品ファンへの毎日スパムが再発する。
     } catch (err) {
       console.error(`[recurring] publish error tpl=${tpl.id}:`, err);
     }

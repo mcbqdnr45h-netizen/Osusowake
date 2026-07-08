@@ -6,7 +6,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useListReservations, useCancelReservation, getListReservationsQueryKey } from '@workspace/api-client-react';
 import { useQueryClient } from '@tanstack/react-query';
 import { format, parseISO, isToday, isYesterday } from 'date-fns';
-import { formatPickupTime } from '@/lib/utils';
+import { formatPickupTime, effectivePickupDate } from '@/lib/utils';
 import { ja } from 'date-fns/locale';
 import { Ticket, Clock, Star, PenLine, X, CheckCircle2, CreditCard, Ban, Trash2, Package, AlertCircle, RefreshCcw } from 'lucide-react';
 import { Link, useLocation } from 'wouter';
@@ -418,7 +418,7 @@ export default function MyReservations() {
                                 {(res.bag?.pickupStart || res.bag?.pickupEnd) && (
                                   <p className="text-[10px] text-muted-foreground/60 mt-0.5 flex items-center gap-0.5">
                                     <Clock className="w-2.5 h-2.5 shrink-0" />
-                                    <span className="truncate">{formatPickupTime(res.bag.pickupStart, res.bag.pickupEnd, res.createdAt)}</span>
+                                    <span className="truncate">{formatPickupTime(res.bag.pickupStart, res.bag.pickupEnd, effectivePickupDate((res.bag as { createdAt?: string }).createdAt, (res.bag as { pickupNextDay?: boolean }).pickupNextDay) ?? res.createdAt)}</span>
                                   </p>
                                 )}
 

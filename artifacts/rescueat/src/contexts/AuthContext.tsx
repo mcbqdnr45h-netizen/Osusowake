@@ -284,7 +284,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           //     並列化するとレース条件が発生する → 直列順序を必ず守る。
           //     代わりに fetchProfile タイムアウトを 5s→2s に短縮することで体感ロードを改善。
           if (sess.access_token && !isRecoveryFlow) {
-            const adminCheck = await checkIsAdmin(sess.access_token);
+            // ★ checkIsAdmin は /api/auth/is-admin への生 fetch (タイムアウト無し)。
+            //   これが initAuth の直列パスで fetchProfile の前にあるため、 管理者ユーザは
+            //   毎回この往復を待たされ、 回線が遅いと isLoading が 8s の絶対タイムアウトまで
+            //   居座り MyPage スケルトンが長引く (マロ報告「たまに長い」の主因)。
+            //   2s でキャップ: タイムアウト時は今回のパスで非管理者扱いにして即座に
+            //   fetchProfile へ進む。 管理者判定は次回 onAuthStateChange/再認証で解決する。
+            const adminCheck = await raceTimeout(checkIsAdmin(sess.access_token), 2000);
             if (adminCheck) {
               if (isMfaVerifiedInSession()) {
                 // 同一タブ内で MFA 検証済み → そのまま管理者として続行
@@ -406,21 +412,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return (base as string).replace(/\/$/, '') || '';
   }
 
-  async function checkPhoneAvailable(normalizedPhone: string): Promise<boolean> {
-    try {
-      const res = await fetch(`${getApiBase()}/api/auth/check-phone`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone: normalizedPhone }),
-      });
-      if (!res.ok) return true; // エラー時は通過させてDBエラーで捕捉
-      const { taken } = await res.json();
-      return !taken;
-    } catch {
-      return true; // ネットワークエラー時は通過させてDBエラーで捕捉
-    }
-  }
-
   // メールアドレスの実在性検証（形式・MX・使い捨てメール）
   async function validateEmail(email: string): Promise<{ valid: boolean; message?: string }> {
     try {
@@ -457,17 +448,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const normalizedPhone = phone.trim().replace(/[-\s]/g, '');
     const normalizedDisplayName = displayName.trim();
 
-    // 並列実行: メール実在性チェック + 電話番号重複チェック (独立した2つの API 呼び出し)
+    // メール実在性のみ検証する。 電話番号は連絡先であり本人性キーではないため
+    // 重複チェック(=登録ブロック)は撤廃した (2026-07-07)。 同じ電話番号でも登録可能。
     onProgress?.('入力内容を確認中…');
-    const [emailCheck, phoneAvailable] = await Promise.all([
-      validateEmail(email),
-      checkPhoneAvailable(normalizedPhone),
-    ]);
+    const emailCheck = await validateEmail(email);
     if (!emailCheck.valid) {
       return { error: emailCheck.message ?? 'メールアドレスを確認してください', needsConfirmation: false };
-    }
-    if (!phoneAvailable) {
-      return { error: 'この電話番号は既に登録されています', needsConfirmation: false };
     }
 
     onProgress?.('アカウントを作成中…');
@@ -511,17 +497,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   async function signUpAsStore(email: string, password: string, name: string, phone: string, onProgress?: (step: string) => void) {
     const normalizedPhone = phone.trim().replace(/[-\s]/g, '');
 
-    // 並列実行: メール実在性チェック + 電話番号重複チェック (独立した2つの API 呼び出し)
+    // メール実在性のみ検証する。 電話番号は連絡先であり本人性キーではないため
+    // 重複チェック(=登録ブロック)は撤廃した (2026-07-07)。 同じ電話番号でも登録可能。
     onProgress?.('入力内容を確認中…');
-    const [emailCheck, phoneAvailable] = await Promise.all([
-      validateEmail(email),
-      checkPhoneAvailable(normalizedPhone),
-    ]);
+    const emailCheck = await validateEmail(email);
     if (!emailCheck.valid) {
       return { error: emailCheck.message ?? 'メールアドレスを確認してください', needsConfirmation: false };
-    }
-    if (!phoneAvailable) {
-      return { error: 'この電話番号は既に登録されています', needsConfirmation: false };
     }
 
     onProgress?.('アカウントを作成中…');
@@ -899,10 +880,24 @@ export function useAuth() {
 }
 
 function translateError(msg: string): string {
-  if (msg.includes('Invalid login credentials')) return 'メールアドレスまたはパスワードが正しくありません';
-  if (msg.includes('Email not confirmed'))        return 'メールアドレスが未確認です。確認メールのリンクをクリックしてください';
-  if (msg.includes('User already registered'))   return 'このメールアドレスは既に登録されています';
-  if (msg.includes('Password should be at least')) return 'パスワードは6文字以上で入力してください';
-  if (msg.includes('rate limit'))                return 'しばらく時間をおいてから再試行してください';
-  return msg;
+  const m = (msg ?? '').toString().trim();
+  if (m.includes('Invalid login credentials')) return 'メールアドレスまたはパスワードが正しくありません';
+  if (m.includes('Email not confirmed'))        return 'メールアドレスが未確認です。確認メールのリンクをクリックしてください';
+  if (m.includes('User already registered'))   return 'このメールアドレスは既に登録されています';
+  if (m.includes('Password should be at least')) return 'パスワードは6文字以上で入力してください';
+  if (m.includes('rate limit'))                return 'しばらく時間をおいてから再試行してください';
+  // ★ サーバー高負荷・一時障害の保険:
+  //   gotrue が空ボディ / 5xx を返すと supabase-js が error.message を
+  //   "{}"（空オブジェクトのJSON文字列）や "[object Object]" にすることがあり、
+  //   これがそのままユーザーに露出して「赤枠に {} が出る」バグになる。
+  //   意味の無い / JSON まる出し / ネットワーク系メッセージは必ず日本語の汎用文言に変換する。
+  if (
+    m === '' || m === '{}' || m === '[object Object]' ||
+    m === 'undefined' || m === 'null' ||
+    /^[[{].*[\]}]$/.test(m) ||
+    /failed to fetch|networkerror|load failed|timeout|timed out|fetch failed|network request failed/i.test(m)
+  ) {
+    return '接続が不安定なため、ログインに失敗しました。通信環境を確認して、もう一度お試しください';
+  }
+  return m;
 }

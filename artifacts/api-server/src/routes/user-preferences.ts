@@ -148,6 +148,163 @@ router.get("/user/notification-preference", requireAuth, async (req, res) => {
   }
 });
 
+// ── お気に入り外の新規出品(全体配信) ON/OFF ──────────────────────────────────
+//   OFF にすると new-listing-broadcast の全体配信がこの人だけスキップされる。
+//   (お気に入り店の出品通知は別系統なので影響しない)
+router.patch("/user/new-listing-preference", requireAuth, async (req, res) => {
+  try {
+    const meId = req.authUser!.id;
+    const body = (req.body ?? {}) as { notifNewListing?: unknown };
+    if (typeof body.notifNewListing !== "boolean") {
+      return res.status(400).json({
+        error: "invalid_body",
+        message: "notifNewListing (boolean) is required",
+      });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("users")
+      .update({ notif_new_listing: body.notifNewListing })
+      .eq("id", meId);
+
+    if (error) {
+      console.error("[PATCH /user/new-listing-preference] supabase error:", error.message);
+      return res.status(500).json({ error: "internal_error", message: "設定の保存に失敗しました" });
+    }
+
+    return res.json({ notifNewListing: body.notifNewListing });
+  } catch (err: any) {
+    console.error("[PATCH /user/new-listing-preference] error:", err?.message ?? err);
+    return res.status(500).json({ error: "internal_error", message: "設定の保存に失敗しました" });
+  }
+});
+
+router.get("/user/new-listing-preference", requireAuth, async (req, res) => {
+  try {
+    const meId = req.authUser!.id;
+    const { data, error } = await supabaseAdmin
+      .from("users")
+      .select("notif_new_listing")
+      .eq("id", meId)
+      .maybeSingle();
+    if (error) {
+      console.error("[GET /user/new-listing-preference] supabase error:", error.message);
+      return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
+    }
+    // カラムが null (旧ユーザー) の場合は true (通知あり) とみなす
+    const val = (data as { notif_new_listing?: boolean | null } | null)?.notif_new_listing;
+    return res.json({ notifNewListing: val !== false });
+  } catch (err: any) {
+    console.error("[GET /user/new-listing-preference] error:", err?.message ?? err);
+    return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
+  }
+});
+
+// ── お気に入り店舗の更新(新規出品)プッシュ ON/OFF ────────────────────────────
+//   OFF にすると、お気に入り登録した店が新しいバッグを出したときのプッシュ配信が
+//   この人だけスキップされる(アプリ内のベル通知は残す)。bags.ts / recurring-publisher.ts の
+//   filterFavoriteUpdateOptIn が参照する。
+router.patch("/user/favorite-update-preference", requireAuth, async (req, res) => {
+  try {
+    const meId = req.authUser!.id;
+    const body = (req.body ?? {}) as { notifFavoriteUpdate?: unknown };
+    if (typeof body.notifFavoriteUpdate !== "boolean") {
+      return res.status(400).json({
+        error: "invalid_body",
+        message: "notifFavoriteUpdate (boolean) is required",
+      });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("users")
+      .update({ notif_favorite_update: body.notifFavoriteUpdate })
+      .eq("id", meId);
+
+    if (error) {
+      console.error("[PATCH /user/favorite-update-preference] supabase error:", error.message);
+      return res.status(500).json({ error: "internal_error", message: "設定の保存に失敗しました" });
+    }
+
+    return res.json({ notifFavoriteUpdate: body.notifFavoriteUpdate });
+  } catch (err: any) {
+    console.error("[PATCH /user/favorite-update-preference] error:", err?.message ?? err);
+    return res.status(500).json({ error: "internal_error", message: "設定の保存に失敗しました" });
+  }
+});
+
+router.get("/user/favorite-update-preference", requireAuth, async (req, res) => {
+  try {
+    const meId = req.authUser!.id;
+    const { data, error } = await supabaseAdmin
+      .from("users")
+      .select("notif_favorite_update")
+      .eq("id", meId)
+      .maybeSingle();
+    if (error) {
+      console.error("[GET /user/favorite-update-preference] supabase error:", error.message);
+      return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
+    }
+    // カラムが null (旧ユーザー) の場合は true (通知あり) とみなす
+    const val = (data as { notif_favorite_update?: boolean | null } | null)?.notif_favorite_update;
+    return res.json({ notifFavoriteUpdate: val !== false });
+  } catch (err: any) {
+    console.error("[GET /user/favorite-update-preference] error:", err?.message ?? err);
+    return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
+  }
+});
+
+// ── 店舗オーナー: 未出品リマインド ON/OFF ─────────────────────────────────────
+//   OFF にすると unlisted-store-reminder の「今日まだ出品してませんよ」通知が
+//   このオーナーだけスキップされる。
+router.patch("/user/unlisted-reminder-preference", requireAuth, async (req, res) => {
+  try {
+    const meId = req.authUser!.id;
+    const body = (req.body ?? {}) as { notifUnlistedReminder?: unknown };
+    if (typeof body.notifUnlistedReminder !== "boolean") {
+      return res.status(400).json({
+        error: "invalid_body",
+        message: "notifUnlistedReminder (boolean) is required",
+      });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("users")
+      .update({ notif_unlisted_reminder: body.notifUnlistedReminder })
+      .eq("id", meId);
+
+    if (error) {
+      console.error("[PATCH /user/unlisted-reminder-preference] supabase error:", error.message);
+      return res.status(500).json({ error: "internal_error", message: "設定の保存に失敗しました" });
+    }
+
+    return res.json({ notifUnlistedReminder: body.notifUnlistedReminder });
+  } catch (err: any) {
+    console.error("[PATCH /user/unlisted-reminder-preference] error:", err?.message ?? err);
+    return res.status(500).json({ error: "internal_error", message: "設定の保存に失敗しました" });
+  }
+});
+
+router.get("/user/unlisted-reminder-preference", requireAuth, async (req, res) => {
+  try {
+    const meId = req.authUser!.id;
+    const { data, error } = await supabaseAdmin
+      .from("users")
+      .select("notif_unlisted_reminder")
+      .eq("id", meId)
+      .maybeSingle();
+    if (error) {
+      console.error("[GET /user/unlisted-reminder-preference] supabase error:", error.message);
+      return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
+    }
+    // null (旧ユーザー) は true 扱い (デフォルト届く)
+    const val = (data as { notif_unlisted_reminder?: boolean | null } | null)?.notif_unlisted_reminder;
+    return res.json({ notifUnlistedReminder: val !== false });
+  } catch (err: any) {
+    console.error("[GET /user/unlisted-reminder-preference] error:", err?.message ?? err);
+    return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
+  }
+});
+
 // ── 店舗オーナー: 注文メール通知 ON/OFF ──────────────────────────────────────
 //   Web Push 補完として送ってるメールを「Push 来てるからメール邪魔」と感じる
 //   店舗向けの opt-out スイッチ。 OFF にすると emails.ts:sendOrderEmailToStoreOwnerById
@@ -197,6 +354,59 @@ router.get("/user/email-order-preference", requireAuth, async (req, res) => {
     return res.json({ notifEmailOrders: val !== false });
   } catch (err: any) {
     console.error("[GET /user/email-order-preference] error:", err?.message ?? err);
+    return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
+  }
+});
+
+// ── 店舗オーナー: 新規注文の通知(bag_sold push) ON/OFF ────────────────────────
+//   OFF にすると 自店に注文が入った際の push が このオーナーだけスキップされる。
+//   アプリ内ベル(注文履歴)は残すので注文自体は取りこぼさない。
+//   payment.ts / stripe-webhook.ts の bag_sold 送信直前に storeOrderPushEnabled() が参照する。
+router.patch("/user/new-order-preference", requireAuth, async (req, res) => {
+  try {
+    const meId = req.authUser!.id;
+    const body = (req.body ?? {}) as { notifNewOrder?: unknown };
+    if (typeof body.notifNewOrder !== "boolean") {
+      return res.status(400).json({
+        error: "invalid_body",
+        message: "notifNewOrder (boolean) is required",
+      });
+    }
+
+    const { error } = await supabaseAdmin
+      .from("users")
+      .update({ notif_new_order: body.notifNewOrder })
+      .eq("id", meId);
+
+    if (error) {
+      console.error("[PATCH /user/new-order-preference] supabase error:", error.message);
+      return res.status(500).json({ error: "internal_error", message: "設定の保存に失敗しました" });
+    }
+
+    return res.json({ notifNewOrder: body.notifNewOrder });
+  } catch (err: any) {
+    console.error("[PATCH /user/new-order-preference] error:", err?.message ?? err);
+    return res.status(500).json({ error: "internal_error", message: "設定の保存に失敗しました" });
+  }
+});
+
+router.get("/user/new-order-preference", requireAuth, async (req, res) => {
+  try {
+    const meId = req.authUser!.id;
+    const { data, error } = await supabaseAdmin
+      .from("users")
+      .select("notif_new_order")
+      .eq("id", meId)
+      .maybeSingle();
+    if (error) {
+      console.error("[GET /user/new-order-preference] supabase error:", error.message);
+      return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
+    }
+    // null (旧ユーザー) は true 扱い (デフォルト届く)
+    const val = (data as { notif_new_order?: boolean | null } | null)?.notif_new_order;
+    return res.json({ notifNewOrder: val !== false });
+  } catch (err: any) {
+    console.error("[GET /user/new-order-preference] error:", err?.message ?? err);
     return res.status(500).json({ error: "internal_error", message: "設定の取得に失敗しました" });
   }
 });

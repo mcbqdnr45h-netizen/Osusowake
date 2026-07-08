@@ -26,12 +26,13 @@
 | API直 / Fly確認 | https://osusowake-api.fly.dev |
 | staging | https://staging.osusowakejapan.org（移管後に削除可） |
 
-## 現在の状態（2026-05-23 時点）
+## 現在の状態（2026-07-02 時点）
 - ✅ **Replit → Fly 完全移行済**（apex DNS 切替完了、本番は100% Fly 配信。決済/push/iOS/webhook 稼働確認済）。
 - ✅ **B**: 未払い予約の受取ガード（402）+ フロント抑止 / **C**: PWA manifest アイコン（icon-48..512.webp）完了。
-- ⏳ **残: #6 Cloudflare 移管 → Replit 解約**（月額ゼロ化）。
-  ドメイン移管ロックが **6/22 解禁**（登録2026-04-23の60日ロック）。
-  リマインダー: scheduled task `osusowake-cloudflare-migration-unlock`（6/22 09:00 JST）設定済。
+- ✅ **#6 Cloudflare 移管完了**（registrar + NS = Cloudflare）。6/22 リマインダー task 削除済。
+- ✅ **Replit 解約完了（2026-07-02）＝月額ゼロ化達成**。本番は Replit 非依存（DNS/TLS/mail=Cloudflare+Fly+
+  ImprovMX/Resend、cron=Flyプロセス内 setInterval×5、画像/DB=Supabase、code=GitHub、secret=Fly）。
+  旧Replit Neon「Production DB」は解約前確認で**全7テーブル空（0行）**＝失うデータ無しを確定済み。
 
 ## 注意事項（ハマりポイント・破壊するな）
 - **Capacitor `server.url` は `https://osusowakejapan.org/` 固定**。変えると全配信が死ぬ（`artifacts/rescueat/capacitor.config.ts`）。

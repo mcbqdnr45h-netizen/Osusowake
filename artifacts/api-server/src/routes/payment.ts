@@ -2,11 +2,12 @@ import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { reservationsTable, surpriseBagsTable, storesTable, cartReservationsTable, notificationsTable } from "@workspace/db/schema";
 import { eq, sql, and, ne } from "drizzle-orm";
-import { sendPushToUser } from "../lib/push.js";
+import { sendPushToUser, storeOrderPushEnabled } from "../lib/push.js";
 import { sendOrderEmailToStoreOwnerById } from "../utils/emails";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { requireAuth } from "../middlewares/auth.js";
 import { isReviewDemoOwner } from "../lib/app-review.js";
+import { invalidate } from "../lib/ttl-cache.js";
 import {
   CreatePaymentIntentBody,
   ConfirmPaymentBody,
@@ -85,8 +86,8 @@ const USER_SERVICE_FEE_RATE = 0.05;
  *    totalAmountJpy  = ユーザー支払合計 (= round10(merchandise * 1.05))
  *    merchandiseJpy  = 商品代金 (= bag.discountedPrice * quantity)
  *
- *  Step 1. ShopGross（店舗売上 = 25%控除後の店舗取り分・Stripe手数料前）
- *          = Math.floor(merchandiseJpy × 0.75)
+ *  Step 1. ShopGross（店舗売上 = 20%控除後の店舗取り分・Stripe手数料前）
+ *          = Math.floor(merchandiseJpy × 0.80)
  *
  *  Step 2. StripeFee（Stripe決済手数料）
  *          = Math.round(totalAmountJpy × 0.036)
@@ -96,23 +97,25 @@ const USER_SERVICE_FEE_RATE = 0.05;
  *
  *  Step 4. PlatformRevenue（プラットフォーム純利益）
  *          = totalAmountJpy - ShopGross
- *          (内訳: 25% 店舗手数料 + 5% ユーザー利用料 + 端数調整)
+ *          (内訳: 20% 店舗手数料 + 5% ユーザー利用料 + 端数調整)
  *
  *  例（merchandise = 350円, total = round10(350 × 1.05) = 370円）:
- *    ShopGross          = floor(350 × 0.75)          = 262円
+ *    ShopGross          = floor(350 × 0.80)          = 280円
  *    StripeFee          = round(370 × 0.036)         =  13円
- *    ShopTransferAmount = 262 - 13                    = 249円  ← 店舗実入金
- *    PlatformRevenue    = 370 - 262                   = 108円  ← プラットフォームNet（Stripe手数料前）
+ *    ShopTransferAmount = 280 - 13                    = 267円  ← 店舗実入金
+ *    PlatformRevenue    = 370 - 280                   =  90円  ← プラットフォームNet（Stripe手数料前）
  *
- *    検算: 顧客 370 = 店舗 249 + Stripe 13 + プラットフォーム 108 ✓
- *    プラットフォーム純利益(Stripe手数料控除後): 108 - 13 = 95円
- *    内訳目安: 店舗手数料(350×25%≒87) + ユーザー手数料(350×5%≒17) - Stripe手数料(13) ≒ 91円
+ *    検算: 顧客 370 = 店舗 267 + Stripe 13 + プラットフォーム 90 ✓
+ *    プラットフォーム純利益: 90円（= total - shopGross）
+ *      ※ Stripe手数料13円は shopTransferAmount 側で差し引かれる（＝店舗が負担）ため、
+ *        プラットフォームは platformRevenue を満額受け取る。
+ *    内訳: 店舗手数料(350×20%=70円) + ユーザー利用料(total-merch = 370-350 = 20円) = 90円
  */
 function calcFees(totalAmountJpy: number, merchandiseJpy: number): {
   platformRevenue: number;     // プラットフォーム取り分（Stripe手数料控除前）
   stripeFee: number;           // Stripe手数料（事前計算）
   shopTransferAmount: number;  // 店舗への実送金額
-  shopGross: number;           // 店舗売上（25%控除後・Stripe手数料前）
+  shopGross: number;           // 店舗売上（20%控除後・Stripe手数料前）
 } {
   const shopGross          = Math.floor(merchandiseJpy * (1 - PLATFORM_FEE_RATE)); // Step 1
   const stripeFee          = Math.round(totalAmountJpy * STRIPE_FEE_RATE);          // Step 2
@@ -399,10 +402,10 @@ router.post("/payment/create-intent", requireAuth, async (req, res) => {
           store_name:         store?.name ?? "不明な店舗",
           platformFeeRate:    "20%",
           userServiceFeeRate: "5%",
-          merchandiseAmount:  String(merchandise),         // 商品代金（25%課金ベース）
-          platformRevenue:    String(platformRevenue),     // = total - floor(merch × 0.75)
+          merchandiseAmount:  String(merchandise),         // 商品代金（20%課金ベース）
+          platformRevenue:    String(platformRevenue),     // = total - floor(merch × 0.80)
           stripeFee:          String(stripeFee),           // = round(total × 0.036)
-          shopTransferAmount: String(shopTransferAmount),  // = floor(merch × 0.75) - stripeFee
+          shopTransferAmount: String(shopTransferAmount),  // = floor(merch × 0.80) - stripeFee
         };
 
         const baseParams: Parameters<typeof stripe.paymentIntents.create>[0] = {
@@ -434,7 +437,7 @@ router.post("/payment/create-intent", requireAuth, async (req, res) => {
             console.log(
               `✅ PaymentIntent Tier1: ` +
               `total=${total}JPY | ` +
-              `PlatformRevenue=${platformRevenue}JPY (25%) | ` +
+              `PlatformRevenue=${platformRevenue}JPY (20%) | ` +
               `StripeFee≈${stripeFee}JPY | ` +
               `ShopTransfer=${shopTransferAmount}JPY (明示) | ` +
               `Net=${platformRevenue}JPY ✓`
@@ -447,8 +450,8 @@ router.post("/payment/create-intent", requireAuth, async (req, res) => {
             // ⚠️ デスティネーションチャージでは application_fee_amount = total - shopTransferAmount
             //    (= platformRevenue + stripeFee) にしないと店舗送金額がずれる:
             //    store受取 = total - application_fee_amount = total - (total - shopTransfer)
-            //             = shopTransfer = 250円 ✓
-            //    platform純利 = application_fee (100) - Stripe手数料 (13) = 87円 ✓
+            //             = shopTransfer = 267円 ✓
+            //    platform純利 = application_fee (103) - Stripe手数料 (13) = 90円 ✓
             const applicationFeeAmount = total - shopTransferAmount; // = platformRevenue + stripeFee
             try {
               intent = await stripe.paymentIntents.create({
@@ -799,6 +802,10 @@ router.post("/payment/confirm", requireAuth, async (req, res) => {
       return;
     }
 
+    // ★ 在庫が減った/売り切れた → 一覧キャッシュを破棄（他ユーザーに古い在庫数を見せない）。
+    //   これが無いと最大10秒「在庫あり」表示が残り、買えると思って決済→在庫切れ返金のUX事故になる。
+    invalidate("bags:list"); invalidate("stores:list");
+
     // 既に paid / 今回 paid に遷移 — どちらも updated を返す
     const updated = result.reservation;
     res.json({
@@ -849,7 +856,7 @@ router.post("/payment/confirm", requireAuth, async (req, res) => {
         if (existingOwner.length === 0) {
           await db.insert(notificationsTable).values({ userId: store.ownerId, type: "bag_sold", title: ownerTitle, body: ownerBody, storeId: updated.storeId });
         }
-        await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${updated.id}`, url: "/store/orders" });
+        if (await storeOrderPushEnabled(store.ownerId)) await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${updated.id}`, url: "/store/orders" });
         // Web Push が届かない環境 (ブラウザのみ / 通知拒否 / iOS PWA 未追加) の補完として
         // 店舗オーナーへ注文メールを送信。 例外は内部で握り潰されるので await のみで OK。
         // ★ confirm/verify/webhook の三重発火で重複メールを送らないよう、DB通知と同じ
@@ -971,9 +978,9 @@ router.post("/checkout/session", requireAuth, async (req, res) => {
     // 例（merch=350円, total=370円）:
     //   チャージ        370円 → プラットフォームへ着金
     //   Stripe手数料  -  13円
-    //   店舗Transfer  - 249円（/checkout/verify で stripe.transfers.create() ＝ floor(350×0.75)-13）
+    //   店舗Transfer  - 267円（/checkout/verify で stripe.transfers.create() ＝ floor(350×0.80)-13）
     //   ─────────────────────────
-    //   プラットフォームNet 108円（= total - shopGross）− Stripe手数料 13円 = 95円
+    //   プラットフォームNet 90円（= total - shopGross 370-280。Stripe手数料は店舗Transfer側で差引）
     const { platformRevenue, stripeFee, shopTransferAmount } = calcFees(total, merchandise);
 
     const destinationAccountId = store?.stripeAccountId ?? null;
@@ -1010,16 +1017,16 @@ router.post("/checkout/session", requireAuth, async (req, res) => {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     //
     // ❌ 旧実装（application_fee_amount + transfer_data）の問題:
-    //    Stripe が自動で「total - app_fee = 263円」を店舗へ送金した上に、
-    //    /checkout/verify が さらに手動で 250円を Transfer → 二重送金 → プラットフォームがマイナスに
+    //    Stripe が自動で「total - app_fee」を店舗へ送金した上に、
+    //    /checkout/verify が さらに手動で Transfer → 二重送金 → プラットフォームがマイナスに
     //
-    // ✅ 新実装（Separate C&T）:
-    //    Step 1. チャージ全額（350円）がプラットフォームに着金
-    //    Step 2. Stripe 手数料（13円）がプラットフォームから差し引かれる → 残高 337円
-    //    Step 3. /checkout/verify で shopTransferAmount（250円）を店舗へ 1回だけ Transfer
-    //    Step 4. プラットフォーム Net = 337 - 250 = 87円 = 25% ✓（保証）
+    // ✅ 新実装（Separate C&T）（例: merch=350円, total=370円）:
+    //    Step 1. チャージ全額（370円）がプラットフォームに着金
+    //    Step 2. Stripe 手数料（13円）がプラットフォームから差し引かれる → 残高 357円
+    //    Step 3. /checkout/verify で shopTransferAmount（267円）を店舗へ 1回だけ Transfer
+    //    Step 4. プラットフォーム Net = 357 - 267 = 90円 ✓（保証）
     //
-    //    店舗 250円 ✓ | プラットフォーム 87円（25%）✓ | Stripe 13円（3.6%）✓
+    //    店舗 267円 ✓ | プラットフォーム 90円 ✓ | Stripe 13円（3.6%）✓
     //    Stripe ダッシュボード: charge 1件 + transfer 1件 = シンプルで明瞭
     //
     // ※ application_fee_amount も transfer_data も使わない
@@ -1071,7 +1078,7 @@ router.post("/checkout/session", requireAuth, async (req, res) => {
 
     console.log(
       `[Checkout] Separate C&T セッション作成: ${session.id} | ` +
-      `total=${total}JPY | platformRevenue=${platformRevenue}JPY(25%) | ` +
+      `total=${total}JPY | platformRevenue=${platformRevenue}JPY(20%) | ` +
       `shopTransfer=${shopTransferAmount}JPY → /checkout/verify で実行`
     );
 
@@ -1169,6 +1176,10 @@ router.get("/checkout/verify", async (req, res) => {
         storeOwnerId: storesTable.ownerId,
         pickupStart:  surpriseBagsTable.pickupStart,
         pickupEnd:    surpriseBagsTable.pickupEnd,
+        pickupStart2: surpriseBagsTable.pickupStart2,
+        pickupEnd2:   surpriseBagsTable.pickupEnd2,
+        pickupNextDay: surpriseBagsTable.pickupNextDay,
+        bagCreatedAt: surpriseBagsTable.createdAt,
         stockCount:   surpriseBagsTable.stockCount,
       })
       .from(reservationsTable)
@@ -1278,6 +1289,9 @@ router.get("/checkout/verify", async (req, res) => {
       return;
     }
 
+    // ★ 在庫が減った → 一覧キャッシュを破棄（他ユーザーに古い在庫数を見せない）。
+    invalidate("bags:list"); invalidate("stores:list");
+
     // 仮押さえ（旧データ）の確定処理 — 在庫は戻さない（paid / already_paid 共通で実行可、冪等）
     await db
       .update(cartReservationsTable)
@@ -1299,7 +1313,7 @@ router.get("/checkout/verify", async (req, res) => {
 
           if (transferAmount > 0 && storeAccountId) {
             const transfer = await stripe.transfers.create({
-              amount:             transferAmount,            // ShopTransferAmount（例: 250円）
+              amount:             transferAmount,            // ShopTransferAmount（例: 267円）
               currency:           "jpy",
               destination:        storeAccountId,            // 店舗のStripeアカウント
               source_transaction: chargeIdForTransfer,       // このチャージと紐付け
@@ -1317,7 +1331,7 @@ router.get("/checkout/verify", async (req, res) => {
             console.log(
               `✅ Transfer成功: ${transferAmount}JPY → ${storeAccountId} ` +
               `(transfer_id=${transfer.id}, charge=${chargeIdForTransfer}) | ` +
-              `platformNet≈${piMetadata["platformRevenue"]}JPY (25%保証)`
+              `platformNet≈${piMetadata["platformRevenue"]}JPY (20%保証)`
             );
           }
         } catch (transferErr: any) {
@@ -1395,7 +1409,7 @@ router.get("/checkout/verify", async (req, res) => {
           if (existingOwner.length === 0) {
             await db.insert(notificationsTable).values({ userId: ownerId, type: "bag_sold", title: ownerTitle, body: ownerBody, storeId: reservationFull.storeId ?? undefined });
           }
-          await sendPushToUser(ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${reservationId}`, url: "/store/orders" });
+          if (await storeOrderPushEnabled(ownerId)) await sendPushToUser(ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${reservationId}`, url: "/store/orders" });
           if (existingOwner.length === 0) {
           await sendOrderEmailToStoreOwnerById({
             ownerId,
@@ -1448,6 +1462,10 @@ router.get("/checkout/verify", async (req, res) => {
       merchandiseAmount: reservationFull.merchandiseAmount,
       pickupStart: reservationFull.pickupStart,
       pickupEnd: reservationFull.pickupEnd,
+      pickupStart2: reservationFull.pickupStart2,
+      pickupEnd2: reservationFull.pickupEnd2,
+      pickupNextDay: reservationFull.pickupNextDay,
+      bagCreatedAt: reservationFull.bagCreatedAt,
     });
   } catch (err) {
     console.error("Verify error:", err);

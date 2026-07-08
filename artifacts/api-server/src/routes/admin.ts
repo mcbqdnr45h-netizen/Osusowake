@@ -19,6 +19,11 @@ import {
 import { Resend } from "resend";
 import crypto from "node:crypto";
 import { rateLimit } from "express-rate-limit";
+import { bagVisibleSql } from "../lib/bag-visibility.js";
+import { sendPushToUsers } from "../lib/push.js";
+import { buildGrowthData, buildDailyChecklistAI, buildSalesForecast, type AppStoreMetrics } from "../lib/growth.js";
+import { getNotificationReach } from "../lib/daily-engagement.js";
+import OpenAI from "openai";
 
 const router: IRouter = Router();
 
@@ -391,6 +396,344 @@ router.get("/admin/metrics", requireAdmin, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  GROWTH GOD MODE — 成長の神モード
+//  「集客はできてる。転換が壊れてる」を毎日ドライブするための経営コックピット。
+//  単なる数字の羅列ではなく、今日打つべきアクション（死に店の掘り起こし /
+//  ホットリードへの再エンゲージ / 供給の脈拍）を炙り出すことに全振りする。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 「購入した」の定義 = 支払い成立し受取確定/完了した予約（キャンセル除外）。
+const BOUGHT_STATUSES = sql`('confirmed','picked_up')`;
+
+// ── ホットリード再エンゲージの共有ヘルパー ──
+// 指定セグメントのユーザーに in-app 通知 + 実Push(web/APNs) を撃つ。撃った人数を返す。
+// admin 版 (/admin/growth/reengage) と board 版 (/board/reengage) の両方から使う。
+async function runReengage(
+  segment: string,
+  title: string,
+  body: string,
+  url: string,
+): Promise<number> {
+  const idsRes = segment === "fav_no_purchase"
+    ? await db.execute(sql`
+        SELECT DISTINCT f.user_id AS user_id FROM favorites f
+        WHERE NOT EXISTS (
+          SELECT 1 FROM reservations r
+          WHERE r.user_id = f.user_id AND r.status IN ${BOUGHT_STATUSES})`)
+    : await db.execute(sql`
+        SELECT u.id::text AS user_id FROM public.users u
+        WHERE u.created_at > now() - interval '7 days'
+          AND NOT EXISTS (
+            SELECT 1 FROM reservations r
+            WHERE r.user_id = u.id::text AND r.status IN ${BOUGHT_STATUSES})`);
+
+  const userIds = idsRes.rows.map((r: any) => r.user_id).filter(Boolean) as string[];
+  if (userIds.length === 0) return 0;
+
+  // in-app 通知を残す（Push が届かない端末でもアプリ内で見える）
+  await db.insert(notificationsTable).values(
+    userIds.map((userId) => ({
+      userId,
+      type: "reengage" as const,
+      title: title.trim(),
+      body: body?.trim() || null,
+      read: false,
+    })),
+  );
+
+  // 実 Push（web + APNs）を送信
+  await sendPushToUsers(userIds, {
+    title: title.trim(),
+    body: body?.trim() || "",
+    tag: `reengage-${segment}`,
+    url: (typeof url === "string" && url.trim()) || "/",
+  });
+
+  return userIds.length;
+}
+
+const REENGAGE_SEGMENTS = ["fav_no_purchase", "registered_no_purchase_7d"];
+
+// ── GET /admin/growth ──
+// 成長コックピットのデータ一式（共有ライブラリ buildGrowthData で構築）。
+router.get("/admin/growth", requireAdmin, async (_req, res) => {
+  try {
+    const data = await buildGrowthData();
+    res.json({ ok: true, ...data });
+  } catch (err: any) {
+    console.error("[admin/growth]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── POST /admin/growth/reengage ──
+// ホットリードのセグメントを狙って再エンゲージ Push を撃つ（+ in-app 通知も残す）。
+router.post("/admin/growth/reengage", requireAdmin, async (req: any, res) => {
+  const { segment, title, body, url } = req.body ?? {};
+  if (!REENGAGE_SEGMENTS.includes(segment)) {
+    res.status(400).json({ error: "bad_request", message: "unknown segment" }); return;
+  }
+  if (!title?.trim()) {
+    res.status(400).json({ error: "bad_request", message: "title is required" }); return;
+  }
+  try {
+    const targeted = await runReengage(segment, title, body, url);
+    res.json({ ok: true, segment, targeted, note: targeted === 0 ? "対象ユーザーが0でした" : undefined });
+  } catch (err: any) {
+    console.error("[admin/growth/reengage]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SHARED BOARD — 俺らだけの成長ボード（神モードとは別アクセス）
+//  管理者権限(requireAdmin)ではなく「合言葉コード」で入れる。危険な管理操作は
+//  一切できず、成長データ閲覧 + ホットリードPush + 今日のチェックリスト消化だけ。
+//  コードは Fly secret BOARD_ACCESS_CODE。timingSafeEqual で比較。
+// ═══════════════════════════════════════════════════════════════════════════
+
+function checkBoardCode(req: Request): boolean {
+  const expected = process.env.BOARD_ACCESS_CODE || "";
+  if (!expected) return false;
+  const given =
+    (req.headers["x-board-code"] as string) ||
+    (req.body && typeof req.body === "object" ? (req.body as any).code : "") ||
+    "";
+  if (typeof given !== "string" || given.length === 0) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  try {
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+function requireBoardCode(req: Request, res: Response, next: NextFunction) {
+  if (!checkBoardCode(req)) {
+    res.status(401).json({ error: "unauthorized", message: "invalid board code" }); return;
+  }
+  next();
+}
+
+// App Store Connect の数字は自動取得できないので app_settings に手動保存した値を読む。
+async function getAppStoreMetrics(): Promise<AppStoreMetrics> {
+  const r = await db.execute(sql`
+    SELECT key, value FROM app_settings
+    WHERE key IN ('growth_appstore_downloads','growth_appstore_impressions','growth_appstore_updated')`);
+  const m: Record<string, string> = {};
+  for (const row of r.rows as any[]) m[row.key] = row.value;
+  return {
+    downloads: Number(m["growth_appstore_downloads"] ?? 0) || 0,
+    impressions: Number(m["growth_appstore_impressions"] ?? 0) || 0,
+    updatedAt: m["growth_appstore_updated"] ?? null,
+  };
+}
+
+// 今日消化したチェックリスト項目の状態を app_settings に保存する（board_checklist_YYYY-MM-DD）。
+async function getBoardCheckState(isoDate: string): Promise<Record<string, boolean>> {
+  const key = `board_checklist_${isoDate}`;
+  const r = await db.execute(sql`SELECT value FROM app_settings WHERE key = ${key}`);
+  if (r.rows.length === 0) return {};
+  try {
+    return JSON.parse((r.rows[0] as any).value) || {};
+  } catch {
+    return {};
+  }
+}
+
+// その日のAIチェックリストを app_settings に1日キャッシュする（board_checklist_items_YYYY-MM-DD）。
+//   ★ 1日1回だけ生成する理由:
+//     (1) 生成は数秒かかる → 毎回のboard表示で待たせない。
+//     (2) AIは生成の度に item.id が変わる → 毎回作り直すと checkState(id管理のチェック) が全部外れる。
+//   よって「その日 初回生成分」を凍結して同じ日は再利用する。 翌日(JST)は自動で新規生成。
+async function getOrBuildDailyChecklist(
+  isoDate: string,
+  growth: Awaited<ReturnType<typeof buildGrowthData>>,
+  appstore: AppStoreMetrics,
+  sales: Awaited<ReturnType<typeof buildSalesForecast>>,
+): Promise<{ items: any[]; source: "ai" | "template" }> {
+  const key = `board_checklist_items_${isoDate}`;
+  const r = await db.execute(sql`SELECT value FROM app_settings WHERE key = ${key}`);
+  if (r.rows.length > 0) {
+    try {
+      const cached = JSON.parse((r.rows[0] as any).value);
+      if (cached && Array.isArray(cached.items) && cached.items.length > 0) return cached;
+    } catch { /* 壊れてたら作り直す */ }
+  }
+  const built = await buildDailyChecklistAI(growth, appstore, sales);
+  // AI成功時のみ凍結保存（テンプレ・フォールバックはキャッシュせず、次回AI生成を再挑戦させる）。
+  if (built.source === "ai") {
+    await db.execute(sql`
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES (${key}, ${JSON.stringify(built)}, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`).catch(() => {});
+  }
+  return built;
+}
+
+// ── POST /board/data ──
+// 成長データ + App Store 数字 + 今日のチェックリスト + 消化状態を一括返却。
+router.post("/board/data", requireBoardCode, async (_req, res) => {
+  try {
+    const [growth, appstore, reach, sales] = await Promise.all([buildGrowthData(), getAppStoreMetrics(), getNotificationReach(), buildSalesForecast()]);
+    const jst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    // ★ その日のデータをAIが分析して組む動的チェックリスト(毎日中身が変わる)。 1日キャッシュ。 失敗時は固定テンプレにフォールバック。
+    const { items: checklist, source: checklistSource } = await getOrBuildDailyChecklist(jst, growth, appstore, sales);
+    const checkState = await getBoardCheckState(jst);
+    res.json({ ok: true, growth, appstore, reach, sales, checklist, checklistSource, checkState, today: jst });
+  } catch (err: any) {
+    console.error("[board/data]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── POST /board/chat ──
+// board の「何でも聞けるAI」。 従業員も見るので危険な操作(Push配信/DB書込)は一切させない。
+//   その日の成長データ・販売実績を丸ごとコンテキストに渡して、経営の相談相手にする。
+//   ※ Push を撃つ等の"実行"は神モード(/admin)だけ。 ここは読み取り+助言のみ。
+// 本番Flyには OPENAI_API_KEY が設定済み。 ローカル開発は AI_INTEGRATIONS_* を使う。
+//   ★ 以前は AI_INTEGRATIONS_* しか見ておらず本番で "dummy" に落ちて 401 になっていた。
+const boardOpenai = new OpenAI({
+  baseURL: process.env.OPENAI_BASE_URL || process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || undefined,
+  apiKey: process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY || "dummy",
+});
+
+// board データをAIが読める簡潔なテキストに要約する（トークン節約）。
+function summarizeBoardContext(growth: any, appstore: AppStoreMetrics, reach: any, sales: any): string {
+  const f = growth?.funnel ?? {};
+  const sup = growth?.supply ?? {};
+  const s = sales ?? {};
+  const t = s.today ?? {};
+  const fc = s.forecast ?? {};
+  const lines: string[] = [];
+  lines.push(`【全体ファネル(累計)】`);
+  lines.push(`- 登録ユーザー:${f.registered ?? "?"} / お気に入り登録者:${f.favorited ?? "?"} / 購入者:${f.buyers ?? "?"} / リピーター:${f.repeatBuyers ?? "?"}`);
+  lines.push(`- 直近7日新規:${f.newUsers7d ?? "?"} / 30日新規:${f.newUsers30d ?? "?"} / 登録→購入率:${f.rates?.registerToBuy ?? "?"}%`);
+  lines.push(`- 累計GMV:¥${growth?.gmvTotal ?? "?"} / レビュー:${growth?.reviews?.count ?? 0}件(平均★${growth?.reviews?.avgRating ?? "?"})`);
+  lines.push(`【供給】承認稼働店:${sup.approvedActiveStores ?? "?"} / 今ライブの店:${sup.storesWithLiveBags ?? "?"} / ライブ在庫:${sup.liveStockUnits ?? "?"}個`);
+  lines.push(`【ホットリード】お気に入り済未購入:${growth?.hotLeads?.favNoPurchase ?? 0}人 / 登録7日以内未購入:${growth?.hotLeads?.registered7dNoPurchase ?? 0}人`);
+  lines.push(`【App Store】DL:${appstore?.downloads ?? 0} / インプレ:${appstore?.impressions ?? 0}`);
+  lines.push(`【次回デイリー通知の実リーチ】会員:${reach?.members ?? 0} + 匿名iOS:${reach?.anonIos ?? 0} + 匿名Web:${reach?.anonWeb ?? 0} = 計${reach?.total ?? 0}`);
+  lines.push(`【今日の販売実績】出品${t.listedBags ?? 0}袋/在庫${t.listedUnits ?? 0}個/売れた${t.soldUnits ?? 0}個/完売${t.soldOutBags ?? 0}袋/売上¥${t.revenue ?? 0}/販売率${t.sellThrough ?? 0}%`);
+  lines.push(`【販売予測(直近${fc.sampleDays ?? 0}日)】平均販売率${fc.avgSellThrough ?? 0}% / 好調カテゴリ:${fc.bestCategory ?? "—"} / 不調カテゴリ:${fc.worstCategory ?? "—"}`);
+  if (fc.note) lines.push(`- 所見:${fc.note}`);
+  if (Array.isArray(s.categoryPerformance) && s.categoryPerformance.length) {
+    lines.push(`【カテゴリ別(売れた/出品)】` + s.categoryPerformance.map((c: any) => `${c.category}:${c.soldUnits}/${c.listedUnits}(${c.sellThrough}%)`).join(" / "));
+  }
+  if (Array.isArray(s.storePerformance) && s.storePerformance.length) {
+    lines.push(`【店別 上位】` + s.storePerformance.slice(0, 8).map((st: any) => `${st.name}:${st.soldUnits}/${st.listedUnits}個`).join(" / "));
+  }
+  if (Array.isArray(growth?.deadStores) && growth.deadStores.length) {
+    lines.push(`【叩き起こすべき店(承認済みやのに動いてない)】` + growth.deadStores.slice(0, 8).map((d: any) => d.name).join("、"));
+  }
+  return lines.join("\n");
+}
+
+const BOARD_AI_SYSTEM = `あなたは「おすそわけ」(=Too Good To Go の日本版フードロス削減アプリ)の経営参謀AIです。
+飲食店が閉店前の余剰食品を「サプライズバッグ」として安価に販売し、ユーザーが予約・決済します(店舗手数料20%/ユーザー5%)。
+このボードは創業者マロと従業員が見ます。以下の「今日の実データ」だけを根拠に、関西弁のカジュアルな口調で、具体的で実行可能な助言をしてください。
+数字を聞かれたら実データから正確に答え、推測する時は「推測やけど」と明示すること。データに無いことは正直に「そのデータは今ここに無いわ」と言うこと。データを捏造しない。
+回答は簡潔に(長くても400字程度)。`;
+
+router.post("/board/chat", requireBoardCode, async (req: any, res) => {
+  const { message, history, images } = req.body ?? {};
+  const text = typeof message === "string" ? message.trim() : "";
+  // 画像だけ(テキスト無し)でも投げられるようにする。 どちらも無い時だけ弾く。
+  const imgList: string[] = Array.isArray(images)
+    ? images.filter((s: any) => typeof s === "string" && s.startsWith("data:image/")).slice(0, 4)
+    : [];
+  if (!text && imgList.length === 0) {
+    res.status(400).json({ error: "bad_request", message: "message or image is required" }); return;
+  }
+  try {
+    const [growth, appstore, reach, sales] = await Promise.all([
+      buildGrowthData(), getAppStoreMetrics(), getNotificationReach(), buildSalesForecast(),
+    ]);
+    const context = summarizeBoardContext(growth, appstore, reach, sales);
+
+    // 直近数往復だけ渡す(暴走・トークン肥大防止)。 role/content(文字列)以外は捨てる。
+    const priorTurns = (Array.isArray(history) ? history : [])
+      .filter((h: any) => h && (h.role === "user" || h.role === "assistant") && typeof h.content === "string")
+      .slice(-6)
+      .map((h: any) => ({ role: h.role as "user" | "assistant", content: String(h.content).slice(0, 2000) }));
+
+    // 画像がある時はマルチモーダル content 配列で組む(classify.ts と同じ image_url 方式)。
+    const userContent: any = imgList.length > 0
+      ? [
+          ...imgList.map((url) => ({ type: "image_url", image_url: { url, detail: "auto" } })),
+          { type: "text", text: (text || "この画像について、おすそわけの経営視点でコメントして。").slice(0, 2000) },
+        ]
+      : text.slice(0, 2000);
+
+    const completion = await boardOpenai.chat.completions.create({
+      model: "gpt-5-mini",
+      max_completion_tokens: 2000,
+      messages: [
+        { role: "system", content: BOARD_AI_SYSTEM },
+        { role: "system", content: `＝＝＝ 今日の実データ ＝＝＝\n${context}` },
+        ...priorTurns,
+        { role: "user", content: userContent },
+      ],
+    });
+    const reply = completion.choices[0]?.message?.content?.trim() || "うまく答えられへんかった。もう一回聞いて。";
+    res.json({ ok: true, reply });
+  } catch (err: any) {
+    console.error("[board/chat]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── POST /board/check ──
+// チェックリスト項目の完了状態をトグルして今日分に永続化。
+router.post("/board/check", requireBoardCode, async (req: any, res) => {
+  const { itemId, done } = req.body ?? {};
+  if (typeof itemId !== "string" || !itemId) {
+    res.status(400).json({ error: "bad_request", message: "itemId required" }); return;
+  }
+  try {
+    const jst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    const key = `board_checklist_${jst}`;
+    const state = await getBoardCheckState(jst);
+    state[itemId] = !!done;
+    await db.execute(sql`
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES (${key}, ${JSON.stringify(state)}, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`);
+    res.json({ ok: true, checkState: state });
+  } catch (err: any) {
+    console.error("[board/check]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── POST /board/appstore ──
+// App Store Connect の DL / インプレッション数を手動更新。
+router.post("/board/appstore", requireBoardCode, async (req: any, res) => {
+  const { downloads, impressions } = req.body ?? {};
+  try {
+    const jst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    const pairs: [string, string][] = [];
+    if (downloads != null && !Number.isNaN(Number(downloads)))
+      pairs.push(["growth_appstore_downloads", String(Math.round(Number(downloads)))]);
+    if (impressions != null && !Number.isNaN(Number(impressions)))
+      pairs.push(["growth_appstore_impressions", String(Math.round(Number(impressions)))]);
+    pairs.push(["growth_appstore_updated", jst]);
+    for (const [key, value] of pairs) {
+      await db.execute(sql`
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES (${key}, ${value}, NOW())
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`);
+    }
+    res.json({ ok: true, appstore: await getAppStoreMetrics() });
+  } catch (err: any) {
+    console.error("[board/appstore]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
 // ── GET /admin/license-issues ─────────────────────────────────────────────────
 // 営業許可証 silent fail / 未提出だが approved な店舗の一覧
 router.get("/admin/license-issues", requireAdmin, async (_req, res) => {
@@ -539,6 +882,191 @@ router.get("/admin/stores", requireAdmin, async (_req, res) => {
     res.json(stores.rows);
   } catch (err: any) {
     console.error("[admin/stores]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── GET /admin/recurring-monitor ──────────────────────────────────────────────
+// 神モード: 全店の全定期出品テンプレを、今日の状態(公開予定/出品中/完売/取消/休み/未公開アラート)
+// 付きで返す監視専用エンドポイント。 アクションボタンは無し(まず見るだけ)。
+//   状態判定は recurring-publisher.ts / recurring.ts と同じ JST ロジックを踏襲。
+//   - live(🟢出品中): is_active かつ 客に表示中のバッグがあり在庫あり
+//   - soldout(🔴完売): 今日公開したが在庫0 / 持ち越しモードで完売して停止中
+//   - pending(🔵公開予定): 今日が公開曜日・未公開・公開時刻前
+//   - alert(⚠️未公開): 今日が公開曜日・公開時刻を過ぎたのに未公開(=公開漏れ疑い)
+//   - withdrawn(⚫取消/停止): テンプレ自体が is_active=false(店が停止)。 updated_at で停止時刻が分かる
+//   - off(🟡休み): 今日は公開曜日でない or skip_dates で休みに指定
+//   - ended(🏁本日終了): 今日公開済みだが受取窓を過ぎて表示終了
+router.get("/admin/recurring-monitor", requireAdmin, async (_req, res) => {
+  try {
+    // 各テンプレの集計(在庫/予約)を recurring_listing_id 単位で先に GROUP BY してから JOIN。
+    //   ★ bagVisibleSql は surprise_bags を非エイリアスで参照するため、サブクエリの FROM も
+    //     必ず非エイリアス `surprise_bags` にする(エイリアスを付けると列参照が壊れる)。
+    const rows = (await db.execute(sql`
+      SELECT
+        r.id, r.store_id, r.title, r.publish_time, r.days_of_week, r.pickup_next_day,
+        r.is_active, r.carry_over_stock, r.skip_dates, r.last_published_date,
+        r.stock_count, r.discounted_price, r.original_price,
+        r.pickup_start, r.pickup_end, r.pickup_start_2, r.pickup_end_2,
+        to_char(r.updated_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo','MM/DD HH24:MI') AS updated_jst,
+        to_char(r.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo','YYYY/MM/DD')    AS created_jst,
+        s.name AS store_name, s.status AS store_status, s.owner_id,
+        COALESCE(live.live_stock, 0)::int  AS live_stock,
+        COALESCE(live.live_bags, 0)::int   AS live_bags,
+        today.today_stock::int             AS today_stock,
+        latest.latest_stock::int           AS latest_stock,
+        COALESCE(resv.reserved_qty, 0)::int AS reserved_qty,
+        COALESCE(resv.paid_qty, 0)::int     AS paid_qty
+      FROM recurring_listings r
+      JOIN stores s ON s.id = r.store_id
+      LEFT JOIN (
+        SELECT recurring_listing_id AS rid, SUM(stock_count)::int AS live_stock, COUNT(*)::int AS live_bags
+        FROM surprise_bags
+        WHERE recurring_listing_id IS NOT NULL AND is_active = true AND ${bagVisibleSql}
+        GROUP BY recurring_listing_id
+      ) live ON live.rid = r.id
+      LEFT JOIN (
+        SELECT recurring_listing_id AS rid, SUM(stock_count)::int AS today_stock
+        FROM surprise_bags
+        WHERE recurring_listing_id IS NOT NULL
+          AND DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo') = DATE(now() AT TIME ZONE 'Asia/Tokyo')
+        GROUP BY recurring_listing_id
+      ) today ON today.rid = r.id
+      LEFT JOIN (
+        SELECT DISTINCT ON (recurring_listing_id) recurring_listing_id AS rid, stock_count AS latest_stock
+        FROM surprise_bags
+        WHERE recurring_listing_id IS NOT NULL
+        ORDER BY recurring_listing_id, created_at DESC
+      ) latest ON latest.rid = r.id
+      LEFT JOIN (
+        SELECT surprise_bags.recurring_listing_id AS rid,
+          SUM(res.quantity)::int AS reserved_qty,
+          COALESCE(SUM(res.quantity) FILTER (WHERE res.payment_status = 'paid'), 0)::int AS paid_qty
+        FROM reservations res
+        JOIN surprise_bags ON surprise_bags.id = res.bag_id
+        WHERE surprise_bags.recurring_listing_id IS NOT NULL
+          AND surprise_bags.is_active = true AND ${bagVisibleSql}
+          AND res.status IN ('pending','confirmed')
+        GROUP BY surprise_bags.recurring_listing_id
+      ) resv ON resv.rid = r.id
+      ORDER BY r.publish_time, r.id
+    `)).rows as Array<Record<string, any>>;
+
+    // ── JST 現在時刻 ──
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hour12: false, weekday: "short",
+    }).formatToParts(new Date());
+    const gp = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    let hh = gp("hour"); if (hh === "24") hh = "00";
+    const today = `${gp("year")}-${gp("month")}-${gp("day")}`;
+    const nowTime = `${hh}:${gp("minute")}`;
+    const dowMap: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    const dow = dowMap[gp("weekday")] ?? 0;
+    const addDaysStr = (dateStr: string, n: number) => {
+      const [y, m, d] = dateStr.split("-").map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d)); dt.setUTCDate(dt.getUTCDate() + n);
+      const mm = String(dt.getUTCMonth() + 1).padStart(2, "0"); const dd = String(dt.getUTCDate()).padStart(2, "0");
+      return { date: `${dt.getUTCFullYear()}-${mm}-${dd}`, dow: dt.getUTCDay() };
+    };
+
+    const listings = rows.map((r) => {
+      const daysOfWeek = Number(r.days_of_week);
+      const pickupNextDay = !!r.pickup_next_day;
+      const carryOver = !!r.carry_over_stock;
+      const isActive = !!r.is_active;
+      const skips = new Set(
+        String(r.skip_dates ?? "").split(",").map((s) => s.trim()).filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
+      );
+      // 今日この回が serve する受取日(前日出品なら翌日)。 曜日・休み判定はこの受取日ベース。
+      const pickupDow = pickupNextDay ? (dow + 1) % 7 : dow;
+      const scheduledToday = (daysOfWeek & (1 << pickupDow)) !== 0;
+      const pickupDate = pickupNextDay ? addDaysStr(today, 1).date : today;
+      const skippedToday = skips.has(pickupDate);
+      const publishedToday = r.last_published_date === today;
+      const pastPublishTime = nowTime >= String(r.publish_time);
+
+      const liveStock = Number(r.live_stock ?? 0);
+      const hasLive = Number(r.live_bags ?? 0) > 0 && liveStock > 0;
+      const todayStock = r.today_stock == null ? null : Number(r.today_stock);
+      const latestStock = r.latest_stock == null ? null : Number(r.latest_stock);
+
+      // 次回自動公開 JST 日付(休み/曜日/公開済みを考慮、31日先まで探索)。
+      const nextPublishDate = (() => {
+        for (let i = 0; i < 31; i++) {
+          const cur = i === 0 ? { date: today, dow } : addDaysStr(today, i);
+          const pdow = pickupNextDay ? (cur.dow + 1) % 7 : cur.dow;
+          if ((daysOfWeek & (1 << pdow)) === 0) continue;
+          const pd = pickupNextDay ? addDaysStr(cur.date, 1).date : cur.date;
+          if (skips.has(pd)) continue;
+          if (i === 0) { if (!publishedToday && nowTime < String(r.publish_time)) return cur.date; continue; }
+          return cur.date;
+        }
+        return null;
+      })();
+
+      // ── 状態判定(優先順) ──
+      let status:
+        | "withdrawn" | "live" | "soldout" | "alert" | "pending" | "off" | "ended";
+      if (!isActive) status = "withdrawn";
+      else if (hasLive) status = "live";
+      else if (carryOver && latestStock != null && latestStock <= 0) status = "soldout";
+      else if (publishedToday && todayStock != null && todayStock <= 0) status = "soldout";
+      else if (!scheduledToday || skippedToday) status = "off";
+      else if (!publishedToday) status = pastPublishTime ? "alert" : "pending";
+      else status = "ended"; // 今日公開済みだが表示窓を過ぎた
+
+      return {
+        id: Number(r.id),
+        storeId: Number(r.store_id),
+        storeName: r.store_name as string,
+        storeStatus: r.store_status as string,
+        title: r.title as string,
+        status,
+        publishTime: r.publish_time as string,
+        daysOfWeek,
+        pickupNextDay,
+        carryOverStock: carryOver,
+        isActive,
+        pickupStart: r.pickup_start as string | null,
+        pickupEnd: r.pickup_end as string | null,
+        pickupStart2: r.pickup_start_2 as string | null,
+        pickupEnd2: r.pickup_end_2 as string | null,
+        discountedPrice: Number(r.discounted_price),
+        originalPrice: Number(r.original_price),
+        stockCount: Number(r.stock_count),
+        liveStock,
+        liveBags: Number(r.live_bags ?? 0),
+        todayStock,
+        latestStock,
+        reservedQty: Number(r.reserved_qty ?? 0),
+        paidQty: Number(r.paid_qty ?? 0),
+        lastPublishedDate: r.last_published_date as string | null,
+        publishedToday,
+        scheduledToday,
+        skippedToday,
+        nextPublishDate,
+        updatedJst: r.updated_jst as string,
+        createdJst: r.created_jst as string,
+      };
+    });
+
+    const summary = {
+      total: listings.length,
+      live: listings.filter((l) => l.status === "live").length,
+      pending: listings.filter((l) => l.status === "pending").length,
+      soldout: listings.filter((l) => l.status === "soldout").length,
+      alert: listings.filter((l) => l.status === "alert").length,
+      withdrawn: listings.filter((l) => l.status === "withdrawn").length,
+      off: listings.filter((l) => l.status === "off").length,
+      ended: listings.filter((l) => l.status === "ended").length,
+      liveStock: listings.reduce((a, l) => a + l.liveStock, 0),
+      reservedQty: listings.reduce((a, l) => a + l.reservedQty, 0),
+    };
+
+    res.json({ today, nowTime, summary, listings });
+  } catch (err: any) {
+    console.error("[admin/recurring-monitor]", err);
     res.status(500).json({ error: "internal_error", message: err?.message });
   }
 });
@@ -1448,6 +1976,34 @@ router.post("/web-push/subscribe", async (req, res) => {
       INSERT INTO web_push_subscriptions (user_id, endpoint, p256dh, auth)
       VALUES (${user.id}, ${endpoint}, ${p256dh}, ${auth})
       ON CONFLICT (endpoint) DO UPDATE SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth
+    `);
+    // ★ この endpoint が匿名テーブルに残っていたら削除(会員へ昇格・二重送信防止)
+    await db.execute(sql`DELETE FROM anonymous_web_push_subscriptions WHERE endpoint = ${endpoint}`);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── POST /web-push/anon-subscribe (public) ──────────────────────────────────────
+//   会員登録前(ログイン前)の Web Push 購読。 認証不要。
+//   既に会員登録済みの endpoint はスキップして二重送信を防ぐ。
+router.post("/web-push/anon-subscribe", async (req, res) => {
+  const { endpoint, p256dh, auth } = req.body ?? {};
+  if (!endpoint || !p256dh || !auth) {
+    res.status(400).json({ error: "endpoint, p256dh, auth は必須です" }); return;
+  }
+  try {
+    const known = await db.execute(
+      sql`SELECT 1 FROM web_push_subscriptions WHERE endpoint = ${endpoint} LIMIT 1`,
+    );
+    if ((known.rows?.length ?? 0) > 0) {
+      res.json({ ok: true, skipped: "already_registered_to_user" }); return;
+    }
+    await db.execute(sql`
+      INSERT INTO anonymous_web_push_subscriptions (endpoint, p256dh, auth, updated_at)
+      VALUES (${endpoint}, ${p256dh}, ${auth}, NOW())
+      ON CONFLICT (endpoint) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth, updated_at = NOW()
     `);
     res.json({ ok: true });
   } catch (err: any) {

@@ -29,6 +29,10 @@ function setGpsStatus(s: GpsStatus) {
   statusListeners.forEach(fn => fn(s));
 }
 
+export function getCachedCoords(): UserCoords | null {
+  return cachedCoords;
+}
+
 export function updateCachedCoords(coords: UserCoords | null) {
   cachedCoords = coords;
   if (coords) {
@@ -187,7 +191,10 @@ export function formatWalkTime(minutes: number): string {
 export function formatDistanceLabel(meters: number): string {
   const minutes = metersToWalkMinutes(meters);
   if (minutes < 1)   return 'すぐそこ';
-  if (minutes <= 60) return `徒歩${minutes}分`;
-  if (meters < 1000) return `${Math.round(meters)}m`;
+  // ★ 「徒歩◯分」は本当に歩ける範囲(〜15分・約1km)だけ表示する。
+  //   以前は60分(約4km)まで徒歩表記していたが、「徒歩30分/60分」は
+  //   非現実的で「遠い=面倒」という心理的マイナスになり予約を下げる。
+  //   それ以上は徒歩時間を出さず、中立な距離(km)だけを淡々と示す。
+  if (minutes <= 15) return `徒歩${minutes}分`;
   return `${(meters / 1000).toFixed(1)}km`;
 }

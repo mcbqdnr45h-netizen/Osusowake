@@ -11,6 +11,17 @@ import { useMyStore } from '@/hooks/use-my-store';
 import { useMyStoresContext } from '@/contexts/MyStoresContext';
 import { useAuth } from '@/contexts/AuthContext';
 import { NotificationsBell } from '@/components/NotificationsBell';
+import { loadGoogleMapsScript } from '@/lib/maps-loader';
+import { prewarmMap } from '@/lib/map-prewarm';
+
+// ★ 地図タブの「意図プリフェッチ」: 指が触れた/ホバーした瞬間に Google Maps
+//   スクリプト + タイルを先読みする。 タップ→遷移→mount の間 (~100-300ms) を
+//   稼ぎ、 Home の idle prewarm が未完了でも即オープンできるようにする。
+//   loadGoogleMapsScript / prewarmMap は共に多重呼び出し安全 (内部でガード済み)。
+function prefetchMapAssets(): void {
+  loadGoogleMapsScript().catch(() => { /* noop */ });
+  prewarmMap();
+}
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -494,6 +505,8 @@ export function Layout({ children, showBottomNav = true, hideFooter = false, hid
                 <Link
                   key={item.href}
                   href={item.href}
+                  onPointerEnter={item.href === '/map' ? prefetchMapAssets : undefined}
+                  onTouchStart={item.href === '/map' ? prefetchMapAssets : undefined}
                   className="relative flex flex-col items-center justify-center flex-1 gap-1 min-w-0 py-2 transition-opacity duration-100 active:opacity-60"
                 >
                   <div className={`relative flex items-center justify-center w-12 h-8 rounded-full transition-all duration-200

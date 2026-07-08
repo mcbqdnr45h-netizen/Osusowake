@@ -126,8 +126,6 @@ function useLocalSettings(userId: string) {
     notifNewListing: true,
     notifFavoriteUpdate: true,
     notifNewOrder: true,
-    notifPickup: true,
-    notifAdmin: true,
   };
   const saved = raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
   function save(patch: Partial<typeof defaults>) {
@@ -220,8 +218,6 @@ export default function Settings() {
   const [notifNewListing, setNotifNewListing] = useState(saved.notifNewListing);
   const [notifFavoriteUpdate, setNotifFavoriteUpdate] = useState(saved.notifFavoriteUpdate);
   const [notifNewOrder, setNotifNewOrder] = useState(saved.notifNewOrder);
-  const [notifPickup, setNotifPickup] = useState(saved.notifPickup);
-  const [notifAdmin, setNotifAdmin] = useState(saved.notifAdmin);
 
   // ── デイリー通知 ON/OFF はサーバー永続化 ──────────────────────────
   const [notifDailyEngagement, setNotifDailyEngagement] = useState(true);
@@ -287,6 +283,144 @@ export default function Settings() {
       if (!res.ok) throw new Error('save_failed');
     } catch {
       setNotifEmailOrders(!val);
+      toast({ title: '設定の保存に失敗しました', variant: 'destructive' });
+    }
+  }
+
+  // ── お気に入り外の新規出品(全体配信) ON/OFF (サーバー永続化) ────────────────
+  //    以前は localStorage のみで実際の配信は止まっていなかった。 サーバーに永続化して
+  //    new-listing-broadcast の宛先から実際に除外されるようにする。
+  useEffect(() => {
+    if (!user || isStoreOwner) return;
+    const base = ((import.meta as any).env?.VITE_API_BASE as string)
+      || ((import.meta.env.BASE_URL as string) || '').replace(/\/$/, '');
+    import('@/lib/authed-fetch').then(({ authedFetch }) =>
+      authedFetch(`${base}/api/user/new-listing-preference`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d && typeof d.notifNewListing === 'boolean') setNotifNewListing(d.notifNewListing); })
+        .catch(() => {})
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  async function handleNotifNewListingToggle(val: boolean) {
+    setNotifNewListing(val); // 楽観的更新
+    try {
+      const { authedFetch } = await import('@/lib/authed-fetch');
+      const base = ((import.meta as any).env?.VITE_API_BASE as string)
+        || ((import.meta.env.BASE_URL as string) || '').replace(/\/$/, '');
+      const res = await authedFetch(`${base}/api/user/new-listing-preference`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notifNewListing: val }),
+      });
+      if (!res.ok) throw new Error('save_failed');
+    } catch {
+      setNotifNewListing(!val); // ロールバック
+      toast({ title: '設定の保存に失敗しました', variant: 'destructive' });
+    }
+  }
+
+  // ── お気に入り店舗の更新(新規出品)プッシュ ON/OFF (サーバー永続化) ─────────────
+  //    以前は localStorage のみで、OFF にしてもお気に入り店の新規出品プッシュは届き続けていた。
+  //    サーバーに永続化し、bags.ts / recurring-publisher.ts の配信対象から実際に除外する。
+  useEffect(() => {
+    if (!user || isStoreOwner) return;
+    const base = ((import.meta as any).env?.VITE_API_BASE as string)
+      || ((import.meta.env.BASE_URL as string) || '').replace(/\/$/, '');
+    import('@/lib/authed-fetch').then(({ authedFetch }) =>
+      authedFetch(`${base}/api/user/favorite-update-preference`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d && typeof d.notifFavoriteUpdate === 'boolean') setNotifFavoriteUpdate(d.notifFavoriteUpdate); })
+        .catch(() => {})
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  async function handleNotifFavoriteUpdateToggle(val: boolean) {
+    setNotifFavoriteUpdate(val); // 楽観的更新
+    save({ notifFavoriteUpdate: val }); // localStorage にも保持
+    try {
+      const { authedFetch } = await import('@/lib/authed-fetch');
+      const base = ((import.meta as any).env?.VITE_API_BASE as string)
+        || ((import.meta.env.BASE_URL as string) || '').replace(/\/$/, '');
+      const res = await authedFetch(`${base}/api/user/favorite-update-preference`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notifFavoriteUpdate: val }),
+      });
+      if (!res.ok) throw new Error('save_failed');
+    } catch {
+      setNotifFavoriteUpdate(!val); // ロールバック
+      save({ notifFavoriteUpdate: !val });
+      toast({ title: '設定の保存に失敗しました', variant: 'destructive' });
+    }
+  }
+
+  // ── 店舗オーナー: 未出品リマインド ON/OFF (サーバー永続化) ─────────────────────
+  //    「今日まだ出品してませんよ」の毎日リマインドをオーナー単位でオフにできる。
+  const [notifUnlistedReminder, setNotifUnlistedReminder] = useState(true);
+  useEffect(() => {
+    if (!user || !isStoreOwner) return;
+    const base = ((import.meta as any).env?.VITE_API_BASE as string)
+      || ((import.meta.env.BASE_URL as string) || '').replace(/\/$/, '');
+    import('@/lib/authed-fetch').then(({ authedFetch }) =>
+      authedFetch(`${base}/api/user/unlisted-reminder-preference`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d && typeof d.notifUnlistedReminder === 'boolean') setNotifUnlistedReminder(d.notifUnlistedReminder); })
+        .catch(() => {})
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, isStoreOwner]);
+
+  async function handleNotifUnlistedReminderToggle(val: boolean) {
+    setNotifUnlistedReminder(val);
+    try {
+      const { authedFetch } = await import('@/lib/authed-fetch');
+      const base = ((import.meta as any).env?.VITE_API_BASE as string)
+        || ((import.meta.env.BASE_URL as string) || '').replace(/\/$/, '');
+      const res = await authedFetch(`${base}/api/user/unlisted-reminder-preference`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notifUnlistedReminder: val }),
+      });
+      if (!res.ok) throw new Error('save_failed');
+    } catch {
+      setNotifUnlistedReminder(!val);
+      toast({ title: '設定の保存に失敗しました', variant: 'destructive' });
+    }
+  }
+
+  // ── 店舗オーナー: 新規注文の通知 ON/OFF (サーバー永続化 / 実効化) ─────────────────
+  //    お客様が購入した直後の bag_sold プッシュをオーナー単位でオフにできる。
+  //    サーバー側 storeOrderPushEnabled() が notif_new_order を見て配信を止める(ベルは残る)。
+  useEffect(() => {
+    if (!user || !isStoreOwner) return;
+    const base = ((import.meta as any).env?.VITE_API_BASE as string)
+      || ((import.meta.env.BASE_URL as string) || '').replace(/\/$/, '');
+    import('@/lib/authed-fetch').then(({ authedFetch }) =>
+      authedFetch(`${base}/api/user/new-order-preference`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d && typeof d.notifNewOrder === 'boolean') setNotifNewOrder(d.notifNewOrder); })
+        .catch(() => {})
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, isStoreOwner]);
+
+  async function handleNotifNewOrderToggle(val: boolean) {
+    setNotifNewOrder(val);
+    try {
+      const { authedFetch } = await import('@/lib/authed-fetch');
+      const base = ((import.meta as any).env?.VITE_API_BASE as string)
+        || ((import.meta.env.BASE_URL as string) || '').replace(/\/$/, '');
+      const res = await authedFetch(`${base}/api/user/new-order-preference`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notifNewOrder: val }),
+      });
+      if (!res.ok) throw new Error('save_failed');
+    } catch {
+      setNotifNewOrder(!val);
       toast({ title: '設定の保存に失敗しました', variant: 'destructive' });
     }
   }
@@ -436,16 +570,6 @@ export default function Settings() {
       setSavingName(false);
     }
   }
-
-  function handleToggle(key: 'notifNewListing' | 'notifFavoriteUpdate' | 'notifNewOrder' | 'notifPickup' | 'notifAdmin', val: boolean) {
-    if (key === 'notifNewListing')     setNotifNewListing(val);
-    if (key === 'notifFavoriteUpdate') setNotifFavoriteUpdate(val);
-    if (key === 'notifNewOrder')       setNotifNewOrder(val);
-    if (key === 'notifPickup')         setNotifPickup(val);
-    if (key === 'notifAdmin')          setNotifAdmin(val);
-    save({ [key]: val });
-  }
-
 
   async function handleLogout() {
     await authSignOut();
@@ -687,29 +811,7 @@ export default function Settings() {
                     <p className="font-bold text-sm text-foreground">新規注文の通知</p>
                     <p className="text-xs text-muted-foreground">お客様が購入した直後に通知</p>
                   </div>
-                  <Toggle value={notifNewOrder} onChange={v => handleToggle('notifNewOrder', v)} />
-                </div>
-
-                <div className="flex items-center gap-3.5 px-4 min-h-[56px] border-b border-border/60">
-                  <div className="w-9 h-9 rounded-xl bg-blue-100 flex items-center justify-center shrink-0">
-                    <Bell className="w-4 h-4 text-blue-500" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-bold text-sm text-foreground">受取完了の通知</p>
-                    <p className="text-xs text-muted-foreground">商品の受け渡しが完了したとき</p>
-                  </div>
-                  <Toggle value={notifPickup} onChange={v => handleToggle('notifPickup', v)} />
-                </div>
-
-                <div className="flex items-center gap-3.5 px-4 min-h-[56px]">
-                  <div className="w-9 h-9 rounded-xl bg-purple-100 flex items-center justify-center shrink-0">
-                    <Bell className="w-4 h-4 text-purple-600" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-bold text-sm text-foreground">審査・重要なお知らせ</p>
-                    <p className="text-xs text-muted-foreground">審査結果・Stripe関連の重要通知</p>
-                  </div>
-                  <Toggle value={notifAdmin} onChange={v => handleToggle('notifAdmin', v)} />
+                  <Toggle value={notifNewOrder} onChange={handleNotifNewOrderToggle} />
                 </div>
 
                 {/* ── 注文メール通知 (デフォルト OFF・ ON にした店舗のみ受信) ── */}
@@ -723,6 +825,18 @@ export default function Settings() {
                   </div>
                   <Toggle value={notifEmailOrders} onChange={handleNotifEmailOrdersToggle} />
                 </div>
+
+                {/* ── 未出品リマインド (今日まだ出品してない時に届く毎日のお知らせ) ── */}
+                <div className="flex items-center gap-3.5 px-4 min-h-[56px] border-t border-border/60">
+                  <div className="w-9 h-9 rounded-xl bg-orange-100 flex items-center justify-center shrink-0">
+                    <Bell className="w-4 h-4 text-orange-500" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-bold text-sm text-foreground">未出品リマインド</p>
+                    <p className="text-xs text-muted-foreground">その日まだ出品がないとき、出品をおすすめする通知が届きます</p>
+                  </div>
+                  <Toggle value={notifUnlistedReminder} onChange={handleNotifUnlistedReminderToggle} />
+                </div>
               </>
             ) : (
               <>
@@ -731,10 +845,10 @@ export default function Settings() {
                     <Bell className="w-4 h-4 text-blue-500" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <p className="font-bold text-sm text-foreground">近隣店舗の新規出品</p>
-                    <p className="text-xs text-muted-foreground">周辺に新しいバッグが出たとき</p>
+                    <p className="font-bold text-sm text-foreground">新しいおすそわけのお知らせ</p>
+                    <p className="text-xs text-muted-foreground">新しいバッグが出たとき（1日最大5件・夜間を除く）</p>
                   </div>
-                  <Toggle value={notifNewListing} onChange={v => handleToggle('notifNewListing', v)} />
+                  <Toggle value={notifNewListing} onChange={handleNotifNewListingToggle} />
                 </div>
 
                 <div className="flex items-center gap-3.5 px-4 min-h-[56px] border-b border-border/60">
@@ -745,7 +859,7 @@ export default function Settings() {
                     <p className="font-bold text-sm text-foreground">お気に入り店舗の更新</p>
                     <p className="text-xs text-muted-foreground">フォロー中の店舗が出品したとき</p>
                   </div>
-                  <Toggle value={notifFavoriteUpdate} onChange={v => handleToggle('notifFavoriteUpdate', v)} />
+                  <Toggle value={notifFavoriteUpdate} onChange={handleNotifFavoriteUpdateToggle} />
                 </div>
 
                 <div className="flex items-center gap-3.5 px-4 min-h-[56px]">
@@ -754,7 +868,7 @@ export default function Settings() {
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="font-bold text-sm text-foreground">毎日のおすそわけ情報</p>
-                    <p className="text-xs text-muted-foreground">朝9時・夕方5時に出品情報をお届け</p>
+                    <p className="text-xs text-muted-foreground">昼前と夕方、出品があるときにお届け</p>
                   </div>
                   <Toggle value={notifDailyEngagement} onChange={handleNotifDailyEngagementToggle} />
                 </div>

@@ -23,6 +23,14 @@ function formatPostedAt(dateStr: string): string {
   }
 }
 
+// ★ お客様が実際に支払う金額 (販売価格にシステム利用料5%を上乗せし10円単位で切り上げ)。
+//   reservations.ts / StoreDashboard の buyerTotalJpy と完全同一ロジック。
+//   切り上げ理由: 四捨五入だと低額帯で買い手合計 < 販売価格 になる逆転を防ぐため。
+function buyerTotalJpy(merchandiseJpy: number): number {
+  if (!Number.isFinite(merchandiseJpy) || merchandiseJpy <= 0) return 0;
+  return Math.ceil((merchandiseJpy * 1.05) / 10) * 10;
+}
+
 // ─── 型 ──────────────────────────────────────────────────────────────────────
 export interface Bag {
   id: number;
@@ -37,6 +45,11 @@ export interface Bag {
   createdAt: string;
   itemType?: string | null;
   hiddenFromQuickPublish?: boolean;
+  description?: string | null;
+  allergyInfo?: string | null;
+  pickupNote?: string | null;
+  imageUrl?: string | null;
+  category?: string | null;
 }
 
 export function getItemTypeLabel(itemType?: string | null): { label: string; emoji: string; cls: string } {
@@ -129,6 +142,11 @@ interface Props {
   onStockAdjust: (bag: Bag, delta: number) => void;
   onConfirmChange: (id: number | null) => void;
   onEdit: (bag: Bag) => void;
+  // ★ 過去履歴画面(StoreBagsPage)では onEdit が「受取時間編集」専用のため、
+  //   汎用「編集」項目を出すと『編集/受取時間を編集して公開/時間編集ボタン』が
+  //   すべて同じ画面に飛ぶ重複になる。 その場合は汎用「編集」を隠す。
+  //   ダッシュボード(StoreDashboard)は onEdit がフル編集なので既定(false)のまま表示。
+  hideEditItem?: boolean;
 }
 
 // ─── コンポーネント ───────────────────────────────────────────────────────────
@@ -139,6 +157,7 @@ interface Props {
 export function BagManageCard({
   bag, togglingId, deletingId, adjustingId, confirmId,
   onToggle, onDelete, onStockAdjust, onConfirmChange, onEdit,
+  hideEditItem = false,
 }: Props) {
   const now       = new Date();
   const status    = getBagStatus(bag, now);
@@ -199,6 +218,13 @@ export function BagManageCard({
                 ¥{bag.discountedPrice.toLocaleString()}
               </span>
             </div>
+            {/* ★ お客様が実際に支払う金額 (システム利用料5%込み)。 店の販売価格と客の支払額の食い違いを解消。 */}
+            {bag.discountedPrice > 0 && (
+              <p className="text-[11px] text-muted-foreground mt-0.5">
+                お客様お支払い <span className="font-bold text-foreground/80">¥{buyerTotalJpy(bag.discountedPrice).toLocaleString()}</span>
+                <span className="text-muted-foreground/60">（利用料5%込み）</span>
+              </p>
+            )}
             {/* 受取時間 */}
             {(bag.pickupStart || bag.pickupEnd) && (
               <p className="text-xs text-muted-foreground flex items-center gap-1 mt-1">
@@ -270,13 +296,18 @@ export function BagManageCard({
                       公開トグルも実質無効。 削除だけ残してメニューをシンプル化。 */}
                 {!isExpired && status !== 'soldout' && (
                   <>
-                    <DropdownMenuItem
-                      onSelect={(e) => { e.preventDefault(); onEdit(bag); }}
-                      className="text-sm font-bold cursor-pointer"
-                    >
-                      <Pencil className="w-4 h-4 mr-2" />
-                      編集
-                    </DropdownMenuItem>
+                    {/* ★ hideEditItem=true (過去履歴画面) では汎用「編集」を出さない。
+                          そこでの onEdit は時間編集専用で、下の「受取時間を編集して公開」
+                          および右側「時間編集」ボタンと完全重複するため。 */}
+                    {!hideEditItem && (
+                      <DropdownMenuItem
+                        onSelect={(e) => { e.preventDefault(); onEdit(bag); }}
+                        className="text-sm font-bold cursor-pointer"
+                      >
+                        <Pencil className="w-4 h-4 mr-2" />
+                        編集
+                      </DropdownMenuItem>
+                    )}
 
                     {/* ★ 公開/非公開 切替 (受取時間を過ぎている非公開バッグは編集導線に切替) */}
                     {wouldExpireIfActivated ? (

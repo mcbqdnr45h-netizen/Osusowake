@@ -4,8 +4,9 @@ import { storesTable, notificationsTable, surpriseBagsTable, reservationsTable, 
 import { eq, sql, and, ne } from "drizzle-orm";
 import { Resend } from "resend";
 import { sendStoreApprovalEmail, sendOrderEmailToStoreOwnerById } from "../utils/emails";
-import { sendPushToUser } from "../lib/push.js";
+import { sendPushToUser, storeOrderPushEnabled } from "../lib/push.js";
 import { getAllAdminUsers } from "../lib/admin.js";
+import { invalidate } from "../lib/ttl-cache.js";
 
 const router = Router();
 
@@ -585,6 +586,9 @@ router.post("/stripe-webhook", async (req: Request, res: Response) => {
       // ★ result.kind === "paid"
       const row = { id: reservationId, storeId: result.storeId, pickupCode: result.pickupCode };
 
+      // ★ 在庫が減った → 一覧キャッシュを破棄（confirm/verify を踏まず webhook だけで確定した場合の在庫表示ズレを防ぐ）。
+      invalidate("bags:list"); invalidate("stores:list");
+
       // 旧 cart_reservation テーブル（互換）— 残っていれば確定
       await db
         .update(cartReservationsTable)
@@ -605,10 +609,13 @@ router.post("/stripe-webhook", async (req: Request, res: Response) => {
         const [[store], [bag], [reservation]] = await Promise.all([
           db.select({ ownerId: storesTable.ownerId, name: storesTable.name })
             .from(storesTable).where(eq(storesTable.id, row.storeId)).limit(1),
+          // ★ 予約から辿ってそのバッグを取る（reservations → surprise_bags の内部結合）。
+          //   旧実装は from=surprise_bags に定数条件の leftJoin を掛ける読みにくい形だった。
+          //   確実に「この予約のバッグ」だけを返す明快な形に統一。
           db.select({ id: surpriseBagsTable.id, title: surpriseBagsTable.title, pickupStart: surpriseBagsTable.pickupStart, pickupEnd: surpriseBagsTable.pickupEnd })
-            .from(surpriseBagsTable)
-            .leftJoin(reservationsTable, eq(reservationsTable.id, row.id))
-            .where(eq(surpriseBagsTable.id, reservationsTable.bagId)).limit(1),
+            .from(reservationsTable)
+            .innerJoin(surpriseBagsTable, eq(surpriseBagsTable.id, reservationsTable.bagId))
+            .where(eq(reservationsTable.id, row.id)).limit(1),
           db.select({
               userId: reservationsTable.userId,
               quantity: reservationsTable.quantity,
@@ -633,7 +640,9 @@ router.post("/stripe-webhook", async (req: Request, res: Response) => {
           if (existingOwner.length === 0) {
             await db.insert(notificationsTable).values({ userId: store.ownerId, type: "bag_sold", title: ownerTitle, body: ownerBody, storeId: row.storeId });
           }
-          await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${row.id}`, url: "/store/orders" });
+          if (await storeOrderPushEnabled(store.ownerId)) {
+            await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${row.id}`, url: "/store/orders" });
+          }
           // Web Push 補完: ブラウザのみ利用中・通知拒否中のオーナーに必ず届くようメール併用。
           //   ★ confirm/verify/webhook の三重発火で重複送信しないよう DB通知と同じ冪等ガード内で送る。
           if (existingOwner.length === 0) {

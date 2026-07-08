@@ -86,6 +86,7 @@ const TokushoPage        = React.lazy(() => import("./pages/TokushoPage"));
 const MyTownPage         = React.lazy(() => import("./pages/MyTownPage"));
 const RankingPage        = React.lazy(() => import("./pages/RankingPage"));
 const SalesLeadForm      = React.lazy(() => import("./pages/SalesLeadForm"));
+const BoardPage          = React.lazy(() => import("./pages/BoardPage"));
 const ResetPassword      = React.lazy(() => import("./pages/ResetPassword"));
 const AuthCallback       = React.lazy(() => import("./pages/AuthCallback"));
 const FlyerUser          = React.lazy(() => import("./pages/FlyerUser"));
@@ -364,6 +365,9 @@ function AnimatedRoutes() {
 
               {/* ── 公開 店舗詳細 ── */}
               <Route path="/stores/:id" component={StoreDetailPublic} />
+
+              {/* ── 俺らだけの成長ボード（合言葉コードで入る共有ビュー）── */}
+              <Route path="/board" component={BoardPage} />
 
               {/* ── 管理者 ── */}
               <Route path="/admin" component={AdminDashboard} />

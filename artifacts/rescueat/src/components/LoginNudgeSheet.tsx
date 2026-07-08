@@ -1,4 +1,5 @@
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, LogIn, UserPlus, ShoppingBag, Zap, Shield, Sparkles, Heart, Bell } from 'lucide-react';
 import { useLocation } from 'wouter';
@@ -59,7 +60,11 @@ export function LoginNudgeSheet({ isOpen, onClose, reason = 'general' }: LoginNu
     navigate('/signup');
   };
 
-  return (
+  // ★ Portal で body 直下に出す。BagCard は Home の motion.div(transform 持ち)配下にあり、
+  //   transform 祖先があると position:fixed がビューポートではなく祖先基準になって
+  //   シートがページ内に流し込まれレイアウトが崩れる(完売カルーセルで発覚)。
+  //   body へ逃がすことで必ず全画面オーバーレイになる(既存のソートメニューと同じ手法)。
+  return createPortal(
     <AnimatePresence>
       {isOpen && (
         <motion.div
@@ -144,6 +149,7 @@ export function LoginNudgeSheet({ isOpen, onClose, reason = 'general' }: LoginNu
           </motion.div>
         </motion.div>
       )}
-    </AnimatePresence>
+    </AnimatePresence>,
+    document.body,
   );
 }

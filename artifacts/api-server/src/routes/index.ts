@@ -70,13 +70,13 @@ router.post("/auth/forgot-password", async (req, res) => {
     if (genErr || !data?.properties?.action_link) {
       const reason = genErr?.message ?? "no action_link";
       console.warn("[forgot-password] generateLink failed for:", email.trim(), "reason:", reason);
-      // 「ユーザーが存在しない」は明示的に伝える（silently ok はユーザーが「届かない」と誤解する）
+      // ★ セキュリティ修正 (2026-07-08): メールアドレス列挙 (email enumeration) 対策。
+      //   「ユーザーが存在しない」を明示すると、攻撃者が任意のアドレスを叩いて
+      //   「登録済みかどうか」を判定できてしまう (会員リストの割り出し)。よって
+      //   存在しないアカウントでも「送信しました」と同じ 200 を返し、区別させない。
       const isNotFound = /not.?found|does.?not.?exist|user.+not/i.test(reason);
       if (isNotFound) {
-        res.status(404).json({
-          error:   "user_not_found",
-          message: "このメールアドレスで登録されたアカウントは見つかりませんでした。新規登録するか、別のアドレスをお試しください。",
-        });
+        res.json({ ok: true });
         return;
       }
       // それ以外（Supabase 一時障害等）は 500 を返す
