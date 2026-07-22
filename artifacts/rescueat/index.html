@@ -161,6 +161,41 @@
     </script>
     <script type="module" src="/src/main.tsx"></script>
     <script>
+      // ★ 起動失敗の最終保険 (React マウント前の白画面対策):
+      //   デプロイ直後に旧 index.html がキャッシュから返ると、参照するエントリチャンク
+      //   (/assets/*.js) が 404 になり main.tsx が読めず React が一切マウントされない = 白画面。
+      //   ErrorBoundary は React 内部なのでこの段階では効かない。
+      //   → チャンク読込失敗 or 一定時間 #root が空 なら、キャッシュバスト付きで最新
+      //     index.html を強制取得する (セッション1回だけ = 無限ループ防止)。
+      (function () {
+        var KEY = '__bootReloaded';
+        function bustReload() {
+          try {
+            if (sessionStorage.getItem(KEY)) return;
+            sessionStorage.setItem(KEY, '1');
+          } catch (e) {}
+          try {
+            var u = new URL(window.location.href);
+            u.searchParams.set('_cb', String(Date.now()));
+            window.location.replace(u.toString());
+          } catch (e) { window.location.reload(); }
+        }
+        // (a) スクリプト/スタイルの読込失敗 (チャンク 404) を捕捉 (capture フェーズ)
+        window.addEventListener('error', function (e) {
+          var t = e && e.target;
+          if (t && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) {
+            var src = t.src || t.href || '';
+            if (src.indexOf('/assets/') !== -1) bustReload();
+          }
+        }, true);
+        // (b) 10 秒経っても React がマウントしなければ (エントリ読込失敗の可能性) リロード
+        setTimeout(function () {
+          var root = document.getElementById('root');
+          if (root && !root.firstElementChild) bustReload();
+        }, 10000);
+      })();
+    </script>
+    <script>
       // SW is only registered in production (not Replit dev proxy)
       if ('serviceWorker' in navigator && location.hostname !== 'localhost' && !location.hostname.includes('replit')) {
         window.addEventListener('load', () => {

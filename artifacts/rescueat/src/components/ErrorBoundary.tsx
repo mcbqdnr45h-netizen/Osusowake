@@ -43,7 +43,17 @@ export class ErrorBoundary extends React.Component<Props, State> {
       const RELOAD_KEY = isStaleChunk ? '__staleChunkReloaded' : '__errorReloaded';
       if (!sessionStorage.getItem(RELOAD_KEY)) {
         sessionStorage.setItem(RELOAD_KEY, '1');
-        window.location.reload();
+        if (isStaleChunk) {
+          // ★ ステイルチャンクはキャッシュバスト付きで最新 index.html を強制取得する。
+          //   Instagram/iOS の in-app WebView は plain reload だと旧 index.html を
+          //   キャッシュから返し、削除済みチャンクを 404 で引いて白画面のままになる。
+          //   クエリを変えると必ずネットワークから取り直す。
+          const url = new URL(window.location.href);
+          url.searchParams.set('_cb', String(Date.now()));
+          window.location.replace(url.toString());
+        } else {
+          window.location.reload();
+        }
         return;
       }
     } catch { /* sessionStorage 不可環境は次の自己リセットへフォールバック */ }

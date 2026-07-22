@@ -5,6 +5,7 @@ import { eq, and, ne, sql, like } from "drizzle-orm";
 import { releaseExpiredCartReservations } from "./reservations";
 import { sendPushToUsers, filterFavoriteUpdateOptIn } from "../lib/push.js";
 import { broadcastNewListing } from "../lib/new-listing-broadcast.js";
+import { computeUserTotal } from "../lib/pricing.js";
 import { requireAuth, requireStoreOwner } from "../middlewares/auth.js";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { getReviewDemoOwnerIds, isReviewDemoOwner } from "../lib/app-review.js";
@@ -518,7 +519,9 @@ router.post("/stores/:storeId/bags", requireAuth, requireStoreOwner, async (req,
         .from(favoritesTable)
         .where(eq(favoritesTable.storeId, storeId));
 
-      const priceLabel = `¥${Number(body.discountedPrice).toLocaleString()}`;
+      // ★ 通知の価格は「お客様が実際に支払う額」= 商品代金 + 5%利用料(10円切上) にする。
+      //   生の discountedPrice(店舗設定の商品代金)を出すと決済画面の金額とズレるため computeUserTotal を使う。
+      const priceLabel = `¥${computeUserTotal(Number(body.discountedPrice)).toLocaleString()}`;
 
       if (fanRows.length > 0 && store) {
         const notifTitle = `🛍️ ${store.name} が新しいおすそわけを出品`;

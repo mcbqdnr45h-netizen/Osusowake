@@ -640,10 +640,13 @@ router.post("/stripe-webhook", async (req: Request, res: Response) => {
           if (existingOwner.length === 0) {
             await db.insert(notificationsTable).values({ userId: store.ownerId, type: "bag_sold", title: ownerTitle, body: ownerBody, storeId: row.storeId });
           }
+          let ownerPushSent = 0;
           if (await storeOrderPushEnabled(store.ownerId)) {
-            await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${row.id}`, url: "/store/orders" });
+            ownerPushSent = await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${row.id}`, url: "/store/orders" });
           }
           // Web Push 補完: ブラウザのみ利用中・通知拒否中のオーナーに必ず届くようメール併用。
+          //   ★ push が1台も届かなかった場合 (ownerPushSent===0) は opt-out を無視して必ず送る
+          //     =注文の取りこぼし(オーバーブッキング)防止。届いた場合は opt-in 店のみメール。
           //   ★ confirm/verify/webhook の三重発火で重複送信しないよう DB通知と同じ冪等ガード内で送る。
           if (existingOwner.length === 0) {
             await sendOrderEmailToStoreOwnerById({
@@ -656,6 +659,7 @@ router.post("/stripe-webhook", async (req: Request, res: Response) => {
               pickupEnd:   bag?.pickupEnd ?? null,
               totalPrice:  reservation?.totalPrice ?? null,
               orderId:     row.id,
+              pushDelivered: ownerPushSent > 0,
             });
           }
         }

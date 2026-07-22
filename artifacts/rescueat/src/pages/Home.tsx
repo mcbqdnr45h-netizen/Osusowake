@@ -461,8 +461,23 @@ export default function Home() {
     return arr;
   }, [sortKey]);
 
+  // ── 特定商品の「並び下げ」(マロ指示) ──────────────────────────────────────
+  //   松村製麺所の「煮卵丼」は、出品カードが多い一覧では一番下へ沈める。
+  //   店名・商品名の部分一致で判定し、相対順序を保つ安定パーティション
+  //   （通常商品 → 対象商品 の順）で末尾へ寄せる。対象0件なら元配列をそのまま返す。
+  //   ★ 解除/変更したい時は下の DEMOTED_ITEMS を編集するだけ。
+  const demoteToBottom = useCallback((arr: SurpriseBagWithStore[]) => {
+    const DEMOTED_ITEMS = [{ store: '松村製麺所', title: '煮卵丼' }];
+    const isDemoted = (b: SurpriseBagWithStore) =>
+      DEMOTED_ITEMS.some(d =>
+        (b.store?.name ?? '').includes(d.store) && (b.title ?? '').includes(d.title));
+    const demoted = arr.filter(isDemoted);
+    if (demoted.length === 0) return arr;
+    return [...arr.filter(b => !isDemoted(b)), ...demoted];
+  }, []);
+
   // ソート済みベース（セクション・全体グリッド共通で使う）
-  const sortedVisibleBags = useMemo(() => applySortKey(visibleBags), [visibleBags, applySortKey]);
+  const sortedVisibleBags = useMemo(() => demoteToBottom(applySortKey(visibleBags)), [visibleBags, applySortKey, demoteToBottom]);
 
   // 日次シードは1日中固定（ページリフレッシュしても同じ順番）
   const dailySeed = useMemo(() => getDailySeed(), []);
@@ -558,8 +573,8 @@ export default function Home() {
     if (halfOff)  result = result.filter(b => getDisplayDiscountPercent(b.originalPrice, b.discountedPrice) >= 50);
     if (under500) result = result.filter(b => getDisplayPrice(b.discountedPrice) <= 500);
     if (urgent30) result = result.filter(b => isUrgent30(b));
-    return applySortKey(result);
-  }, [visibleBags, searchQuery, activeCategory, halfOff, under500, urgent30, applySortKey, isUrgent30]);
+    return demoteToBottom(applySortKey(result));
+  }, [visibleBags, searchQuery, activeCategory, halfOff, under500, urgent30, applySortKey, isUrgent30, demoteToBottom]);
 
   // 「明日受け取り」(翌日公開・pickup_next_day)のバッグ判定。
   //   今日向けの各セクション(今夜/朝/半額/近く/カテゴリ/新着)からは除外し、

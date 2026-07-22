@@ -162,9 +162,12 @@ if (STATIC_DIR && fs.existsSync(STATIC_DIR)) {
       maxAge: "1y",
       etag: true,
       setHeaders: (res, filePath) => {
-        // index.html だけは常に最新を取らせる (SPA エントリ)
+        // index.html だけは絶対キャッシュさせない (SPA エントリ)。
+        // ★ no-cache/must-revalidate だと Instagram/iOS の in-app WebView が
+        //   revalidate を無視して旧 index.html を掴み続け、削除済みチャンクハッシュを
+        //   404 で引いて白画面になる。no-store で毎回必ず最新エントリを取らせる。
         if (filePath.endsWith("index.html")) {
-          res.setHeader("Cache-Control", "no-cache, must-revalidate");
+          res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
         }
       },
     })
@@ -175,7 +178,11 @@ if (STATIC_DIR && fs.existsSync(STATIC_DIR)) {
   app.use(createCrawlerSeoMiddleware(indexPath));
 
   // 2) SPA フォールバック: /api/* 以外の GET は全部 index.html を返す
+  //   ★ res.sendFile は上の express.static の setHeaders を通らない (別ミドルウェア)。
+  //     SPA の実エントリはこの catch-all なので、ここで明示的に no-store を付けないと
+  //     旧 index.html がキャッシュされ、削除済みチャンク 404 → 白画面になる。
   app.get(/^\/(?!api\/).*/, (_req, res, next) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
     res.sendFile(indexPath, (err) => {
       if (err) next(err);
     });

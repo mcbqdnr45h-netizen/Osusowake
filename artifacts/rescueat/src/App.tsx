@@ -119,7 +119,13 @@ const GuardedStoreDashboard  = Protected(StoreDashboard, 'store_owner');
 const GuardedStoreOwnerDash  = Protected(StoreOwnerDashboard, 'store_owner');
 const GuardedStoreBags       = Protected(StoreBagsPage, 'store_owner');
 const GuardedStoreSales      = Protected(StoreSalesPage, 'store_owner');
-const GuardedStoreOnboarding = Protected(StoreOnboarding, 'store_owner');
+// ★ 店舗オンボーディングは「これから店舗オーナーになる」ページなので role を要求しない。
+//   role='customer' の既存ユーザー (先に一般登録した人) も到達できるようにする。
+//   ここで 'store_owner' を要求すると、 customer が /store-onboarding に来たとき
+//   ProtectedRoute が空描画 (return null) → 白画面になる二重登録衝突の元凶だった。
+//   StoreOnboarding 自身が setOptimisticRole('store_owner') で UI ロールを合わせ、
+//   /stores/apply 送信で正式に店舗オーナー化する。
+const GuardedStoreOnboarding = Protected(StoreOnboarding);
 const GuardedStripeBankSetup = Protected(StripeBankSetup, 'store_owner');
 const GuardedStripeKYCPage   = Protected(StripeKYCPage, 'store_owner');
 const GuardedStoreProfileEdit = Protected(StoreProfileEdit, 'store_owner');

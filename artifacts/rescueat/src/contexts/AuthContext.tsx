@@ -28,6 +28,12 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+// ★ 既存メールで新規登録 (店舗/一般) しようとしたときの共通コード。
+//   Supabase は列挙防止のため「identities が空の obfuscated user」を error なしで返すため、
+//   これを検出してこのコードを返す。 SignUp 側はこの値を見て「ログインして店舗登録」導線を
+//   出す (customer 既存 → 店舗登録が /store-onboarding で白画面になる二重登録衝突の根本対策)。
+export const EMAIL_ALREADY_REGISTERED = 'email_already_registered';
+
 // タイムアウト付きPromise競走（PromiseLike にも対応）
 function raceTimeout<T>(p: PromiseLike<T>, ms: number): Promise<T | null> {
   return Promise.race([
@@ -108,6 +114,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // ★ initAuth 完走まで onAuthStateChange の fetchProfile を抑止する
   //    (adminCheck → fetchProfile の順序を全経路で保証 → adminUserMode role 上書きのレース回避)
   const initInProgressRef = useRef(true);
+  // ★ init 実行中に手動ログイン (signIn) が成功したら true にする。
+  //   initAuth の getSession が (遅延して) 古い null を返しても、 確立済みの
+  //   user/session を上書きして消さないためのガード (「ログイン直後にログアウト」 防止)。
+  const manualAuthRef = useRef(false);
 
   // MFA 検証済みか sessionStorage で確認（同一タブのページ更新では再要求しない）
   function isMfaVerifiedInSession(): boolean {
@@ -262,8 +272,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (cancelled) return;
 
         const sess = sessionResult?.data?.session ?? null;
-        setSession(sess);
-        setUser(sess?.user ?? null);
+        // ★ init 実行中にユーザーが手動ログイン (signIn) を完了していた場合、
+        //   getSession が古い null を返しても user を上書きして消さない
+        //   (「ログイン直後に一瞬でログアウトされる」 レースの防止)。 signIn が権威。
+        if (!sess && manualAuthRef.current) {
+          // 何もしない (finally で initInProgress / isLoading は解除される)
+        } else {
+          setSession(sess);
+          setUser(sess?.user ?? null);
+        }
         if (sess?.user) {
           // パスワードリセット中は管理者チェックをスキップ
           // 判定条件:
@@ -338,22 +355,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           return;
         }
 
-        setSession(session);
-        setUser(session?.user ?? null);
+        // ★ 明示的な SIGNED_OUT のみを「ログアウト」として扱い user/profile を破棄する。
+        //   【なぜ】 supabase-js はトークン処理中に稀に session=null のイベントを
+        //   SIGNED_IN の前後に stray 発火することがある。 従来は「session が無い=ログアウト」と
+        //   単純判定して user を null にしていたため、 ログイン成功→ダッシュボード遷移の直後に
+        //   この stray null イベントが届くと user=null → ProtectedRoute が !user で /welcome へ
+        //   弾き、 「店舗ログインでたまに一回目だけログアウトされる」 症状になっていた。
+        //   → SIGNED_OUT 以外の null セッションイベントでは既存の認証状態を一切壊さない。
+        if (event === 'SIGNED_OUT') {
+          // ★ 自動サインアウト (トークン失効・リモート無効化等) でもフラグを必ず消す。
+          //    残存すると次の別ユーザがこのタブで顧客ログインした時に
+          //    fetchProfile が role を store_owner にクランプするバグになる。
+          try { sessionStorage.removeItem(PENDING_STORE_OWNER_KEY); } catch (_) {}
+          setSession(null);
+          setUser(null);
+          setProfile(null);
+          writeCachedProfile(null); // ★ ログアウト時はキャッシュも消す
+          return;
+        }
+
         if (session?.user) {
+          setSession(session);
+          setUser(session.user);
           // ★ initAuth 進行中はスキップ (adminCheck 前に fetchProfile が走るレース回避)
           //   initAuth 側で adminCheck → fetchProfile が必ず実行されるので二重取得不要
           if (!fetchingRef.current && !initInProgressRef.current) {
             fetchProfile(session.user.id);
           }
-        } else {
-          // ★ 自動サインアウト (トークン失効・リモート無効化等) でもフラグを必ず消す。
-          //    残存すると次の別ユーザがこのタブで顧客ログインした時に
-          //    fetchProfile が role を store_owner にクランプするバグになる。
-          try { sessionStorage.removeItem(PENDING_STORE_OWNER_KEY); } catch (_) {}
-          setProfile(null);
-          writeCachedProfile(null); // ★ ログアウト時はキャッシュも消す
         }
+        // ★ session=null かつ SIGNED_OUT 以外のイベント (transient / 順序前後) は
+        //   何もしない = 直前に確立した認証状態を誤って破棄しない。
       },
     );
 
@@ -460,7 +491,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const { data, error } = await supabase.auth.signUp({ email, password });
 
     if (error) {
+      if (error.message.includes('User already registered')) {
+        return { error: EMAIL_ALREADY_REGISTERED, needsConfirmation: false };
+      }
       return { error: translateError(error.message), needsConfirmation: false };
+    }
+
+    // ★ 既存メール検出 (identities 空 = 列挙防止応答)。 二重登録衝突を防ぐ。
+    if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+      return { error: EMAIL_ALREADY_REGISTERED, needsConfirmation: false };
     }
 
     if (data.user) {
@@ -513,11 +552,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
 
     if (error) {
-      // 「既に登録済み」の場合は店舗タブでのログインを促す
+      // 「既に登録済み」(メール確認 OFF 時) → ログインして店舗登録する導線へ
       if (error.message.includes('User already registered')) {
-        return { error: 'このメールアドレスは既に登録されています。「飲食店・パートナー」タブからログインしてください。', needsConfirmation: false };
+        return { error: EMAIL_ALREADY_REGISTERED, needsConfirmation: false };
       }
       return { error: translateError(error.message), needsConfirmation: false };
+    }
+
+    // ★ 二重登録衝突の根本対策 (白画面の真因):
+    //   既に customer 等で登録済みのメールで店舗登録すると、 Supabase はメール確認 ON 時に
+    //   列挙防止のため error を返さず「identities が空の obfuscated user」を返す。 これを
+    //   検出せず先へ進むと session 無し → 別経路で /store-onboarding に入り profile.role=customer
+    //   のまま ProtectedRoute が空描画 = 白画面になっていた。 明示的に既存メールとして扱い、
+    //   ログイン → 店舗登録の正規ルートへ誘導する (一般アカウントの退会は不要)。
+    if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+      return { error: EMAIL_ALREADY_REGISTERED, needsConfirmation: false };
     }
 
     if (data.user) {
@@ -591,6 +640,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     //   ケースが発生 (GuestWallRoute がゲスト画面に落ちて、 Apple 審査員からは
     //   「ログインボタンを押しても元のログイン画面に戻る」 ように見える) 。
     //   ここで同期的に user/session を確定させて、 リスナーへの依存を排除する。
+    // ★ init レース対策: これ以降 initAuth の遅延 getSession(null) で user を消させない。
+    manualAuthRef.current = true;
     if (data.session) setSession(data.session);
     if (data.user)    setUser(data.user);
 

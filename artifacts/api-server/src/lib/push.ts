@@ -148,11 +148,12 @@ export interface PushPayload {
   data?: Record<string, unknown>;
 }
 
-async function sendApnsPushToUser(userId: string, payload: PushPayload): Promise<void> {
+async function sendApnsPushToUser(userId: string, payload: PushPayload): Promise<number> {
+  let apnsSent = 0;
   const uShort = userId.slice(0, 8);
   if (!apnsProvider) {
     console.warn(`[push] APNs provider 未初期化 (user ${uShort})`);
-    return;
+    return 0;
   }
 
   const allRegs = await db
@@ -176,7 +177,7 @@ async function sendApnsPushToUser(userId: string, payload: PushPayload): Promise
 
   if (regs.length === 0) {
     console.warn(`[push] user ${uShort} のデバイストークンが DB に無い`);
-    return;
+    return 0;
   }
 
   const notification = new apn.Notification();
@@ -208,7 +209,7 @@ async function sendApnsPushToUser(userId: string, payload: PushPayload): Promise
   }
 
   const prodResult = await trySend(apnsProvider, 'prod', tokens);
-  if (!prodResult) return;
+  if (!prodResult) return 0;
 
   const envMismatchTokens: string[] = [];
   for (const fail of prodResult.failed) {
@@ -238,14 +239,17 @@ async function sendApnsPushToUser(userId: string, payload: PushPayload): Promise
         }
       }
       if (sbResult.sent.length > 0) {
+        apnsSent += sbResult.sent.length;
         console.log(`[push] ✅ sandbox 送信成功: ${sbResult.sent.length} 件`);
       }
     }
   }
 
   if (prodResult.sent.length > 0) {
+    apnsSent += prodResult.sent.length;
     console.log(`[push] ✅ prod 送信成功: ${prodResult.sent.length} 件`);
   }
+  return apnsSent;
 }
 
 /**
@@ -378,15 +382,15 @@ export async function sendApnsPushToRawTokens(
   return { sent: sentCount, deadTokens };
 }
 
-export async function sendWebPushToUser(userId: string, payload: PushPayload): Promise<void> {
-  if (!vapidPublicKey || !vapidPrivateKey) return;
+export async function sendWebPushToUser(userId: string, payload: PushPayload): Promise<number> {
+  if (!vapidPublicKey || !vapidPrivateKey) return 0;
 
   const subs = await db
     .select()
     .from(webPushSubscriptionsTable)
     .where(eq(webPushSubscriptionsTable.userId, userId));
 
-  if (subs.length === 0) return;
+  if (subs.length === 0) return 0;
 
   const notification = JSON.stringify({
     title: payload.title,
@@ -397,6 +401,7 @@ export async function sendWebPushToUser(userId: string, payload: PushPayload): P
     data:  { url: payload.url ?? '/', ...payload.data },
   });
 
+  let webSent = 0;
   await Promise.allSettled(
     subs.map(async (sub) => {
       try {
@@ -404,6 +409,7 @@ export async function sendWebPushToUser(userId: string, payload: PushPayload): P
           { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
           notification,
         );
+        webSent++;
       } catch (err: any) {
         if (err?.statusCode === 410 || err?.statusCode === 404) {
           await db
@@ -417,6 +423,7 @@ export async function sendWebPushToUser(userId: string, payload: PushPayload): P
       }
     }),
   );
+  return webSent;
 }
 
 /**
@@ -489,14 +496,15 @@ function shouldSkipDuplicate(userId: string, tag: string | undefined): boolean {
   return false;
 }
 
-async function sendFcmPushToUser(userId: string, payload: PushPayload): Promise<void> {
-  if (!fcmApp) return;
+async function sendFcmPushToUser(userId: string, payload: PushPayload): Promise<number> {
+  if (!fcmApp) return 0;
   const tokens = await db
     .select({ token: fcmRegistrationsTable.deviceToken, id: fcmRegistrationsTable.id })
     .from(fcmRegistrationsTable)
     .where(eq(fcmRegistrationsTable.userId, userId));
-  if (tokens.length === 0) return;
+  if (tokens.length === 0) return 0;
 
+  let fcmSent = 0;
   await Promise.allSettled(tokens.map(async (row) => {
     try {
       await fcmApp!.messaging().send({
@@ -518,6 +526,7 @@ async function sendFcmPushToUser(userId: string, payload: PushPayload): Promise<
           },
         },
       });
+      fcmSent++;
     } catch (err: any) {
       const code: string = err?.errorInfo?.code ?? err?.code ?? '';
       // 失効トークンは DB から掃除する
@@ -533,15 +542,27 @@ async function sendFcmPushToUser(userId: string, payload: PushPayload): Promise<
       }
     }
   }));
+  return fcmSent;
 }
 
-export async function sendPushToUser(userId: string, payload: PushPayload): Promise<void> {
-  if (shouldSkipDuplicate(userId, payload.tag)) return;
-  await Promise.allSettled([
+/**
+ * ユーザーへ全チャネル(Web Push / APNs / FCM)で push 送信し、
+ * 「実際に1台以上の端末へ配信できた件数」を返す。
+ *   sent === 0 = どの端末にも届かなかった (未購読 / 通知拒否 / 失効) を意味する。
+ *   呼び出し側はこれを見て「メール等のフォールバック」を発火できる。
+ *   ★ dedup で 2回目以降スキップした場合は「既に1回送った」= 届いた扱いで sent=1 を返す
+ *     (同一注文の三重発火でフォールバックメールを重複させないため)。
+ */
+export async function sendPushToUser(userId: string, payload: PushPayload): Promise<number> {
+  if (shouldSkipDuplicate(userId, payload.tag)) return 1;
+  const results = await Promise.allSettled([
     sendWebPushToUser(userId, payload),
     sendApnsPushToUser(userId, payload),
     sendFcmPushToUser(userId, payload),
   ]);
+  let sent = 0;
+  for (const r of results) if (r.status === 'fulfilled') sent += r.value ?? 0;
+  return sent;
 }
 
 export async function sendWebPushToUsers(userIds: string[], payload: PushPayload): Promise<void> {

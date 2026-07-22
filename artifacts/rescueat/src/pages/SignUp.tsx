@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Eye, EyeOff, Mail, Lock, CheckCircle2, X, User, Phone, Store, ShieldCheck,
 } from 'lucide-react';
-import { useAuth } from '@/contexts/AuthContext';
+import { useAuth, EMAIL_ALREADY_REGISTERED } from '@/contexts/AuthContext';
 import { AuthShell, AuthPrimaryButton } from '@/components/AuthShell';
 import { LegalSheet, type LegalDoc } from '@/components/LegalSheet';
 
@@ -28,6 +28,7 @@ export default function SignUp() {
   const [isLoading,       setIsLoading]       = useState(false);
   const [loadingStep,     setLoadingStep]     = useState('');
   const [error,           setError]           = useState('');
+  const [emailExists,     setEmailExists]     = useState(false);
   const [shakeKey,        setShakeKey]        = useState(0);
   const [done,            setDone]            = useState(false);
   const [needsConfirm,    setNeedsConfirm]    = useState(false);
@@ -41,7 +42,7 @@ export default function SignUp() {
   useEffect(() => {
     setName(''); setPhone(''); setEmail('');
     setPassword(''); setConfirmPassword('');
-    setAgreed(false); setError('');
+    setAgreed(false); setError(''); setEmailExists(false);
   }, [activeTab]);
 
   const passwordsMatch  = confirmPassword === '' || password === confirmPassword;
@@ -68,12 +69,20 @@ export default function SignUp() {
     e.preventDefault();
     if (!isValid) return;
     setError('');
+    setEmailExists(false);
     setIsLoading(true);
     setLoadingStep('処理中…');
 
     try {
       if (activeTab === 'store') {
         const { error: err, needsConfirmation: confirm } = await signUpAsStore(email, password, name.trim(), normalizedPhone, setLoadingStep);
+        // ★ 既存メール (customer 等で登録済み) → 白画面にせず、 ログインして店舗登録する導線を出す
+        if (err === EMAIL_ALREADY_REGISTERED) {
+          setEmailExists(true);
+          setError('このメールアドレスは既に登録されています。ログインしてから店舗を登録してください（アカウントの退会は不要です）。');
+          setShakeKey(k => k + 1);
+          return;
+        }
         if (err) { setError(err); setShakeKey(k => k + 1); return; }
         setNeedsConfirm(confirm);
         setDone(true);
@@ -82,6 +91,12 @@ export default function SignUp() {
         if (!confirm) navigate('/store-onboarding', { replace: true });
       } else {
         const { error: err, needsConfirmation: confirm } = await signUp(email, password, name, phone, '', setLoadingStep);
+        if (err === EMAIL_ALREADY_REGISTERED) {
+          setEmailExists(true);
+          setError('このメールアドレスは既に登録されています。ログインしてください。');
+          setShakeKey(k => k + 1);
+          return;
+        }
         if (err) { setError(err); setShakeKey(k => k + 1); return; }
         setNeedsConfirm(confirm);
         setDone(true);
@@ -356,6 +371,27 @@ export default function SignUp() {
                 </motion.div>
               )}
             </AnimatePresence>
+
+            {/* ★ 既存メール時: ログイン → 店舗登録 の正規ルートへ (退会不要) */}
+            {emailExists && (
+              <button
+                type="button"
+                onClick={() =>
+                  navigate(
+                    isStore
+                      ? `/login?tab=store&redirect=${encodeURIComponent('/store-onboarding')}`
+                      : '/login'
+                  )
+                }
+                className="w-full flex items-center justify-center gap-2 text-white font-black py-3.5 rounded-xl active:scale-[0.98] transition-transform"
+                style={{
+                  background: 'linear-gradient(180deg, #F07826 0%, #E85A0C 100%)',
+                  boxShadow: '0 4px 20px rgba(242,100,25,0.30)',
+                }}
+              >
+                {isStore ? 'ログインして店舗を登録する' : 'ログイン画面へ'}
+              </button>
+            )}
 
             <div className="flex-1 min-h-2" />
 

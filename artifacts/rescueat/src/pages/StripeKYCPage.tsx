@@ -1069,12 +1069,21 @@ export default function StripeKYCPage() {
                       <X className="w-4 h-4 text-white" />
                     </button>
                   )}
-                  <div className="flex items-center gap-1.5 mt-2">
-                    {docFrontDone
-                      ? <><BadgeCheck className="w-4 h-4 text-green-500" /><span className="text-xs text-green-600 font-bold">Stripeに送信済み</span></>
-                      : <><CheckCircle2 className="w-4 h-4 text-orange-400" /><span className="text-xs text-orange-500 font-bold">選択済み — 下の「送信」ボタンで一括送信します</span></>
-                    }
-                  </div>
+                  {docFrontDone ? (
+                    <div className="flex items-center gap-1.5 mt-2">
+                      <BadgeCheck className="w-4 h-4 text-green-500" /><span className="text-xs text-green-600 font-bold">Stripeに送信済み</span>
+                    </div>
+                  ) : (
+                    <div className="mt-2 space-y-1.5">
+                      <button type="button" disabled={docLoading === 'front'} onClick={() => handleDocUpload('front')}
+                        className="w-full py-2.5 bg-orange-500 text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 active:scale-[0.98]">
+                        {docLoading === 'front' ? <><Loader2 className="w-4 h-4 animate-spin" />送信中...</> : <><Upload className="w-4 h-4" />この画像だけ今すぐ送信する</>}
+                      </button>
+                      <p className="text-[11px] text-gray-400 text-center leading-relaxed">
+                        本人確認書類の再提出だけなら、このボタンで送信できます（氏名・住所などの入力は不要です）
+                      </p>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <button type="button" onClick={() => frontInputRef.current?.click()}
@@ -1103,12 +1112,18 @@ export default function StripeKYCPage() {
                       <X className="w-4 h-4 text-white" />
                     </button>
                   )}
-                  <div className="flex items-center gap-1.5 mt-2">
-                    {docBackDone
-                      ? <><BadgeCheck className="w-4 h-4 text-green-500" /><span className="text-xs text-green-600 font-bold">Stripeに送信済み</span></>
-                      : <><CheckCircle2 className="w-4 h-4 text-orange-400" /><span className="text-xs text-orange-500 font-bold">選択済み — 下の「送信」ボタンで一括送信します</span></>
-                    }
-                  </div>
+                  {docBackDone ? (
+                    <div className="flex items-center gap-1.5 mt-2">
+                      <BadgeCheck className="w-4 h-4 text-green-500" /><span className="text-xs text-green-600 font-bold">Stripeに送信済み</span>
+                    </div>
+                  ) : (
+                    <div className="mt-2 space-y-1.5">
+                      <button type="button" disabled={docLoading === 'back'} onClick={() => handleDocUpload('back')}
+                        className="w-full py-2.5 bg-orange-500 text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 active:scale-[0.98]">
+                        {docLoading === 'back' ? <><Loader2 className="w-4 h-4 animate-spin" />送信中...</> : <><Upload className="w-4 h-4" />この画像だけ今すぐ送信する</>}
+                      </button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <button type="button" onClick={() => backInputRef.current?.click()}

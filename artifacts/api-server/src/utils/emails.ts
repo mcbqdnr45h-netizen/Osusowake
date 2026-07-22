@@ -207,20 +207,27 @@ export async function sendOrderEmailToStoreOwnerById(args: {
   pickupEnd?:   string | null;
   totalPrice?:  number | null;
   orderId?:     number | string | null;
+  // ★ push が1台以上の端末へ届いたか。false/undefined のときは「push が届いていない」
+  //   = このメールが唯一の注文通知なので、opt-out を無視して必ず送る (注文取りこぼし=
+  //   オーバーブッキング防止)。true のときだけ opt-out を尊重し、邪魔なメールを止める。
+  pushDelivered?: boolean;
 }): Promise<boolean> {
   try {
-    // ★ 店舗オーナーの注文メール opt-out チェック (Settings で OFF にしてれば送らない)
-    //    旧ユーザー (カラム null) は true 扱いで送る (デフォルト送信)。
-    const { data: prefRow, error: prefErr } = await supabaseAdmin
-      .from("users")
-      .select("notif_email_orders")
-      .eq("id", args.ownerId)
-      .maybeSingle();
-    if (!prefErr && prefRow) {
-      const wants = (prefRow as { notif_email_orders?: boolean | null }).notif_email_orders;
-      if (wants === false) {
-        console.log(`[email] 店舗オーナー opt-out のため注文メール送信スキップ ownerId=${args.ownerId}`);
-        return false;
+    // ★ 注文メールは本来「push が届かない環境のフォールバック」。
+    //   push が届いている店舗にだけ opt-out を効かせ、届いていない店舗には必ず送る。
+    if (args.pushDelivered === true) {
+      const { data: prefRow, error: prefErr } = await supabaseAdmin
+        .from("users")
+        .select("notif_email_orders")
+        .eq("id", args.ownerId)
+        .maybeSingle();
+      if (!prefErr && prefRow) {
+        const wants = (prefRow as { notif_email_orders?: boolean | null }).notif_email_orders;
+        // push 配信済みなら、明示的に「常にメールも欲しい」(true) 店だけ送る。
+        if (wants !== true) {
+          console.log(`[email] push 配信済み & 明示 opt-in でないため注文メール送信スキップ ownerId=${args.ownerId}`);
+          return false;
+        }
       }
     }
 

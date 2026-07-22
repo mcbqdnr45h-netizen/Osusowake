@@ -21,7 +21,7 @@ import crypto from "node:crypto";
 import { rateLimit } from "express-rate-limit";
 import { bagVisibleSql } from "../lib/bag-visibility.js";
 import { sendPushToUsers } from "../lib/push.js";
-import { buildGrowthData, buildDailyChecklistAI, buildSalesForecast, type AppStoreMetrics } from "../lib/growth.js";
+import { buildGrowthData, buildDailyChecklistAI, buildSalesForecast, buildStoreOutreach, type AppStoreMetrics } from "../lib/growth.js";
 import { getNotificationReach } from "../lib/daily-engagement.js";
 import OpenAI from "openai";
 
@@ -578,12 +578,12 @@ async function getOrBuildDailyChecklist(
 // 成長データ + App Store 数字 + 今日のチェックリスト + 消化状態を一括返却。
 router.post("/board/data", requireBoardCode, async (_req, res) => {
   try {
-    const [growth, appstore, reach, sales] = await Promise.all([buildGrowthData(), getAppStoreMetrics(), getNotificationReach(), buildSalesForecast()]);
+    const [growth, appstore, reach, sales, outreach] = await Promise.all([buildGrowthData(), getAppStoreMetrics(), getNotificationReach(), buildSalesForecast(), buildStoreOutreach()]);
     const jst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
     // ★ その日のデータをAIが分析して組む動的チェックリスト(毎日中身が変わる)。 1日キャッシュ。 失敗時は固定テンプレにフォールバック。
     const { items: checklist, source: checklistSource } = await getOrBuildDailyChecklist(jst, growth, appstore, sales);
     const checkState = await getBoardCheckState(jst);
-    res.json({ ok: true, growth, appstore, reach, sales, checklist, checklistSource, checkState, today: jst });
+    res.json({ ok: true, growth, appstore, reach, sales, outreach, checklist, checklistSource, checkState, today: jst });
   } catch (err: any) {
     console.error("[board/data]", err);
     res.status(500).json({ error: "internal_error", message: err?.message });
@@ -2270,6 +2270,67 @@ router.patch("/admin/stores/:storeId/link-stripe-account", requireAdmin, async (
     res.json({ ok: true, storeId, stripeAccountId });
   } catch (err: any) {
     console.error("[admin/link-stripe-account]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── PATCH /admin/stores/:storeId/owner-email ──────────────────────────────────
+// 店舗オーナーのログイン用メールアドレス(Supabase Auth)を管理者が変更する。
+//   ログインメールは users テーブルではなく Supabase Auth(auth.users)にのみ存在するため、
+//   admin API(updateUserById)経由でのみ変更できる。 email_confirm:true で確認メールを
+//   送らず即時確定する(店主から「このアドレスに変えて」と依頼された代行を想定)。
+//   ⚠️ 同一 owner_id が複数店舗を持つ場合、全店舗のログインメールが一括で変わる(=同一アカウント)。
+router.patch("/admin/stores/:storeId/owner-email", requireAdmin, async (req, res) => {
+  try {
+    const storeId = Number(req.params.storeId);
+    if (isNaN(storeId)) return res.status(400).json({ error: "bad_request", message: "Invalid storeId" });
+
+    const rawEmail = String((req.body as { email?: string }).email ?? "").trim().toLowerCase();
+    // RFC 完全準拠は不要。 最低限「x@y.z」形式を弾く程度のガード。
+    if (!rawEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail)) {
+      return res.status(400).json({ error: "bad_request", message: "メールアドレスの形式が正しくありません" });
+    }
+
+    const [store] = await db
+      .select({ id: storesTable.id, name: storesTable.name, ownerId: storesTable.ownerId })
+      .from(storesTable)
+      .where(eq(storesTable.id, storeId));
+    if (!store) return res.status(404).json({ error: "not_found", message: "店舗が見つかりません" });
+    if (!store.ownerId) {
+      return res.status(400).json({ error: "no_owner", message: "この店舗にはオーナーアカウントが紐づいていません" });
+    }
+
+    // 現在のメールを取得(監査ログ用 & 同一なら no-op)
+    const { data: current } = await supabaseAdmin.auth.admin.getUserById(store.ownerId);
+    const oldEmail = current?.user?.email ?? null;
+    if (oldEmail && oldEmail.toLowerCase() === rawEmail) {
+      return res.json({ ok: true, email: rawEmail, unchanged: true });
+    }
+
+    // Supabase Auth のメールを即時確定で更新。 既に他ユーザーが使用中ならここでエラーが返る。
+    const { data: updated, error } = await supabaseAdmin.auth.admin.updateUserById(store.ownerId, {
+      email: rawEmail,
+      email_confirm: true,
+    });
+    if (error) {
+      const msg = error.message ?? "";
+      const dup = /already|registered|exists|duplicate|been taken/i.test(msg);
+      console.warn(`[admin/owner-email] storeId=${storeId} 失敗: ${msg}`);
+      return res.status(dup ? 409 : 400).json({
+        error: dup ? "email_taken" : "update_failed",
+        message: dup
+          ? "そのメールアドレスは既に別のアカウントで使われています"
+          : `更新に失敗しました: ${msg}`,
+      });
+    }
+
+    await writeAuditLog(req, "store_owner_email_change", storeId, {
+      storeName: store.name, ownerId: store.ownerId, oldEmail, newEmail: rawEmail,
+    });
+    console.log(`[admin/owner-email] ✅ storeId=${storeId} owner=${store.ownerId} ${oldEmail ?? "(不明)"} → ${rawEmail}`);
+    res.json({ ok: true, email: updated?.user?.email ?? rawEmail, oldEmail });
+  } catch (err: any) {
+    console.error("[admin/owner-email]", err);
     res.status(500).json({ error: "internal_error", message: err?.message });
   }
 });

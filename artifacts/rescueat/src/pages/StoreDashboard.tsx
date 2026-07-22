@@ -15,6 +15,7 @@ import {
   Plus, Minus, Clock, CheckCircle2, Package2, X, ChevronUp, ChevronDown,
   Loader2, AlertCircle, BarChart2, RefreshCw, Ticket, Eye, ArrowRight,
   History, CreditCard, Zap, Pencil, Trash2, Save, Store, XCircle, Search, RotateCcw,
+  ExternalLink, Sparkles,
 } from 'lucide-react';
 import { Link, useLocation } from 'wouter';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -1523,6 +1524,13 @@ function ReservationCard({
 }
 
 // ─── メインページ ─────────────────────────────────────────────────────────
+// ★ 掲載バナー判定用の定期出品テンプレ（必要フィールドのみ）
+interface RecurringTemplateLite {
+  isActive: boolean;
+  publishTime: string;        // "HH:mm"（JST 自動公開時刻）
+  nextPublishDate: string;    // 次に自動公開される JST 日付 "YYYY-MM-DD"
+}
+
 export default function StoreDashboard() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -1560,6 +1568,7 @@ export default function StoreDashboard() {
   const activeBagsRef   = useRef<HTMLDivElement>(null);
   const pendingRef      = useRef<HTMLDivElement>(null);
   const pickedUpRef     = useRef<HTMLDivElement>(null);
+  const recurringRef    = useRef<HTMLDivElement>(null); // 定期出品セクションへスクロール(掲載バナーから)
 
   function scrollToSection(ref: React.RefObject<HTMLDivElement | null>, open?: boolean) {
     if (open) setShowPickedUp(true);
@@ -1627,6 +1636,22 @@ export default function StoreDashboard() {
     refetchOnMount: 'always',
   });
 
+  // ★ まちポケ高槻 掲載バナー用: 定期出品テンプレの有無・次回自動公開を親でも把握する。
+  //   RecurringListingsSection は内部で独立 fetch しているため、バナー判定用に軽量取得する。
+  //   これで「もう定期出品を組んでいる店」に『セットして』と誤ってナッジするのを防ぐ。
+  const { data: recurringData } = useQuery<{ enabled: boolean; listings: RecurringTemplateLite[] }>({
+    queryKey: [`/api/stores/${storeId}/recurring`],
+    queryFn: async () => {
+      if (!storeId) return { enabled: false, listings: [] };
+      const res = await authedFetch(`${BASE}/api/stores/${storeId}/recurring`);
+      if (!res.ok) return { enabled: false, listings: [] };
+      return res.json();
+    },
+    enabled: !!storeId && /高槻|takatsuki/i.test(store?.city ?? '') && store?.status === 'approved',
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+
   const updateStatus = useUpdateReservationStatus();
 
   // 今日の未受取予約（★決済完了済みのみ表示。未払い=決済待ちは一覧に出さない）
@@ -1674,6 +1699,31 @@ export default function StoreDashboard() {
   };
   const todaysBags = (bags as any[]).filter(isTodaysBoardBag);
   const activeBags     = todaysBags.filter((b: any) => getBagStatus(b, now) === 'active');
+  // ★ まちポケ高槻(takatsuki.machipoke.com)連携: 公開APIは status=active の出品だけを返す = 「今 出品中」の店だけが
+  //   ポータルに載る。定期出品を組めば毎日自動で active になる = 毎日タダで地域メディアに載る、という
+  //   供給側インセンティブを店舗ダッシュボードで可視化する(下部の掲載バナー)。
+  const inTakatsuki = /高槻|takatsuki/i.test(store?.city ?? '');
+  const isListedOnPortal = activeBags.length > 0;
+  // ★ まちポケ高槻バナーの3状態判定:
+  //   ① isListedOnPortal … いま出品中 → 掲載中
+  //   ② 未掲載だが有効な定期出品あり … 公開時刻になれば自動掲載（＝ナッジ不要・安心させる）
+  //   ③ 未掲載＆有効な定期出品なし … 定期出品セットへ誘導（ナッジ）
+  const activeRecurring = (recurringData?.listings ?? []).filter((t) => t.isActive);
+  const hasActiveRecurring = activeRecurring.length > 0;
+  // 次に自動公開されるテンプレ（nextPublishDate + publishTime が最も早いもの）
+  const nextAutoPublish = activeRecurring
+    .map((t) => ({ when: `${t.nextPublishDate}T${t.publishTime}`, date: t.nextPublishDate, time: t.publishTime }))
+    .sort((a, b) => a.when.localeCompare(b.when))[0] ?? null;
+  // 自動公開の相対表現（今日/明日/日付）
+  const nextPublishLabel = (() => {
+    if (!nextAutoPublish) return null;
+    const tomorrowStr = toJSTDateStr(new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString());
+    const dayWord =
+      nextAutoPublish.date === todayStr ? '今日' :
+      nextAutoPublish.date === tomorrowStr ? '明日' :
+      nextAutoPublish.date.slice(5).replace('-', '/'); // "MM/DD"
+    return `${dayWord} ${nextAutoPublish.time}`;
+  })();
   // 出品中（active・soldout のみ — expired は除外）
   const nonIdleBags = [...todaysBags]
     .filter((b: any) => b.isActive && getBagStatus(b, now) !== 'expired')
@@ -2273,8 +2323,90 @@ export default function StoreDashboard() {
 
         {/* ── 売上残高カードは「売上確認」 タブへ移動済み ── */}
 
+        {/* ── まちポケ高槻 掲載ステータス（高槻の承認店のみ）── */}
+        {store.status === 'approved' && inTakatsuki && (
+          isListedOnPortal ? (
+            /* ① いま掲載中 */
+            <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-xl bg-emerald-100 flex items-center justify-center shrink-0">
+                  <Sparkles className="w-5 h-5 text-emerald-600" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-black text-emerald-800">
+                    まちポケ高槻に掲載中 🎉
+                  </p>
+                  <p className="text-xs text-emerald-700/90 mt-1 leading-relaxed">
+                    今出品中の商品が、地域メディア「まちポケ高槻」にも自動で載っています。
+                    出品を切らさなければ毎日ここから新しいお客様が届きます。
+                  </p>
+                  <button
+                    onClick={() => window.open('https://takatsuki.machipoke.com/', '_blank', 'noopener,noreferrer')}
+                    className="mt-2 inline-flex items-center gap-1 text-xs font-bold text-emerald-700 hover:underline"
+                  >
+                    まちポケ高槻で見る <ExternalLink className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : hasActiveRecurring ? (
+            /* ② いまは未掲載だが、定期出品セット済み → 公開時刻になれば自動掲載（安心させる・ナッジしない） */
+            <div className="bg-sky-50 border border-sky-200 rounded-2xl p-4">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-xl bg-sky-100 flex items-center justify-center shrink-0">
+                  <Clock className="w-5 h-5 text-sky-600" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-black text-sky-800">
+                    まちポケ高槻に自動で掲載されます ✓
+                  </p>
+                  <p className="text-xs text-sky-700/90 mt-1 leading-relaxed">
+                    定期出品を設定済みです。
+                    {nextPublishLabel
+                      ? <>次回の自動出品は<span className="font-bold">{nextPublishLabel}</span>。公開されると同時に「まちポケ高槻」にも自動で掲載されます。</>
+                      : <>公開時刻になると自動で出品され、同時に「まちポケ高槻」にも掲載されます。</>}
+                  </p>
+                  <button
+                    onClick={() => scrollToSection(recurringRef)}
+                    className="mt-2 inline-flex items-center gap-1 text-xs font-bold text-sky-700 hover:underline"
+                  >
+                    定期出品を確認・編集する <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            /* ③ 未掲載＆有効な定期出品なし → 定期出品セットへ誘導 */
+            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4">
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 rounded-xl bg-amber-100 flex items-center justify-center shrink-0">
+                  <ExternalLink className="w-5 h-5 text-amber-600" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-black text-amber-800">
+                    今、まちポケ高槻に載っていません
+                  </p>
+                  <p className="text-xs text-amber-700/90 mt-1 leading-relaxed">
+                    地域メディア「まちポケ高槻」には、<span className="font-bold">出品中の商品がある店舗だけ</span>が自動で掲載されます。
+                    定期出品をセットすれば毎日自動で出品され、そのまま毎日タダで掲載＝送客につながります。
+                  </p>
+                  <button
+                    onClick={() => scrollToSection(recurringRef)}
+                    className="mt-2 inline-flex items-center gap-1 text-xs font-black text-white bg-amber-500 hover:bg-amber-600 rounded-xl px-3 py-1.5 active:scale-95 transition"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    定期出品をセットして毎日載せる →
+                  </button>
+                </div>
+              </div>
+            </div>
+          )
+        )}
+
         {/* ── 定期出品（毎日自動公開）パイロット店のみ表示 ── */}
-        {storeId && <RecurringListingsSection storeId={storeId} storeName={store.name} />}
+        <div ref={recurringRef}>
+          {storeId && <RecurringListingsSection storeId={storeId} storeName={store.name} />}
+        </div>
 
         {/* ── 出品中の商品（active・soldout のみ）── */}
         {nonIdleBags.length > 0 && (

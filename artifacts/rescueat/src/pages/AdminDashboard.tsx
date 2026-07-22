@@ -7,7 +7,7 @@ import {
   ShieldCheck, TrendingUp, Users, Store, Clock, CheckCircle, XCircle,
   Pause, Send, Megaphone, RefreshCw, AlertTriangle, ChevronDown, ChevronUp,
   BadgeDollarSign, BarChart2, Bell, Settings, ToggleLeft, ToggleRight, Type, Wrench, CreditCard,
-  LogOut, ExternalLink, Package, Receipt, Flag, MapPin, Trash2, FileWarning, Link2 as LinkIcon,
+  LogOut, ExternalLink, Package, Receipt, Flag, MapPin, Trash2, FileWarning, Link2 as LinkIcon, Mail,
   Activity, Award, Calendar, Filter, Flame, TrendingDown, Zap, AlertCircle,
 } from 'lucide-react';
 import {
@@ -463,6 +463,9 @@ export default function AdminDashboard() {
   const [linkStripeDialog, setLinkStripeDialog] = useState<{ storeId: number; storeName: string } | null>(null);
   const [linkStripeInput,  setLinkStripeInput]  = useState('');
   const [linkStripeLoading, setLinkStripeLoading] = useState(false);
+  const [emailDialog, setEmailDialog] = useState<{ storeId: number; storeName: string; currentEmail: string | null } | null>(null);
+  const [emailInput, setEmailInput] = useState('');
+  const [emailLoading, setEmailLoading] = useState(false);
 
   const token = session?.access_token;
 
@@ -850,6 +853,38 @@ export default function AdminDashboard() {
       toast({ title: 'エラー', description: 'サーバーへの接続に失敗しました', variant: 'destructive' });
     } finally {
       setLinkStripeLoading(false);
+    }
+  }
+
+  async function changeOwnerEmail() {
+    if (!emailDialog || !emailInput.trim()) return;
+    setEmailLoading(true);
+    try {
+      const res = await authedFetch(`${BASE}/api/admin/stores/${emailDialog.storeId}/owner-email`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: emailInput.trim() }),
+      });
+      const d = await res.json();
+      if (res.ok) {
+        const newEmail = (d.email as string) ?? emailInput.trim();
+        // 展開中パネルの表示メールを即時更新
+        setStoreDetails(prev => prev[emailDialog.storeId]
+          ? { ...prev, [emailDialog.storeId]: { ...prev[emailDialog.storeId], owner_email: newEmail } }
+          : prev);
+        toast({
+          title: d.unchanged ? 'メールは変更されていません' : '✅ ログインメールを変更しました',
+          description: d.unchanged ? undefined : `新しいメール: ${newEmail}`,
+        });
+        setEmailDialog(null);
+        setEmailInput('');
+      } else {
+        toast({ title: 'エラー', description: d.message ?? d.error ?? '変更に失敗しました', variant: 'destructive' });
+      }
+    } catch {
+      toast({ title: 'エラー', description: 'サーバーへの接続に失敗しました', variant: 'destructive' });
+    } finally {
+      setEmailLoading(false);
     }
   }
 
@@ -2178,6 +2213,14 @@ export default function AdminDashboard() {
                                   {/* オーナー情報 */}
                                   <DetailSection title="👤 オーナー情報">
                                     <DetailRow label="メールアドレス" value={d.owner_email} copyable />
+                                    <button
+                                      type="button"
+                                      onClick={() => { setEmailInput(''); setEmailDialog({ storeId: store.id, storeName: store.name, currentEmail: d.owner_email }); }}
+                                      disabled={!d.owner_id}
+                                      className="mb-2 inline-flex items-center gap-1.5 text-[11px] font-bold text-violet-600 hover:underline disabled:opacity-40 disabled:no-underline"
+                                    >
+                                      <Mail className="w-3 h-3" />ログインメールを変更
+                                    </button>
                                     <DetailRow label="オーナーID" value={d.owner_id} mono />
                                     <DetailRow label="登録日" value={new Date(d.created_at).toLocaleString('ja-JP')} />
                                   </DetailSection>
@@ -3127,6 +3170,65 @@ export default function AdminDashboard() {
                   className="flex-1 py-2.5 rounded-xl bg-violet-600 text-white font-bold text-sm hover:bg-violet-700 transition-colors disabled:opacity-40"
                 >
                   {linkStripeLoading ? <RefreshCw className="w-4 h-4 animate-spin mx-auto" /> : 'リンクして同期'}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── ログインメール変更 モーダル ───────────────────────────────── */}
+      <AnimatePresence>
+        {emailDialog && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm p-4"
+            onClick={() => setEmailDialog(null)}
+          >
+            <motion.div
+              initial={{ y: 40, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 40, opacity: 0 }}
+              className="bg-white rounded-2xl shadow-2xl p-5 w-full max-w-sm md:max-w-2xl"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="flex items-center gap-2 mb-4">
+                <Mail className="w-5 h-5 text-violet-600" />
+                <h2 className="font-black text-gray-900 text-base">ログインメールを変更</h2>
+              </div>
+              <p className="text-xs text-gray-500 mb-1 font-medium">店舗名</p>
+              <p className="text-sm font-bold text-gray-800 mb-3 truncate">{emailDialog.storeName}</p>
+              <div className="mb-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-800 leading-relaxed">
+                ⚠️ 変更後は<strong>新しいメールでログイン</strong>する必要があります。注文通知メールの宛先もこのアドレスに変わります。同じオーナーが複数店舗を持つ場合、全店舗のログインが一括で変わります。
+              </div>
+              {emailDialog.currentEmail && (
+                <p className="text-[11px] text-gray-500 mb-1">
+                  現在: <span className="font-mono">{emailDialog.currentEmail}</span>
+                </p>
+              )}
+              <input
+                type="email"
+                inputMode="email"
+                autoCapitalize="none"
+                autoCorrect="off"
+                value={emailInput}
+                onChange={e => setEmailInput(e.target.value)}
+                placeholder="new-email@example.com"
+                className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-violet-400 mb-4"
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setEmailDialog(null)}
+                  className="flex-1 py-2.5 rounded-xl border border-gray-200 text-gray-600 font-bold text-sm"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="button"
+                  onClick={changeOwnerEmail}
+                  disabled={emailLoading || !emailInput.trim()}
+                  className="flex-1 py-2.5 rounded-xl bg-violet-600 text-white font-bold text-sm hover:bg-violet-700 transition-colors disabled:opacity-40"
+                >
+                  {emailLoading ? <RefreshCw className="w-4 h-4 animate-spin mx-auto" /> : 'メールを変更する'}
                 </button>
               </div>
             </motion.div>

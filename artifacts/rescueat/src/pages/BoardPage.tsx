@@ -38,9 +38,19 @@ interface SalesForecast {
   today: { listedBags: number; listedUnits: number; soldUnits: number; revenue: number; soldOutBags: number; sellThrough: number };
   daily: { date: string; listedUnits: number; soldUnits: number; revenue: number; sellThrough: number }[];
   storePerformance: { storeId: number; name: string; category: string | null; listedUnits: number; soldUnits: number; sellThrough: number; revenue: number }[];
-  categoryPerformance: { category: string; listedUnits: number; soldUnits: number; sellThrough: number }[];
+  categoryPerformance: { category: string; listedUnits: number; soldUnits: number; sellThrough: number; revenue: number }[];
+  breakdown: { period: string; orders: number; gmv: number; platformRevenue: number; storePayout: number; takeRate: number }[];
   forecast: { sampleDays: number; avgSellThrough: number; bestCategory: string | null; worstCategory: string | null; note: string };
 }
+type OutreachSituation = 'convert_to_recurring' | 'low_sales' | 'went_quiet' | 'partial_recurring' | 'steady';
+interface StoreOutreachItem {
+  storeId: number; storeName: string; city: string | null;
+  situation: OutreachSituation; headline: string;
+  manualStreak: number; manualDaysRecent: number; daysSinceManual: number;
+  listedUnits: number; soldUnits: number; sellThrough: number; recurringDays: number;
+  message: string;
+}
+interface StoreOutreach { generatedAt: string; items: StoreOutreachItem[]; note: string }
 type TimeSlot = 'morning' | 'midday' | 'afternoon' | 'evening' | 'night';
 interface ChecklistTarget { label: string; sub?: string }
 interface ChecklistItem {
@@ -64,6 +74,7 @@ interface BoardResponse {
   appstore: AppStoreMetrics;
   reach?: NotificationReach;
   sales?: SalesForecast;
+  outreach?: StoreOutreach;
   checklist: ChecklistItem[];
   checklistSource?: 'ai' | 'template';
   checkState: Record<string, boolean>;
@@ -92,6 +103,14 @@ const SLOT_META: Record<TimeSlot, { label: string; emoji: string; hint: string }
   night:     { label: '夜',     emoji: '🌙', hint: '21:00〜23:00' },
 };
 
+const OUTREACH_META: Record<OutreachSituation, { label: string; bg: string; fg: string }> = {
+  convert_to_recurring: { label: '定期化を案内', bg: '#ede9fe', fg: '#6d28d9' },
+  low_sales:            { label: '販売サポート', bg: '#fee2e2', fg: '#b91c1c' },
+  went_quiet:           { label: '再開の声かけ', bg: '#fef3c7', fg: '#92400e' },
+  partial_recurring:    { label: '残り曜日も定期化', bg: '#e0f2fe', fg: '#0369a1' },
+  steady:               { label: '安定・頃合いで案内', bg: '#dcfce7', fg: '#166534' },
+};
+
 const yen = (n: number) => '¥' + n.toLocaleString('ja-JP');
 
 export default function BoardPage() {
@@ -104,6 +123,7 @@ export default function BoardPage() {
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [bdIdx, setBdIdx] = useState(2); // 売上内訳の期間: 0=今日 1=直近14日 2=累計(既定)
   // 何でも聞けるAI相談（画像添付対応）
   const [chat, setChat] = useState<{ role: 'user' | 'assistant'; content: string; images?: string[] }[]>([]);
   const [chatInput, setChatInput] = useState('');
@@ -268,7 +288,7 @@ export default function BoardPage() {
     return <div style={{ minHeight: '100dvh', display: 'grid', placeItems: 'center', color: '#64748b' }}>{loading ? '読み込み中…' : (err || '—')}</div>;
   }
 
-  const { growth, appstore, reach, sales, checklist, checklistSource, checkState } = data;
+  const { growth, appstore, reach, sales, outreach, checklist, checklistSource, checkState } = data;
   const f = growth.funnel;
   const doneCount = checklist.filter((i) => checkState[i.id]).length;
   const progress = checklist.length ? Math.round((doneCount / checklist.length) * 100) : 0;
@@ -439,10 +459,116 @@ export default function BoardPage() {
                       background: c.sellThrough >= 60 ? '#dcfce7' : c.sellThrough >= 30 ? '#ffedd5' : '#fee2e2',
                       color: c.sellThrough >= 60 ? '#166534' : c.sellThrough >= 30 ? '#9a3412' : '#991b1b',
                     }}>
-                      {c.category} {c.sellThrough}%（{c.soldUnits}/{c.listedUnits}）
+                      {c.category} {c.sellThrough}%（{c.soldUnits}/{c.listedUnits}）{c.revenue > 0 ? ` · ${yen(c.revenue)}` : ''}
                     </span>
                   ))}
                 </div>
+              </div>
+            )}
+          </Card>
+        )}
+
+        {/* 売上内訳（取扱高がおすそわけ売上と店舗入金にどう分かれるか） */}
+        {sales && sales.breakdown && sales.breakdown.length > 0 && (() => {
+          const bd = sales.breakdown[bdIdx] ?? sales.breakdown[sales.breakdown.length - 1];
+          const gmv = Math.max(bd.gmv, 1);
+          const platPct = Math.round((bd.platformRevenue / gmv) * 100);
+          const storePct = 100 - platPct;
+          return (
+            <Card>
+              <Row>
+                <b style={{ fontSize: 15 }}>💰 売上内訳</b>
+                <span style={{ fontSize: 12, color: '#94a3b8' }}>{bd.orders.toLocaleString('ja-JP')}件の成約</span>
+              </Row>
+
+              {/* 期間トグル */}
+              <div style={{ display: 'flex', gap: 6, margin: '10px 0 12px' }}>
+                {sales.breakdown.map((b, i) => (
+                  <button key={b.period} type="button" onClick={() => setBdIdx(i)}
+                    style={{
+                      flex: 1, fontSize: 12, fontWeight: 700, padding: '7px 0', borderRadius: 9, cursor: 'pointer',
+                      border: i === bdIdx ? '1px solid #f59e0b' : '1px solid #e2e8f0',
+                      background: i === bdIdx ? '#fff7ed' : '#fff',
+                      color: i === bdIdx ? '#b45309' : '#64748b',
+                    }}>
+                    {b.period}
+                  </button>
+                ))}
+              </div>
+
+              {/* 取扱高（大きく） */}
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 2 }}>
+                <span style={{ fontSize: 12, color: '#64748b' }}>取扱高（GMV）</span>
+                <span style={{ fontSize: 28, fontWeight: 800, color: '#0f172a' }}>{yen(bd.gmv)}</span>
+              </div>
+
+              {/* 内訳の積み上げバー */}
+              <div style={{ display: 'flex', height: 14, borderRadius: 7, overflow: 'hidden', marginTop: 8, background: '#eef1f4' }}>
+                <div style={{ width: `${platPct}%`, background: '#16a34a' }} />
+                <div style={{ width: `${storePct}%`, background: '#f59e0b' }} />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#64748b', marginTop: 5 }}>
+                <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: '#16a34a', marginRight: 4 }} />おすそわけ売上 {platPct}%</span>
+                <span>店舗入金 {storePct}% <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: '#f59e0b', marginLeft: 4 }} /></span>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 10, marginTop: 12 }}>
+                <Stat label={`おすそわけ売上（手数料 ${bd.takeRate}%）`} value={bd.platformRevenue} prefix="¥" />
+                <Stat label="店舗へ入金（80%・Stripe前）" value={bd.storePayout} prefix="¥" />
+              </div>
+
+              <p style={{ fontSize: 11, color: '#94a3b8', margin: '10px 0 0', lineHeight: 1.5 }}>
+                おすそわけ売上 = 店20%手数料 ＋ ユーザー5%利用料（Stripe手数料前・満額受取）。店舗入金は商品代金の80%（実入金はここからStripe約3.6%を店舗が負担）。
+              </p>
+            </Card>
+          );
+        })()}
+
+        {/* 店舗サポート（毎日更新・出品してくれた店ごとの営業文） */}
+        {outreach && (
+          <Card>
+            <Row>
+              <b style={{ fontSize: 15 }}>🤝 店舗サポート（毎日更新）</b>
+              <span style={{ fontSize: 12, color: '#94a3b8' }}>{outreach.items.length}店</span>
+            </Row>
+            <p style={{ fontSize: 11.5, color: '#64748b', margin: '4px 0 12px', lineHeight: 1.5 }}>{outreach.note}</p>
+            {outreach.items.length === 0 ? (
+              <div style={{ fontSize: 12.5, color: '#94a3b8', textAlign: 'center', padding: '14px 0' }}>今日アプローチ対象の店はありません 🎉</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                {outreach.items.map((it) => {
+                  const om = OUTREACH_META[it.situation];
+                  const copyId = `outreach:${it.storeId}`;
+                  return (
+                    <div key={it.storeId} style={{ background: '#fff', border: '1px solid #f1f5f9', borderRadius: 14, padding: 14, boxShadow: '0 2px 8px rgba(0,0,0,.04)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 14.5, fontWeight: 800, color: '#0f172a', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '60%' }}>{it.storeName}</span>
+                        <span style={{ fontSize: 10, fontWeight: 700, color: om.fg, background: om.bg, borderRadius: 6, padding: '2px 8px' }}>{om.label}</span>
+                        {it.city && <span style={{ fontSize: 11, color: '#94a3b8' }}>{it.city}</span>}
+                      </div>
+                      <div style={{ fontSize: 12.5, color: '#475569', fontWeight: 600, marginTop: 6 }}>{it.headline}</div>
+                      {/* 数字 */}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                        {it.manualStreak > 0 && <Pill label="連続手動" value={`${it.manualStreak}日`} />}
+                        <Pill label="30日手動" value={`${it.manualDaysRecent}日`} />
+                        {it.daysSinceManual > 0 && <Pill label="最終から" value={`${it.daysSinceManual}日`} />}
+                        {it.listedUnits > 0 && <Pill label="販売率" value={`${it.sellThrough}%`} sub={`${it.soldUnits}/${it.listedUnits}個`} />}
+                        <Pill label="定期曜日" value={`週${it.recurringDays}日`} />
+                      </div>
+                      {/* コピペ営業文 */}
+                      <div style={{ marginTop: 10 }}>
+                        <Row>
+                          <span style={{ fontSize: 11.5, fontWeight: 700, color: '#475569' }}>コピペ用 営業文</span>
+                          <button onClick={() => doCopy(copyId, it.message)}
+                            style={{ fontSize: 11, padding: '3px 10px', borderRadius: 8, border: '1px solid #e2e8f0', background: copied === copyId ? '#dcfce7' : '#fff', fontWeight: 600 }}>
+                            {copied === copyId ? '✓ コピー済' : '📋 コピー'}
+                          </button>
+                        </Row>
+                        <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12.5, color: '#0f172a', background: '#f8fafc', border: '1px solid #eef1f4', borderRadius: 10, padding: 12, margin: '6px 0 0', fontFamily: 'inherit', lineHeight: 1.55 }}>{it.message}</pre>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </Card>
@@ -762,6 +888,15 @@ function Stat({ label, value, suffix, prefix, danger }: { label: string; value: 
     <div style={{ background: danger ? '#fef2f2' : '#f8fafc', borderRadius: 12, padding: '10px 12px' }}>
       <div style={{ fontSize: 11, color: '#64748b' }}>{label}</div>
       <div style={{ fontSize: 22, fontWeight: 800, color: danger ? '#dc2626' : '#0f172a' }}>{prefix && <span style={{ fontSize: 14, fontWeight: 700, marginRight: 1 }}>{prefix}</span>}{value.toLocaleString('ja-JP')}<span style={{ fontSize: 12, fontWeight: 600, marginLeft: 2 }}>{suffix}</span></div>
+    </div>
+  );
+}
+function Pill({ label, value, sub }: { label: string; value: string; sub?: string }) {
+  return (
+    <div style={{ background: '#f1f5f9', borderRadius: 8, padding: '4px 9px', display: 'flex', alignItems: 'baseline', gap: 5 }}>
+      <span style={{ fontSize: 10.5, color: '#64748b' }}>{label}</span>
+      <span style={{ fontSize: 12.5, fontWeight: 800, color: '#0f172a' }}>{value}</span>
+      {sub && <span style={{ fontSize: 10, color: '#94a3b8' }}>{sub}</span>}
     </div>
   );
 }

@@ -2720,20 +2720,44 @@ router.post("/stores/:storeId/connect/kyc-document", requireAuth, requireStoreOw
     console.log(`✅ [KYC-DOC] Stripe file created: ${file.id} (${file.filename})`);
 
     // ── business_type を確認して verification の送信先を決める ──
-    // 個人事業主: individual.verification.document
-    // 法人: representative.verification.document
+    // 個人事業主: individual.verification.document → accounts.update({ individual })
+    // 法人:       代表者(Person).verification.document → accounts.updatePerson()
+    //   ★ Stripe の accounts.update に `representative` というパラメータは存在しない
+    //     (=旧実装は "Received unknown parameter: representative" で会社アカウントは常に失敗していた)。
+    //     法人の代表者は Person オブジェクトなので、listPersons で代表者を引いて
+    //     updatePerson で書類をセットしなければならない。
     const existingAccount = await stripe.accounts.retrieve(store.stripeAccountId);
     const isCompany = existingAccount.business_type === "company";
-    const verificationUpdate = isCompany
-      ? { representative: { verification: { document: { [side]: file.id } } } }
-      : { individual:     { verification: { document: { [side]: file.id } } } };
 
-    console.log(`📤 [KYC-DOC] Sending verification to ${isCompany ? "representative" : "individual"}.verification.document`);
+    let account: any;
+    if (isCompany) {
+      // 代表者 Person を特定（representative → owner → 先頭 の順でフォールバック）
+      const persons = await stripe.accounts.listPersons(store.stripeAccountId, { limit: 100 });
+      const rep =
+        persons.data.find((p) => (p.relationship as any)?.representative) ??
+        persons.data.find((p) => (p.relationship as any)?.owner) ??
+        persons.data[0];
+      if (!rep) {
+        res.status(400).json({
+          error: "no_representative",
+          message: "代表者情報が未登録です。先に代表者情報を登録してから書類を再提出してください。",
+        });
+        return;
+      }
+      console.log(`📤 [KYC-DOC] Sending verification to Person ${rep.id} (representative).verification.document`);
+      await stripe.accounts.updatePerson(store.stripeAccountId, rep.id, {
+        verification: { document: { [side]: file.id } },
+      } as any);
+      // 更新後のアカウント requirements を取り直す
+      account = await stripe.accounts.retrieve(store.stripeAccountId);
+    } else {
+      console.log(`📤 [KYC-DOC] Sending verification to individual.verification.document`);
+      account = await stripe.accounts.update(store.stripeAccountId, {
+        individual: { verification: { document: { [side]: file.id } } },
+      } as any);
+    }
 
-    // ── accounts.update で verification.document に fileId をセット ──
-    const account = await stripe.accounts.update(store.stripeAccountId, verificationUpdate as any);
-
-    console.log(`✅ [KYC-DOC] accounts.update succeeded for store ${storeId}`);
+    console.log(`✅ [KYC-DOC] verification.document set succeeded for store ${storeId}`);
     console.log(`   requirements.currently_due:  ${JSON.stringify(account.requirements?.currently_due)}`);
     console.log(`   requirements.eventually_due: ${JSON.stringify(account.requirements?.eventually_due)}`);
     console.log(`   requirements.pending_verification: ${JSON.stringify(account.requirements?.pending_verification)}`);

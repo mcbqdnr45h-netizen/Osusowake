@@ -856,9 +856,12 @@ router.post("/payment/confirm", requireAuth, async (req, res) => {
         if (existingOwner.length === 0) {
           await db.insert(notificationsTable).values({ userId: store.ownerId, type: "bag_sold", title: ownerTitle, body: ownerBody, storeId: updated.storeId });
         }
-        if (await storeOrderPushEnabled(store.ownerId)) await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${updated.id}`, url: "/store/orders" });
+        let ownerPushSent = 0;
+        if (await storeOrderPushEnabled(store.ownerId)) ownerPushSent = await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${updated.id}`, url: "/store/orders" });
         // Web Push が届かない環境 (ブラウザのみ / 通知拒否 / iOS PWA 未追加) の補完として
         // 店舗オーナーへ注文メールを送信。 例外は内部で握り潰されるので await のみで OK。
+        // ★ push が1台も届かなかった場合 (ownerPushSent===0) は opt-out を無視して必ず送る
+        //   =注文の取りこぼし(オーバーブッキング)防止。届いた場合は opt-in 店のみメール。
         // ★ confirm/verify/webhook の三重発火で重複メールを送らないよう、DB通知と同じ
         //   冪等ガード内で送る（DB通知行が「一度だけ」マーカーになり、再起動後も有効）。
         if (existingOwner.length === 0) {
@@ -872,6 +875,7 @@ router.post("/payment/confirm", requireAuth, async (req, res) => {
             pickupEnd:   bag?.pickupEnd ?? null,
             totalPrice:  updated.totalPrice,
             orderId:     updated.id,
+            pushDelivered: ownerPushSent > 0,
           });
         }
       }
@@ -1409,7 +1413,8 @@ router.get("/checkout/verify", async (req, res) => {
           if (existingOwner.length === 0) {
             await db.insert(notificationsTable).values({ userId: ownerId, type: "bag_sold", title: ownerTitle, body: ownerBody, storeId: reservationFull.storeId ?? undefined });
           }
-          if (await storeOrderPushEnabled(ownerId)) await sendPushToUser(ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${reservationId}`, url: "/store/orders" });
+          let ownerPushSent = 0;
+          if (await storeOrderPushEnabled(ownerId)) ownerPushSent = await sendPushToUser(ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${reservationId}`, url: "/store/orders" });
           if (existingOwner.length === 0) {
           await sendOrderEmailToStoreOwnerById({
             ownerId,
@@ -1421,6 +1426,7 @@ router.get("/checkout/verify", async (req, res) => {
             pickupEnd:   reservationFull.pickupEnd ?? null,
             totalPrice:  reservationFull.totalPrice ?? null,
             orderId:     reservationId,
+            pushDelivered: ownerPushSent > 0,
           });
           }
         }
