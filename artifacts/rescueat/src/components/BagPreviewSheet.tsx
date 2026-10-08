@@ -89,7 +89,7 @@ export function BagPreviewSheet({
                 <span className="text-xl font-black text-primary">¥{price.toLocaleString()}</span>
               </div>
               <span className={`inline-flex items-center gap-1 text-[11px] font-bold px-2 py-1 rounded-full ${isLowStock ? 'bg-rose-50 text-rose-600' : 'bg-muted/60 text-muted-foreground'}`}>
-                <Gift className="w-3 h-3" />残り{stock}個
+                <Gift className="whitespace-nowrap w-3 h-3" />残り{stock}個
               </span>
             </div>
           </div>

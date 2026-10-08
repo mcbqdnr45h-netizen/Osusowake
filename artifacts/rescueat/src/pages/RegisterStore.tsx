@@ -196,7 +196,7 @@ export default function RegisterStore() {
 
   return (
     <Layout>
-      <div className="max-w-xl md:max-w-3xl mx-auto px-4 py-6">
+      <div className="w-full max-w-xl md:max-w-3xl mx-auto px-4 py-6">
 
         {/* Header */}
         <div className="flex items-center gap-3 mb-6">
@@ -267,7 +267,7 @@ export default function RegisterStore() {
                   </div>
                 )}
               </div>
-              <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={handleImageChange} className="hidden" />
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleImageChange} className="hidden" />
             </div>
 
             {/* Store name */}

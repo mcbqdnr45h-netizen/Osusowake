@@ -657,7 +657,7 @@ export default function StripeKYCPage() {
 
     return (
       <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50">
-        <div className="max-w-lg md:max-w-3xl mx-auto px-4 pt-safe-or-4 pb-12">
+        <div className="w-full max-w-lg md:max-w-3xl mx-auto px-4 pt-safe-or-4 pb-12">
           <div className="flex items-center gap-3 py-5">
             <button onClick={() => navigate('/mypage')}
               className="w-10 h-10 rounded-full bg-white shadow-sm flex items-center justify-center">
@@ -768,7 +768,7 @@ export default function StripeKYCPage() {
               )}
 
               {/* 表面 */}
-              <input ref={frontInputRef} type="file" accept="image/jpeg,image/png,image/heic,image/heif"
+              <input ref={frontInputRef} type="file" accept="image/*"
                 onChange={handleDocFileChange('front')} className="hidden" />
               {docFrontPreview ? (
                 <div className="relative">
@@ -809,7 +809,7 @@ export default function StripeKYCPage() {
   // ── メインフォーム ──────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50">
-      <div className="max-w-lg md:max-w-3xl mx-auto px-4 pt-safe-or-4 pb-12">
+      <div className="w-full max-w-lg md:max-w-3xl mx-auto px-4 pt-safe-or-4 pb-12">
 
         {/* ヘッダー */}
         <div className="flex items-center gap-3 py-5">
@@ -1055,7 +1055,7 @@ export default function StripeKYCPage() {
               <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">
                 表面 <span className="text-red-400">*</span>
               </p>
-              <input ref={frontInputRef} type="file" accept="image/jpeg,image/png,image/heic,image/heif"
+              <input ref={frontInputRef} type="file" accept="image/*"
                 onChange={handleDocFileChange('front')} className="hidden" />
 
               {docFrontPreview ? (
@@ -1079,8 +1079,17 @@ export default function StripeKYCPage() {
                         className="w-full py-2.5 bg-orange-500 text-white font-bold text-sm rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 active:scale-[0.98]">
                         {docLoading === 'front' ? <><Loader2 className="w-4 h-4 animate-spin" />送信中...</> : <><Upload className="w-4 h-4" />この画像だけ今すぐ送信する</>}
                       </button>
+                      {/* ★ 「書類だけ送れば済む」と読めると、 不一致系エラー
+                          (verification_failed_document_match 等) の店が書類だけを何度も送って
+                          永久に弾かれ続ける。 書類だけで解決するケースと、 氏名・生年月日の
+                          修正が必要なケースを明確に書き分ける。 */}
                       <p className="text-[11px] text-gray-400 text-center leading-relaxed">
-                        本人確認書類の再提出だけなら、このボタンで送信できます（氏名・住所などの入力は不要です）
+                        書類の写真だけを差し替える場合はこのボタンで送信できます
+                      </p>
+                      <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-2 leading-relaxed">
+                        ⚠️「<strong>情報が書類と一致しません</strong>」と表示された場合は、写真を送り直しても解消しません。
+                        上の<strong>お名前（漢字・カナ）・生年月日</strong>を身分証の記載と<strong>完全に同じ</strong>に直してから、
+                        ページ下部の送信ボタンでまとめて送信してください。
                       </p>
                     </div>
                   )}
@@ -1098,7 +1107,7 @@ export default function StripeKYCPage() {
             {/* 裏面（任意） */}
             <div className="space-y-2 pt-3 border-t border-gray-100">
               <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">裏面（任意）</p>
-              <input ref={backInputRef} type="file" accept="image/jpeg,image/png,image/heic,image/heif"
+              <input ref={backInputRef} type="file" accept="image/*"
                 onChange={handleDocFileChange('back')} className="hidden" />
 
               {docBackPreview ? (

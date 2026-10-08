@@ -57,10 +57,36 @@ export function usePushNotifications() {
   };
 
   // ── listener 設置 + register() (許可済みが前提・1回のみ)。
+  // ★ Android の通知チャンネル (2026-08-12)
+  //   Android 8 以降は「チャンネル」ごとに重要度が決まる。作っていないと FCM の
+  //   フォールバックチャンネル(重要度=標準)が使われ、【画面上部にバナーが出ない】。
+  //   店の端末は注文に気づけるかが命なので、注文用は重要度MAXのチャンネルを用意する。
+  //   ※ サーバーが channelId を指定しても、端末にそのチャンネルが無ければ FCM は
+  //     従来どおりフォールバックで配信するので、古いアプリでも通知が消えることはない。
+  const ensureAndroidChannels = async () => {
+    if (Capacitor.getPlatform() !== 'android') return;
+    try {
+      await PushNotifications.createChannel({
+        id: 'orders', name: '注文の通知',
+        description: 'お店に新しい注文が入ったときのお知らせ',
+        importance: 5, visibility: 1, sound: 'default', vibration: true, lights: true,
+      });
+      await PushNotifications.createChannel({
+        id: 'general', name: 'おすそわけのお知らせ',
+        description: '新しい出品やおすすめのお知らせ',
+        importance: 3, visibility: 1, vibration: true,
+      });
+      console.log('[push] Android 通知チャンネルを用意しました');
+    } catch (e) {
+      console.warn('[push] 通知チャンネルの作成に失敗（既定チャンネルで配信されます）:', e);
+    }
+  };
+
   const doRegister = async () => {
     if (registerStarted) return;
     registerStarted = true;
     try {
+      await ensureAndroidChannels();
       // ★ race condition 修正: register() より先に listener を登録する。
       //   register() が即座に registration を発火するケースがあり、後付けだと取りこぼす。
       await PushNotifications.addListener('registration', async (token) => {

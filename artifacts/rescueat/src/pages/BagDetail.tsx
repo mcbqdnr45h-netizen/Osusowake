@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { useRoute, useLocation } from 'wouter';
+import { useRoute, useLocation, Link } from 'wouter';
 import { Layout } from '@/components/Layout';
 import { useGetBag, useCreateReservation, getListAllBagsQueryKey, getGetBagQueryKey } from '@workspace/api-client-react';
 import { getCategoryImage, getCategoryIcon, getImageFromName } from '@/lib/category-utils';
@@ -19,6 +19,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { format, parseISO } from 'date-fns';
 import { WalkTime } from '@/components/WalkTime';
 import { useUserLocation, haversineMeters, metersToWalkMinutes, formatDistanceLabel } from '@/hooks/use-user-location';
+import { optimizedImage, IMG_W } from '@/lib/image-utils';
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
 
@@ -507,7 +508,7 @@ export default function BagDetail() {
               src={
                 heroImgError
                   ? (getImageFromName(bag.title, bag.id) || getCategoryImage(bag.store.category, bag.id))
-                  : (bag.imageUrl || bag.store.imageUrl || getImageFromName(bag.title, bag.id) || getCategoryImage(bag.store.category, bag.id))
+                  : (optimizedImage(bag.imageUrl, IMG_W.hero) || optimizedImage(bag.store.imageUrl, IMG_W.hero) || getImageFromName(bag.title, bag.id) || getCategoryImage(bag.store.category, bag.id))
               }
               alt={bag.store.name}
               loading="eager"
@@ -533,9 +534,12 @@ export default function BagDetail() {
             {/* 店舗ヘッダー — refine-b 風 (タイトルの下に店名 + ⭐ + 📍) */}
             <div className="flex items-center justify-between gap-3 -mt-2">
               <div className="min-w-0 flex-1">
-                <h2 className="font-black text-foreground text-lg leading-tight truncate">
-                  {bag.store.name}
-                </h2>
+                {/* 店名タップ → 店舗ページ（過去の出品・店舗情報・出品リクエスト） 2026-09-13 */}
+                <Link href={`/stores/${bag.store.id}`}>
+                  <h2 className="font-black text-foreground text-lg leading-tight truncate cursor-pointer active:opacity-60 transition-opacity underline decoration-border underline-offset-4 decoration-2">
+                    {bag.store.name}
+                  </h2>
+                </Link>
                 <div className="flex items-center gap-3 mt-1.5 text-[13px] text-muted-foreground font-medium flex-wrap">
                   {reviewData?.avgRating != null && reviewData.count > 0 ? (
                     <span className="flex items-center gap-1">
@@ -570,7 +574,7 @@ export default function BagDetail() {
               {/* 店舗アイコン (右) */}
               {bag.store.iconUrl ? (
                 <div className="w-12 h-12 rounded-2xl overflow-hidden shrink-0 ring-1 ring-border shadow-sm">
-                  <img src={bag.store.iconUrl} alt={bag.store.name} loading="lazy" className="w-full h-full object-cover" />
+                  <img src={optimizedImage(bag.store.iconUrl, IMG_W.icon)} alt={bag.store.name} loading="lazy" className="w-full h-full object-cover" />
                 </div>
               ) : (
                 <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-primary/15 to-primary/5 border border-primary/10 flex items-center justify-center shrink-0">
@@ -808,7 +812,7 @@ export default function BagDetail() {
                     {bag.store.iconUrl ? (
                       <div className="w-12 h-12 rounded-2xl overflow-hidden shrink-0 ring-2 ring-white dark:ring-stone-800 shadow-md">
                         <img
-                          src={bag.store.iconUrl}
+                          src={optimizedImage(bag.store.iconUrl, IMG_W.icon)}
                           alt={bag.store.name}
                           loading="lazy"
                           className="w-full h-full object-cover"

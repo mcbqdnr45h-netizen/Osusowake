@@ -318,8 +318,28 @@ export function GuestRoute({
 }: {
   component: React.ComponentType;
 }) {
-  const { user, profile, isLoading } = useAuth();
+  const { user, profile, isLoading, refreshProfile } = useAuth();
   const [, navigate] = useLocation();
+
+  // ★ 白画面バグの安全網: 登録/ログイン直後は profile 行の作成・取得がレースで
+  //   遅れることがあり、「user あり・profile なし」が続くと下の描画が null のまま
+  //   = 真っ白で固まっていた。profile を定期リトライし、それでも来なければ
+  //   公開ホームへ逃がす (ログイン自体は成立しており Home は profile 不要で動く)。
+  useEffect(() => {
+    if (isLoading || !user || profile) return;
+    let attempts = 0;
+    const timer = setInterval(() => {
+      attempts += 1;
+      if (attempts <= 4) {
+        refreshProfile().catch(() => { /* ignore */ });
+      } else {
+        clearInterval(timer);
+        logNav('GuestRoute(profile timeout fallback)', '/');
+        navigate('/', { replace: true });
+      }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [isLoading, user, profile, refreshProfile, navigate]);
 
   useEffect(() => {
     if (isLoading || !user) return;
@@ -362,8 +382,20 @@ export function GuestRoute({
   }, [isLoading, user, profile, navigate]);
 
   if (isLoading) return null;
-  // ログイン済み (user あり) なら遷移完了まで何も表示しない (再ログイン画面の無限ループ防止)
-  if (user) return null;
+  // ログイン済み (user あり) なら遷移完了までローディングを表示する。
+  // ★ 旧実装の null (真っ白) は登録直後の profile レースで「白画面で固まる」
+  //   と誤認される元凶だった。ロゴ+スピナーで「処理中」であることを見せる。
+  if (user) {
+    return (
+      <div className="min-h-dvh flex flex-col items-center justify-center bg-background gap-4">
+        <img loading="lazy" decoding="async" src={logoUrl} alt="おすそわけ" className="w-16 h-16 rounded-2xl object-cover shadow-lg ring-1 ring-black/5" />
+        <div className="flex items-center gap-2 text-muted-foreground text-sm font-bold">
+          <span className="inline-block w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+          アカウントを準備しています…
+        </div>
+      </div>
+    );
+  }
 
   return <Component />;
 }

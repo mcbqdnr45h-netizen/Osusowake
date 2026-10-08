@@ -11,6 +11,7 @@ import {
 import { useFavorites } from '@/hooks/useFavorites';
 import { useAuth } from '@/contexts/AuthContext';
 import { getCategoryIcon, getCategoryImage, getImageFromName } from '@/lib/category-utils';
+import { optimizedImage, IMG_W } from '@/lib/image-utils';
 import { formatPickupTime, pickupWindowsLabel, getPickupDateLabel } from '@/lib/utils';
 import { useUserLocation, haversineMeters, formatDistanceLabel } from '@/hooks/use-user-location';
 import { getDisplayPrice, getDisplayDiscountPercent } from '@/lib/price-display';
@@ -128,7 +129,7 @@ function CompactCardBody({
           <div className="flex flex-col gap-0.5">
             {isLowStock && (
               <span className="inline-flex items-center gap-0.5 text-[10px] font-black text-rose-500 bg-rose-50
-                px-1.5 py-[2px] rounded-full ring-1 ring-rose-200/70 leading-none w-fit">
+                px-1.5 py-[2px] rounded-full ring-1 ring-rose-200/70 leading-none w-fit whitespace-nowrap">
                 🔥 残り{bag.stockCount}個
               </span>
             )}
@@ -334,9 +335,11 @@ export function BagCard({ bag, compact = false }: BagCardProps) {
   }
 
   const fallbackImg = getImageFromName(bag.title, bag.id) || getCategoryImage(bag.store.category, bag.id);
-  const imgSrc = imgError
+  const rawImgSrc = imgError
     ? fallbackImg
     : (bag.imageUrl || bag.store.imageUrl || fallbackImg);
+  // Supabase の原寸画像 (170〜540KB) をカード表示幅に合わせて配信する (-82%)
+  const imgSrc = optimizedImage(rawImgSrc, IMG_W.thumb) ?? rawImgSrc;
   const storeComment = (bag as any).description as string | null | undefined;
   const trimmedComment = storeComment
     ? storeComment.length > 36 ? storeComment.slice(0, 35) + '…' : storeComment

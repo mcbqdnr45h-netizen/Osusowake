@@ -17,8 +17,8 @@ const PLAY_STORE_APP = 'market://details?id=com.yuhi.osusowake';
 // LINE が標準ブラウザ(Safari)で開き直す → そこでは App Store が正常に開く。
 const EXTERNAL_GET = `${WEB_URL}/get?openExternalBrowser=1`;
 
-// ★ Android 版を Google Play で公開したら true に変更する。
-const ANDROID_PUBLISHED = false;
+// ★ Android 版は 2026-08-03 に Google Play で正式公開済み → Play へ誘導する。
+const ANDROID_PUBLISHED = true;
 
 export default function GetApp() {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';

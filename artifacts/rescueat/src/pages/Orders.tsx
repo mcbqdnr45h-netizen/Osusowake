@@ -11,6 +11,7 @@ import { authedFetch } from '@/lib/authed-fetch';
 import { normalizeBrand } from '@/lib/brand-text';
 import { pickupWindowsLabel } from '@/lib/utils';
 import { motion, AnimatePresence } from 'framer-motion';
+import { optimizedImage, IMG_W } from '@/lib/image-utils';
 import {
   ChevronLeft, Receipt, ShoppingBag, CheckCircle2, XCircle,
   Clock, Store, Printer, Share2, ChevronRight, X,
@@ -556,7 +557,7 @@ export default function Orders() {
   const userId = useUserId() || '';
   const { profile } = useAuth();
   const [, navigate] = useLocation();
-  const { data: reservations, isLoading } = useListReservations(
+  const { data: reservations, isLoading, isError, refetch } = useListReservations(
     { userId },
     {
       query: {
@@ -659,6 +660,21 @@ export default function Orders() {
             <div className="flex items-center justify-center py-16">
               <div className="w-8 h-8 border-3 border-primary border-t-transparent rounded-full animate-spin" />
             </div>
+          ) : isError ? (
+            /* ★ 通信エラーを「注文なし」と混同させない。 誤表示すると
+               「注文が消えた」とユーザーを不安にさせるため、 明示＋再試行を出す */
+            <div className="bg-secondary/50 rounded-2xl p-10 text-center">
+              <ShoppingBag className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
+              <p className="font-bold text-muted-foreground text-sm">読み込みに失敗しました</p>
+              <p className="text-xs text-muted-foreground mt-1">通信環境をご確認のうえ、もう一度お試しください</p>
+              <button
+                type="button"
+                onClick={() => refetch()}
+                className="mt-4 inline-flex items-center gap-1.5 bg-primary text-primary-foreground font-bold text-sm px-5 py-2.5 rounded-xl active:scale-[0.98] transition-transform"
+              >
+                再読み込み
+              </button>
+            </div>
           ) : filtered.length === 0 ? (
             <div className="bg-secondary/50 rounded-2xl p-10 text-center">
               <ShoppingBag className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
@@ -684,7 +700,7 @@ export default function Orders() {
                       {/* Store image */}
                       <div className="w-12 h-12 bg-muted rounded-xl overflow-hidden shrink-0">
                         <img
-                          src={r.store?.iconUrl || r.store?.imageUrl || 'https://images.unsplash.com/photo-1542838132-92c53300491e?w=200&q=70'}
+                          src={optimizedImage(r.store?.iconUrl, IMG_W.icon) || optimizedImage(r.store?.imageUrl, IMG_W.icon) || 'https://images.unsplash.com/photo-1542838132-92c53300491e?w=200&q=70'}
                           alt=""
                           className="w-full h-full object-cover"
                         />

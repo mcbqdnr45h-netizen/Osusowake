@@ -16,3 +16,29 @@ export function roundTo10(n: number): number {
 export function computeUserTotal(merchandiseJpy: number): number {
   return roundTo10(merchandiseJpy * (1 + USER_SERVICE_FEE_RATE));
 }
+
+// ─── 手数料・送金額の分割（単一ソース）─────────────────────────────────────
+// ★ payment.ts の calcFees と完全に同一のロジック。 変更するときは両方を必ず揃える
+//   （売上明細書と実際の Stripe 送金額を1円もズレさせないため）。
+export const PLATFORM_FEE_RATE = 0.20; // 店舗手数料 20%
+export const STRIPE_FEE_RATE   = 0.036; // Stripe 決済手数料 3.6%
+
+/**
+ * ユーザー支払合計(total)と商品代金(merchandise)から、手数料と送金額を計算する。
+ *   shopGross          = floor(merchandise × 0.80)         店舗売上(20%控除後・Stripe手数料前)
+ *   stripeFee          = round(total × 0.036)              Stripe決済手数料
+ *   shopTransferAmount = shopGross - stripeFee             店舗への実送金額
+ *   platformRevenue    = total - shopGross                 プラットフォーム取り分(Stripe手数料前)
+ */
+export function calcFees(totalAmountJpy: number, merchandiseJpy: number): {
+  platformRevenue: number;
+  stripeFee: number;
+  shopTransferAmount: number;
+  shopGross: number;
+} {
+  const shopGross          = Math.floor(merchandiseJpy * (1 - PLATFORM_FEE_RATE));
+  const stripeFee          = Math.round(totalAmountJpy * STRIPE_FEE_RATE);
+  const shopTransferAmount = shopGross - stripeFee;
+  const platformRevenue    = totalAmountJpy - shopGross;
+  return { platformRevenue, stripeFee, shopTransferAmount, shopGross };
+}

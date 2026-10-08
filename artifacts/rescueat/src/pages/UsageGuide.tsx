@@ -216,7 +216,7 @@ export default function UsageGuide() {
 
   return (
     <Layout showBottomNav>
-      <div className="max-w-md md:max-w-2xl mx-auto px-4 pt-4 pb-28">
+      <div className="w-full max-w-md md:max-w-2xl mx-auto px-4 pt-4 pb-28">
         <button
           onClick={() => window.history.back()}
           className="flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors mb-4 -ml-1 tap-opacity"

@@ -532,7 +532,7 @@ export default function StoreOwnerDashboard() {
       {/* ── ヘッダー ── */}
       <header className="sticky top-0 z-40 bg-background/90 backdrop-blur-xl border-b border-border"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}>
-        <div className="max-w-2xl mx-auto px-4 h-14 flex items-center justify-between">
+        <div className="w-full max-w-2xl mx-auto px-4 h-14 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 bg-primary/10 rounded-lg flex items-center justify-center">
               <Store className="w-4 h-4 text-primary" />
@@ -555,7 +555,7 @@ export default function StoreOwnerDashboard() {
         </div>
       </header>
 
-      <div className="max-w-2xl mx-auto px-4 py-4 space-y-4">
+      <div className="w-full max-w-2xl mx-auto px-4 py-4 space-y-4">
 
         {/* ── エラー ── */}
         <AnimatePresence>

@@ -9,6 +9,7 @@ import { eq, gt, and, sql } from 'drizzle-orm';
 import { sendPushToUsers, sendApnsPushToRawTokens, sendWebPushToRawSubs, getStoreOrAdminUserIds, type PushPayload } from './push.js';
 import { supabaseAdmin } from './supabase.js';
 import { bagVisibleSql } from './bag-visibility.js';
+import { claimOncePerDay } from './once-per-day.js';
 
 /**
  * 毎日2回（昼前 11:45・夕方 16:30 JST）全登録ユーザーにエンゲージメント通知を送る。
@@ -81,7 +82,7 @@ async function getOptInUserIds(): Promise<Set<string>> {
 }
 
 /** プッシュ登録済み かつ opt-in のユーザーIDを重複なしで返す */
-async function getAllSubscribedUserIds(): Promise<string[]> {
+export async function getAllSubscribedUserIds(): Promise<string[]> {
   const [[webRows, apnsRows], optInIds, storeOrAdmin] = await Promise.all([
     Promise.all([
       db.select({ userId: webPushSubscriptionsTable.userId }).from(webPushSubscriptionsTable),
@@ -200,6 +201,12 @@ export async function runDailyEngagementNotifications(): Promise<void> {
 
     const logKey = `${dateStr}:${slot.key}`;
     if (sentLog.has(logKey)) continue; // 今日このスロットは送済み
+    // ★ メモリだけだと再起動で記録が消えて同じスロットを再送してしまう(2026-08-06)。
+    //   DBで「その日そのスロット1回」を保証する。
+    if (!(await claimOncePerDay(`daily-${slot.key}`, dateStr))) {
+      sentLog.add(logKey);
+      continue;
+    }
     sentLog.add(logKey);
 
     try {

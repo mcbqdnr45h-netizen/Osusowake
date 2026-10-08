@@ -1,9 +1,9 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { surpriseBagsTable, storesTable, reservationsTable, favoritesTable, notificationsTable, reviewsTable } from "@workspace/db/schema";
-import { eq, and, ne, sql, like } from "drizzle-orm";
+import { eq, and, ne, sql, like, desc, inArray } from "drizzle-orm";
 import { releaseExpiredCartReservations } from "./reservations";
-import { sendPushToUsers, filterFavoriteUpdateOptIn } from "../lib/push.js";
+import { sendPushToUsers, filterFavoriteUpdateOptIn, getStoreOrAdminUserIds } from "../lib/push.js";
 import { broadcastNewListing } from "../lib/new-listing-broadcast.js";
 import { computeUserTotal } from "../lib/pricing.js";
 import { requireAuth, requireStoreOwner } from "../middlewares/auth.js";
@@ -31,7 +31,7 @@ const router: IRouter = Router();
 async function deleteNewBagNotifications(bagId: number): Promise<void> {
   try {
     await db.delete(notificationsTable).where(and(
-      eq(notificationsTable.type, "new_bag"),
+      inArray(notificationsTable.type, ["new_bag", "recurring_fan"]),
       like(notificationsTable.body, `%[bag:${bagId}]%`),
     ));
   } catch (e) {
@@ -212,6 +212,8 @@ router.get("/bags", async (_req, res) => {
         isActive: surpriseBagsTable.isActive,
         createdAt: surpriseBagsTable.createdAt,
         pickupNextDay: surpriseBagsTable.pickupNextDay,
+        // 手動出品 or 定期出品(自動公開) の区別。発見ページで手動出品を優先表示するため (2026-09-30 マロ指示)
+        isRecurring: sql<boolean>`${surpriseBagsTable.recurringListingId} IS NOT NULL`.as('is_recurring'),
         // ★ PII 除外: storesTable 全カラムではなく公開フィールドのみ取得
         store: publicStoreCols,
         storeAvgRating: sql<number | null>`(SELECT ROUND(AVG(r.rating)::numeric, 1) FROM reviews r WHERE r.store_id = ${storesTable.id})`,
@@ -384,6 +386,12 @@ router.get("/bags/:bagId", async (req, res) => {
     void _omit;
     res.json({ ...publicBag, store: { ...publicBag.store, totalBagsAvailable: publicBag.stockCount } });
   } catch (err) {
+    // 不正な bagId (数値でない等) は 400。 500 にするとクローラの不正URLでも
+    // サーバーエラー扱いになり監視ノイズになる。 (zod直接依存が無いためname判定)
+    if ((err as any)?.name === "ZodError" || (err as any)?.name === "$ZodError") {
+      res.status(400).json({ error: "bad_request", message: "Invalid bagId" });
+      return;
+    }
     console.error(err);
     res.status(500).json({ error: "internal_error", message: "Failed to fetch bag" });
   }
@@ -392,10 +400,15 @@ router.get("/bags/:bagId", async (req, res) => {
 router.get("/stores/:storeId/bags", async (req, res) => {
   try {
     const { storeId } = ListStoreBagsParams.parse(req.params);
+    // ★ 2026-08-12: ORDER BY が無く、DBが返す順（＝物理的な並びで、更新のたびに変わる）
+    //   そのまま返していた。店の「出品・在庫管理」は100件を超えるため、8月の次に5月が
+    //   来るような並びになり、目的の出品を探せなかった（マロ報告）。新しい順に固定する。
+    //   createdAt が同値のときは id で最終決着させ、毎回まったく同じ並びを返す。
     const bags = await db
       .select()
       .from(surpriseBagsTable)
-      .where(eq(surpriseBagsTable.storeId, storeId));
+      .where(eq(surpriseBagsTable.storeId, storeId))
+      .orderBy(desc(surpriseBagsTable.createdAt), desc(surpriseBagsTable.id));
 
     // ★ best-effort なオーナー判定。
     //   `hidden_from_quick_publish` はオーナー本人の UI 設定（クイック出品リストの非表示フラグ）であり、
@@ -538,7 +551,16 @@ router.post("/stores/:storeId/bags", requireAuth, requireStoreOwner, async (req,
         );
         // ★ DB通知(ベル)は全お気に入りユーザーに残す。プッシュ配信だけ
         //   「お気に入り店舗の更新」通知OFFのユーザーを除外する(設定を本当に効かせる)。
-        const pushRecipients = await filterFavoriteUpdateOptIn(fanRows.map(f => f.userId));
+        // ★★ 2026-08-06 追加: 【店舗オーナー/管理者にはプッシュを送らない】。
+        //   店の端末は注文通知を受け取るためのものであり、そこに他店の出品通知が
+        //   混ざると自店の注文を見落とす（店舗様から実際に報告あり）。
+        //   全体配信(🍱)と日次発見通知は既に同じ理由で除外済みで、
+        //   お気に入り経由だけが抜けていた。ベル(アプリ内)には残るので情報は失われない。
+        const storeOrAdminIds = await getStoreOrAdminUserIds();
+        const consumerFanIds = fanRows
+          .map(f => f.userId)
+          .filter(id => !storeOrAdminIds.has(id));
+        const pushRecipients = await filterFavoriteUpdateOptIn(consumerFanIds);
         console.log(`[bags] 新出品通知ブロック開始 bag=${bag?.id} fans=${fanRows.length} push対象=${pushRecipients.length}`);
         if (pushRecipients.length > 0) {
           await sendPushToUsers(pushRecipients, {

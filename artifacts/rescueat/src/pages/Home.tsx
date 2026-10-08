@@ -476,8 +476,19 @@ export default function Home() {
     return [...arr.filter(b => !isDemoted(b)), ...demoted];
   }, []);
 
+  // ── 手動出品を定期出品（自動公開）より前へ (2026-09-30 マロ指示) ──
+  //   今日わざわざ手で出品してくれた店を先に見せる。相対順序は保つ安定パーティション。
+  //   「おすすめ順」（default）のときだけ適用し、時間順などの明示ソートは崩さない。
+  const manualFirst = useCallback((arr: SurpriseBagWithStore[]) => {
+    if (sortKey !== 'default') return arr;
+    const isRec = (b: SurpriseBagWithStore) => !!(b as { isRecurring?: boolean }).isRecurring;
+    const recurring = arr.filter(isRec);
+    if (recurring.length === 0) return arr;
+    return [...arr.filter(b => !isRec(b)), ...recurring];
+  }, [sortKey]);
+
   // ソート済みベース（セクション・全体グリッド共通で使う）
-  const sortedVisibleBags = useMemo(() => demoteToBottom(applySortKey(visibleBags)), [visibleBags, applySortKey, demoteToBottom]);
+  const sortedVisibleBags = useMemo(() => demoteToBottom(manualFirst(applySortKey(visibleBags))), [visibleBags, applySortKey, manualFirst, demoteToBottom]);
 
   // 日次シードは1日中固定（ページリフレッシュしても同じ順番）
   const dailySeed = useMemo(() => getDailySeed(), []);
@@ -568,7 +579,7 @@ export default function Home() {
     }
     if (activeCategory !== 'all') result = result.filter(b => normalizeCategory(b.category) === activeCategory);
     // ★ 表示価格ベースで判定 (バッジ表記と必ず一致させる):
-    //   - halfOff: カードの「% OFF」 バッジが getDisplayDiscountPercent ベースなのでフィルタも揃える
+    //   - halfOff: カードの「% OFF」 バッジと同じ getDisplayDiscountPercent（販売価格ベース）で判定
     //   - under500: ¥500以下チップは「お客様お支払い金額」 が ¥500 以下のもののみ含める
     if (halfOff)  result = result.filter(b => getDisplayDiscountPercent(b.originalPrice, b.discountedPrice) >= 50);
     if (under500) result = result.filter(b => getDisplayPrice(b.discountedPrice) <= 500);
@@ -608,11 +619,15 @@ export default function Home() {
   }, [sortedVisibleBags, remainingMs]);
 
   // ── ② 今日のおすすめ ── デフォルト時は日次シードシャッフルで全店舗公平に露出
+  //   ★ 2026-09-30 マロ指示: 手動出品（今日わざわざ手で出してくれた店）を定期出品（自動公開）より
+  //     先頭に寄せる。各グループ内の公平シャッフルは維持。定期は手動の後ろに続けて枠を埋める。
   const recommendedBags = useMemo(() => {
     const filtered = sortedVisibleBags.filter(b => b.stockCount > 0 &&
       !getPickupDateLabel((b as { createdAt?: string }).createdAt, (b as { pickupNextDay?: boolean }).pickupNextDay).isTomorrow);
     if (sortKey === 'default') {
-      return diversify(filtered, 0).slice(0, 8);
+      const manual    = filtered.filter(b => !(b as { isRecurring?: boolean }).isRecurring);
+      const recurring = filtered.filter(b => (b as { isRecurring?: boolean }).isRecurring);
+      return [...diversify(manual, 0), ...diversify(recurring, 0)].slice(0, 8);
     }
     return applySortKey(filtered).slice(0, 8);
   }, [sortedVisibleBags, applySortKey, sortKey, diversify]);
@@ -662,7 +677,7 @@ export default function Home() {
   }, [sortedVisibleBags, applySortKey, sortKey, diversify, isTomorrowBag]);
 
   // ── ⑤ 半額以上のお得（discount >= 50%） ──
-  //   ★ カードの「% OFF」 バッジは getDisplayDiscountPercent (表示価格ベース) なので、
+  //   ★ カードの「% OFF」 バッジと同じ getDisplayDiscountPercent (販売価格ベース) で、
   //      セクション抽出条件もそれと揃えてバッジと矛盾しないようにする。
   const halfOffSectionBags = useMemo(() => {
     const filtered = sortedVisibleBags.filter(b =>
@@ -1267,12 +1282,25 @@ export default function Home() {
                           : 'お近くのお店がおすそわけを準備中です！'
                         }
                       </p>
-                      {inStockOnly && (
-                        <button onClick={() => setInStockOnly(false)}
-                          className="px-5 py-2 bg-secondary text-foreground rounded-2xl text-sm font-bold border border-border">
-                          すべて表示する
+                      {/* ★ 空の画面を行き止まりにしない。
+                          おすそわけは「その日に余ったもの」を出すため事前予告はできないが、
+                          出品が増える時間帯を伝え、 お店を見に行く導線を出すことで再訪につなげる。 */}
+                      <div className="w-full max-w-[320px] space-y-2">
+                        <div className="text-[12px] text-muted-foreground/90 bg-secondary/60 border border-border rounded-xl px-3 py-2 leading-relaxed">
+                          🌅 おすそわけは<strong>朝〜お昼ごろ</strong>に出そろうことが多いです。
+                          <br />その時間帯にのぞいてみてください。
+                        </div>
+                        {inStockOnly && (
+                          <button onClick={() => setInStockOnly(false)}
+                            className="w-full px-5 py-2.5 bg-secondary text-foreground rounded-2xl text-sm font-bold border border-border active:scale-[0.98] transition-transform">
+                            すべて表示する
+                          </button>
+                        )}
+                        <button onClick={() => navigate('/map')}
+                          className="w-full px-5 py-2.5 bg-primary text-primary-foreground rounded-2xl text-sm font-black active:scale-[0.98] transition-transform">
+                          近くのお店をさがす
                         </button>
-                      )}
+                      </div>
                     </div>
                   ) : (
                     <motion.div

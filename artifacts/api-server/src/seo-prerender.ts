@@ -79,7 +79,9 @@ function homeMeta(): SeoMeta {
         "@type": "Organization",
         name: "おすそわけ",
         url: BASE,
-        logo: `${BASE}/images/logo.jpg`,
+        // ★ 旧 logo.jpg は縦長(1050x1397)で、Google が favicon 代替として拾うと
+        //   検索結果のアイコンが潰れて表示されていた。 正方形のアプリアイコンに統一。
+        logo: `${BASE}/icons/icon-512-full.png`,
         description,
         sameAs: [],
       },

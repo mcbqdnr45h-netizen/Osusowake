@@ -3,4 +3,6 @@
     <!-- 起動スプラッシュ背景。 Web #__splash / Capacitor splash と同色に揃え、
          Android 12+ システムスプラッシュのグレー背景を防ぐ。 -->
     <color name="splashBg">#FBF8F4</color>
+    <!-- 通知アイコンの着色 (アプリアイコンのブランドピンク) -->
+    <color name="notificationIconColor">#F4727C</color>
 </resources>

@@ -1,6 +1,6 @@
 // ⚠️ デプロイ時にこの数字を必ず上げること（v4 → v5 → v6 ...）
 // バンプしないと iOS / PWA が古いキャッシュを掴み続けます
-const CACHE_NAME = 'osusowake-v30';
+const CACHE_NAME = 'osusowake-v32';
 const BASE = '';
 
 const PRECACHE_URLS = [
@@ -119,9 +119,31 @@ self.addEventListener('fetch', (event) => {
 
       // バックグラウンド revalidate（常に実行）
       const networkFetch = fetch(request)
-        .then((response) => {
+        .then(async (response) => {
           if (response && response.status === 200 && response.type !== 'opaque') {
-            cache.put(request, response.clone());
+            const forCache = response.clone();
+            // ★ 2026-08-04 白画面の根本対策:
+            //   旧実装は新しい HTML を保存するだけで反映は「次回起動時」だった。
+            //   その間アプリは古い HTML を使い続け、デプロイで消えた JS チャンクを
+            //   404 で引いて白画面のまま固まっていた（今日のように何度もデプロイすると必発）。
+            //   新旧の entry スクリプト名を比較し、変わっていたら即クライアントへ通知して
+            //   その場でリロードさせる。
+            try {
+              if (cached) {
+                const [newText, oldText] = await Promise.all([
+                  response.clone().text(),
+                  cached.clone().text(),
+                ]);
+                const pickEntry = (t) => (t.match(/assets\/index-[A-Za-z0-9_-]+\.js/) || [''])[0];
+                const nv = pickEntry(newText);
+                const ov = pickEntry(oldText);
+                if (nv && ov && nv !== ov) {
+                  const wins = await self.clients.matchAll({ type: 'window' });
+                  wins.forEach((c) => c.postMessage({ type: 'NEW_VERSION' }));
+                }
+              }
+            } catch (_) { /* 比較失敗時は従来どおり次回反映にフォールバック */ }
+            cache.put(request, forCache);
           }
           return response;
         })

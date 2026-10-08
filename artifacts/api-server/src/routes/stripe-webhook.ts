@@ -642,7 +642,7 @@ router.post("/stripe-webhook", async (req: Request, res: Response) => {
           }
           let ownerPushSent = 0;
           if (await storeOrderPushEnabled(store.ownerId)) {
-            ownerPushSent = await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${row.id}`, url: "/store/orders" });
+            ownerPushSent = await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${row.id}`, url: "/store/dashboard", channelId: "orders" });
           }
           // Web Push 補完: ブラウザのみ利用中・通知拒否中のオーナーに必ず届くようメール併用。
           //   ★ push が1台も届かなかった場合 (ownerPushSent===0) は opt-out を無視して必ず送る
@@ -871,14 +871,18 @@ router.post("/stripe-webhook", async (req: Request, res: Response) => {
 
     // ── 自動承認設定を確認（デフォルトON）────────────────────────────────────
     const autoApprove = (await getSetting('auto_approve_stripe_verified', 'true')) === 'true';
+    // ★ 2026-08-04 修正: 旧実装は account.updated を受けるだけで Stripe の実状態を
+    //   見ずに承認していた（テスト店が最小入力→入金停止のままマップ公開される事故）。
+    //   自動承認は「Stripeが完全にOKした店 = 決済◯かつ入金◯」の時だけ発動する。
+    const stripeFullyVerified = account.charges_enabled === true && account.payouts_enabled === true;
 
     // ── 自動承認モード ON → 審査待ちなら即承認 ──────────────────────────────
     // 'applied' = 口座登録済みでStripe審査待ち（最も一般的なケース）
     // 'pending' / 'pending_review' = 旧ステータス互換
-    if (autoApprove && (store.status === 'applied' || store.status === 'pending_review' || store.status === 'pending')) {
+    if (autoApprove && stripeFullyVerified && (store.status === 'applied' || store.status === 'pending_review' || store.status === 'pending')) {
       await db
         .update(storesTable)
-        .set({ status: 'approved' as any, isActive: true, stripeChargesEnabled: true })
+        .set({ status: 'approved' as any, isActive: true, stripeChargesEnabled: true, stripePayoutsEnabled: true })
         .where(eq(storesTable.id, store.id));
 
       console.log(`[stripe-webhook] ✅ 自動承認: store ${store.id} (${store.name})`);

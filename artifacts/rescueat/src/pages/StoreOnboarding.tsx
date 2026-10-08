@@ -604,7 +604,7 @@ export default function StoreOnboarding() {
 
   return (
     <Layout showBottomNav={false} hideHeader={true}>
-      <div className="max-w-xl md:max-w-3xl mx-auto px-4 py-6">
+      <div className="w-full max-w-xl md:max-w-3xl mx-auto px-4 py-6">
 
         {/* ヘッダー */}
         <div className="flex items-center gap-3 mb-6">
@@ -721,7 +721,7 @@ export default function StoreOnboarding() {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/jpeg,image/png,image/webp"
+                accept="image/*"
                 className="sr-only"
                 onChange={e => {
                   const file = e.target.files?.[0];
@@ -755,7 +755,7 @@ export default function StoreOnboarding() {
             <input
               ref={iconFileRef}
               type="file"
-              accept="image/jpeg,image/png,image/webp"
+              accept="image/*"
               className="hidden"
               onChange={handleIconFile}
             />
@@ -918,7 +918,7 @@ export default function StoreOnboarding() {
               <input
                 ref={bizLicenseInputRef}
                 type="file"
-                accept="image/jpeg,image/png,image/webp,application/pdf"
+                accept="image/*,application/pdf"
                 className="hidden"
                 onChange={handleBizLicenseFile}
               />

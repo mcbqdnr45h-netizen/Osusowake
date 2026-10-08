@@ -39,18 +39,34 @@ export async function filterFavoriteUpdateOptIn(userIds: string[]): Promise<stri
  *     絶対に止めない方向に倒す。 稀に店舗へ発見通知が漏れるのは許容 (害小)。
  */
 export async function getStoreOrAdminUserIds(): Promise<Set<string>> {
+  const ids = new Set<string>();
+  // ① role で判定（管理者 / role が正しく store_owner になっている店主）
   try {
     const { data } = await supabaseAdmin
       .from('users')
       .select('id')
       .neq('role', 'customer');
-    const ids = new Set<string>();
     for (const row of data ?? []) if (row.id) ids.add(row.id as string);
-    return ids;
   } catch (e) {
-    console.error('[push] getStoreOrAdminUserIds error (fail-open):', e);
-    return new Set<string>();
+    console.error('[push] getStoreOrAdminUserIds(role) error (fail-open):', e);
   }
+  // ② ★ 店を所有している事実でも判定する。
+  //    users.role が 'customer' のまま残っている店主が実在するため
+  //    (だから /api/stores/fix-owner-role による自動修復が用意されている)、
+  //    role だけで判定すると その店主に お客さん向けの発見通知が届いてしまう。
+  //    role の状態に関係なく「店を持っている人」を確実に除外する。
+  try {
+    const { data } = await supabaseAdmin
+      .from('stores')
+      .select('owner_id');
+    for (const row of data ?? []) {
+      const owner = (row as { owner_id?: string | null }).owner_id;
+      if (owner) ids.add(owner);
+    }
+  } catch (e) {
+    console.error('[push] getStoreOrAdminUserIds(stores) error (fail-open):', e);
+  }
+  return ids;
 }
 
 /**
@@ -140,6 +156,8 @@ if (process.env.APNS_PRIVATE_KEY && process.env.APNS_KEY_ID && process.env.APNS_
 }
 
 export interface PushPayload {
+  /** Android の通知チャンネル。'orders'=重要度MAX / 'general'=通常 (既定) */
+  channelId?: 'orders' | 'general';
   title: string;
   body:  string;
   icon?: string;
@@ -278,8 +296,9 @@ export async function setApnsBadgeForUser(userId: string, badge: number): Promis
   if (regs.length === 0) return;
 
   const n = new apn.Notification();
+  const badgeValue   = Math.max(0, Math.trunc(badge) || 0);
   n.expiry           = Math.floor(Date.now() / 1000) + 3600;
-  n.badge            = Math.max(0, Math.trunc(badge) || 0);
+  n.badge            = badgeValue;
   n.topic            = APNS_BUNDLE_ID;
   n.contentAvailable = true;        // サイレント(背景)更新。alert/sound は付けない
   n.pushType         = 'background';
@@ -290,7 +309,10 @@ export async function setApnsBadgeForUser(userId: string, badge: number): Promis
   async function trySend(provider: apn.Provider, label: 'prod' | 'sandbox', toks: string[]) {
     try {
       const r = await provider.send(n, toks);
-      console.log(`[push] badge[${label}] user=${uShort} badge=${n.badge} sent=${r.sent.length} failed=${r.failed.length}`);
+      // ★ node-apn の badge は setter しか無く、n.badge を読むと常に undefined になる。
+      //   ログが「badge=undefined」に見えて不具合と誤読されるので、渡した値をそのまま出す。
+      //   （実際の送信内容 aps.badge には正しく入っている）
+      console.log(`[push] badge[${label}] user=${uShort} badge=${badgeValue} sent=${r.sent.length} failed=${r.failed.length}`);
       return r;
     } catch (err: any) {
       console.error(`[push] badge[${label}] 例外 user=${uShort}:`, err?.message ?? err);
@@ -523,6 +545,11 @@ async function sendFcmPushToUser(userId: string, payload: PushPayload): Promise<
           notification: {
             tag:       payload.tag,
             clickAction: 'FCM_PLUGIN_ACTIVITY', // Capacitor Push が拾うアクション
+            // ★ 2026-08-12 チャンネル指定。注文は重要度MAX(=画面上部にバナー)、
+            //   それ以外は通常。端末にチャンネルが無い場合 FCM は既定チャンネルに
+            //   フォールバックするので、古いアプリでも通知が消えることはない。
+            channelId: payload.channelId ?? 'general',
+            sound: 'default',
           },
         },
       });
@@ -573,4 +600,15 @@ export async function sendWebPushToUsers(userIds: string[], payload: PushPayload
 export async function sendPushToUsers(userIds: string[], payload: PushPayload): Promise<void> {
   if (userIds.length === 0) return;
   await Promise.allSettled(userIds.map((id) => sendPushToUser(id, payload)));
+}
+
+// ★ 通知の稼働状況を管理画面から確認できるようにするための公開フラグ (2026-08-06)
+//   「通知バグ起きてないよな」を毎回ログを掘って確かめるのは非現実的なので、
+//   設定の有無を外から読めるようにしておく。値そのもの(鍵)は絶対に返さない。
+export function getPushConfigStatus() {
+  return {
+    apns:    apnsProvider !== null,   // iPhone
+    fcm:     fcmApp !== null,         // Android
+    webPush: Boolean(vapidPublicKey && vapidPrivateKey),
+  };
 }

@@ -5,6 +5,7 @@ import { useMyStoresContext } from '@/contexts/MyStoresContext';
 import { useListReservations, getListReservationsQueryKey } from '@workspace/api-client-react';
 import { BarChart2, TrendingUp, Package2, CheckCircle2, Loader2, AlertCircle } from 'lucide-react';
 import { StoreBalanceCard } from '@/components/StoreBalanceCard';
+import { StatementDownloadCard } from '@/components/StatementDownloadCard';
 import { isToday, parseISO, format, startOfMonth } from 'date-fns';
 import { ja } from 'date-fns/locale';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
@@ -113,7 +114,7 @@ export default function StoreSalesPage() {
 
   return (
     <StoreLayout>
-      <div className="max-w-2xl mx-auto w-full px-4 py-5 space-y-5">
+      <div className="w-full max-w-2xl mx-auto w-full px-4 py-5 space-y-5">
 
         {/* ── ヘッダー ── */}
         <div>
@@ -167,6 +168,11 @@ export default function StoreSalesPage() {
               </p>
             </div>
           </div>
+        )}
+
+        {/* ── 売上明細書ダウンロード（承認済み店舗のみ） ── */}
+        {storeId && canShowBalance && (
+          <StatementDownloadCard storeId={storeId} />
         )}
 
         {/* ── 直近7日間の売上グラフ ── */}

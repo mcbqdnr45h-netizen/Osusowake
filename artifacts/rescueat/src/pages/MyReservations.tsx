@@ -8,12 +8,14 @@ import { useQueryClient } from '@tanstack/react-query';
 import { format, parseISO, isToday, isYesterday } from 'date-fns';
 import { formatPickupTime, effectivePickupDate } from '@/lib/utils';
 import { ja } from 'date-fns/locale';
-import { Ticket, Clock, Star, PenLine, X, CheckCircle2, CreditCard, Ban, Trash2, Package, AlertCircle, RefreshCcw } from 'lucide-react';
+import { Ticket, Clock, Star, PenLine, X, CheckCircle2, CreditCard, Ban, Trash2, Package, AlertCircle, RefreshCcw, Eye } from 'lucide-react';
 import { Link, useLocation } from 'wouter';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useToast } from '@/hooks/use-toast';
 import { ReviewModal } from '@/components/ReviewModal';
 import type { ReviewTarget } from '@/components/ReviewModal';
+import { PurchasedBagSheet, type PurchasedBagData, type PurchasedBagStatus } from '@/components/PurchasedBagSheet';
+import { optimizedImage, IMG_W } from '@/lib/image-utils';
 
 function isPickupExpired(pickupEnd?: string | null, createdAt?: string): boolean {
   if (!pickupEnd) {
@@ -70,6 +72,12 @@ export default function MyReservations() {
 
   const [reviewTarget,  setReviewTarget]  = useState<ReviewTarget | null>(null);
   const [reviewedIds,   setReviewedIds]   = useState<Set<number>>(new Set());
+  // 「購入した商品の詳細」シート: 予約に含まれる bag データをそのまま表示する。
+  //   picked_up 以外でも「あの日買ったの何やったっけ」を後から見返せるようにするため、
+  //   任意のステータスから開けるようにしておく。
+  //   ★ 開いてる最中に予約データが更新されても最新値を追従できるように、
+  //     state には予約 ID だけ保持し、レンダー時に reservations 配列から引き直す。
+  const [detailReservationId, setDetailReservationId] = useState<number | null>(null);
   // dismiss は「自分の一覧から非表示にしたい」操作。サーバー側の予約状態は変えない
   // (受取期限切れの paid 予約を cancel API に流すと在庫が誤復元される事故になる)。
   // localStorage にユーザー単位で永続化し、リロードしても消えない動作を再現する。
@@ -150,6 +158,11 @@ export default function MyReservations() {
         badge: 'bg-emerald-50 text-emerald-600 border border-emerald-200',
         bar: 'bg-emerald-400',
       };
+      case 'cancelled_refunded': return {
+        label: '不成立・返金済み', icon: <Ban className="w-3 h-3" />,
+        badge: 'bg-red-100 text-red-600 border border-red-300',
+        bar: 'bg-red-400',
+      };
       case 'cancelled': return {
         label: 'キャンセル', icon: <Ban className="w-3 h-3" />,
         badge: 'bg-red-50 text-red-500 border border-red-200',
@@ -212,6 +225,31 @@ export default function MyReservations() {
           />
         )}
       </AnimatePresence>
+
+      {/* 購入した商品の詳細シート: 予約に含まれる bag データをそのまま表示。
+         受取完了後も商品情報を見返せるようにする。
+         ★ state は予約 ID のみ保持し、レンダー時に reservations 配列から最新値を引く。
+           シート開いてる最中に status が pending→confirmed に変わっても即座に追従する。 */}
+      {(() => {
+        const detail = detailReservationId != null
+          ? reservations?.find((r) => r.id === detailReservationId)
+          : null;
+        const detailExpired = detail
+          ? isPickupExpired(detail.bag?.pickupEnd, detail.createdAt)
+          : false;
+        return (
+          <PurchasedBagSheet
+            open={detailReservationId !== null}
+            onOpenChange={(o) => { if (!o) setDetailReservationId(null); }}
+            bag={detail?.bag as PurchasedBagData | undefined}
+            storeName={detail?.store?.name}
+            quantity={detail?.quantity ?? 1}
+            purchasedAt={detail?.createdAt ?? new Date().toISOString()}
+            status={detail?.status as PurchasedBagStatus | undefined}
+            expired={detailExpired}
+          />
+        );
+      })()}
 
       {/* 確認ダイアログ (履歴削除 / 予約キャンセル 共通)
           ★ 重要: BottomNav が z-50 で fixed 配置されているため、 モーダルも z-50 だと
@@ -308,7 +346,15 @@ export default function MyReservations() {
           const sorted = [...(reservations ?? [])]
             .filter(r => {
               if (dismissedIds.has(r.id)) return false;
-              if (r.status === 'cancelled')   return false;
+              if (r.status === 'cancelled') {
+                // ★ 2026-08-21: 在庫切れ等で自動返金になった「購入不成立」は、
+                //   本人が気づかないままお店に行ってしまう事故が実際に起きたため、
+                //   72時間は一覧に残して明確に伝える（×で消せる）。
+                //   自分で取り消したキャンセル(unpaidのまま)は従来どおり出さない。
+                const refunded = (r as any).paymentStatus === 'refunded';
+                const recent = Date.now() - new Date(r.createdAt).getTime() < 72 * 3600 * 1000;
+                return refunded && recent;
+              }
               return true;
             })
             // 新しい順（降順）
@@ -359,10 +405,11 @@ export default function MyReservations() {
                     <div className="divide-y divide-border/30">
                       {group.items.map((res, i) => {
                         const expired         = isPickupExpired(res.bag?.pickupEnd, res.createdAt);
-                        const cfg             = statusConfig(res.status, expired);
+                        const isRefundedCancel = res.status === 'cancelled' && (res as any).paymentStatus === 'refunded';
+                        const cfg             = statusConfig(isRefundedCancel ? 'cancelled_refunded' : res.status, expired);
                         const alreadyReviewed = (res as any).hasReview || reviewedIds.has(res.id);
                         const isFaded         = res.status === 'picked_up' || ((res.status === 'pending' || res.status === 'confirmed') && expired);
-                        const showDismiss     = (res.status === 'pending' || res.status === 'confirmed') && expired;
+                        const showDismiss     = ((res.status === 'pending' || res.status === 'confirmed') && expired) || isRefundedCancel;
                         const storeId         = res.storeId ?? res.store?.id;
 
                         return (
@@ -385,7 +432,7 @@ export default function MyReservations() {
                               <Link href={`/stores/${storeId}`} className="shrink-0">
                                 {(res.store?.iconUrl || res.store?.imageUrl) ? (
                                   <img
-                                    src={res.store.iconUrl || res.store.imageUrl}
+                                    src={optimizedImage(res.store.iconUrl, IMG_W.icon) || optimizedImage(res.store.imageUrl, IMG_W.icon)}
                                     alt={res.store?.name ?? ''}
                                     loading="lazy"
                                     decoding="async"
@@ -427,8 +474,22 @@ export default function MyReservations() {
                                   {format(parseISO(res.createdAt), 'HH:mm')}
                                 </p>
 
-                                {/* アクションボタン */}
-                                {((res.status === 'confirmed' && !expired) || (res.status === 'pending' && !expired) || res.status === 'picked_up' || showDismiss) && (
+                                {/* ★ 購入不成立（自動返金）の説明。 小さな「キャンセル」表示だけでは
+                                    気づかずに来店してしまう事故が起きたため、理由と返金と
+                                    「来店不要」をカードの中で明確に伝える。 */}
+                                {isRefundedCancel && (
+                                  <div className="mt-2 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
+                                    <p className="text-[12px] font-black text-red-600">ご購入は成立しませんでした</p>
+                                    <p className="text-[11px] text-red-500/90 leading-relaxed mt-0.5">
+                                      わずかな差で他のお客様のご購入が先に確定したか、販売が停止されたため、
+                                      この注文は不成立となりました。<strong>お支払いは全額自動返金されます</strong>（数日以内に反映）。
+                                      商品のご用意はないため、<strong>お店へのご来店は不要です</strong>。
+                                    </p>
+                                  </div>
+                                )}
+                                {/* アクションボタン (「商品を見る」は bag があれば常に表示するため、
+                                    元の条件に res.bag を OR で足して確実に描画されるようにする) */}
+                                {(res.bag || (res.status === 'confirmed' && !expired) || (res.status === 'pending' && !expired) || res.status === 'picked_up' || showDismiss) && (
                                   <div className="flex items-center flex-wrap gap-2 mt-2">
                                     {res.status === 'confirmed' && !expired && (
                                       // ★ iOS WebView でも確実にタップが拾われるよう <button> + onClick で実装
@@ -462,6 +523,20 @@ export default function MyReservations() {
                                           キャンセル
                                         </button>
                                       </>
+                                    )}
+                                    {/* 商品を見る: 受取前 (pending/confirmed) ・受取後 (picked_up) ・キャンセル済・期限切れ
+                                       の全ステータスで表示。「あの日買ったの何やったっけ」「これから受け取るやつ何やったっけ」
+                                       の両方を同じ導線でカバーする。予約に含まれる bag データをそのままシートで表示。
+                                       ★ state には予約 ID だけ保存 (レンダー時に最新の予約を引き直すため)。 */}
+                                    {res.bag && (
+                                      <button
+                                        type="button"
+                                        onClick={() => setDetailReservationId(res.id)}
+                                        className="inline-flex items-center gap-1.5 bg-white border border-border text-foreground/80 text-[11px] font-bold px-3 py-1.5 rounded-lg whitespace-nowrap active:scale-95 transition-transform"
+                                      >
+                                        <Eye className="w-3 h-3" />
+                                        商品を見る
+                                      </button>
                                     )}
                                     {res.status === 'picked_up' && (
                                       alreadyReviewed ? (

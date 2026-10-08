@@ -12,6 +12,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { authedFetch } from '@/lib/authed-fetch';
 import { normalizeBrand } from '@/lib/brand-text';
 import { loadStripe, type Stripe } from '@stripe/stripe-js';
+import { optimizedImage, IMG_W } from '@/lib/image-utils';
 import {
   Elements,
   PaymentElement,
@@ -525,7 +526,7 @@ export default function Checkout() {
 
   return (
     <Layout showBottomNav={false}>
-      <div className="max-w-xl md:max-w-3xl mx-auto py-8 px-4">
+      <div className="w-full max-w-xl md:max-w-3xl mx-auto py-8 px-4">
 
         {/* Header */}
         <div className="flex items-center gap-3 mb-6">
@@ -549,7 +550,7 @@ export default function Checkout() {
             <div className="flex gap-4 mb-4">
               <div className="w-20 h-20 bg-muted rounded-xl overflow-hidden shrink-0">
                 <img
-                  src={reservation.store?.iconUrl || reservation.store?.imageUrl || 'https://images.unsplash.com/photo-1542838132-92c53300491e?w=800&q=80'}
+                  src={optimizedImage(reservation.store?.iconUrl, IMG_W.icon) || optimizedImage(reservation.store?.imageUrl, IMG_W.icon) || 'https://images.unsplash.com/photo-1542838132-92c53300491e?w=800&q=80'}
                   alt="Bag"
                   className="w-full h-full object-cover"
                 />

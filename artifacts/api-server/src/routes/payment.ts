@@ -212,6 +212,33 @@ async function buildCustomerSessionSecret(
   }
 }
 
+// ── 購入不成立（在庫切れ/販売停止）時の本人通知 ──────────────────────────────
+//   ★ 2026-08-21 ビーチアイランド高槻の報告より。
+//   最後の1個を同時に決済した場合、負けた側は自動返金されるが【本人への通知が無く】、
+//   予約一覧の小さな「キャンセル」表示に気づかないままお店へ来店してしまった。
+//   決済画面を閉じた後でも必ず気づけるよう、ベル通知＋プッシュで明確に伝える。
+//   「お店へのご来店は不要です」の一文が肝（店頭トラブルを防ぐ）。
+async function notifyPurchaseFailed(userId: string, bagId: number, reason: "sold_out" | "unpublished"): Promise<void> {
+  try {
+    const [bag] = await db
+      .select({ title: surpriseBagsTable.title })
+      .from(surpriseBagsTable)
+      .where(eq(surpriseBagsTable.id, bagId))
+      .limit(1);
+    const item = bag?.title ? `「${bag.title}」` : "ご注文の商品";
+    const title = "ご購入は成立しませんでした";
+    const body = reason === "sold_out"
+      ? `${item}は、わずかな差で他のお客様のご購入が先に確定し、在庫がなくなりました。お支払いは全額自動返金されます（数日以内に反映）。商品のご用意はないため、お店へのご来店は不要です。`
+      : `${item}は店舗側で販売が停止されました。お支払いは全額自動返金されます（数日以内に反映）。商品のご用意はないため、お店へのご来店は不要です。`;
+    await db.insert(notificationsTable).values({
+      userId, type: "announcement", title, body, read: false,
+    });
+    await sendPushToUser(userId, { title, body, tag: `purchase-failed-${bagId}-${userId.slice(0,8)}`, url: "/my-reservations" }).catch(() => {});
+  } catch (e) {
+    console.error("[payment] 購入不成立通知の送信に失敗:", (e as Error)?.message);
+  }
+}
+
 router.post("/payment/create-intent", requireAuth, async (req, res) => {
   try {
     const body = CreatePaymentIntentBody.parse(req.body);
@@ -769,6 +796,8 @@ router.post("/payment/confirm", requireAuth, async (req, res) => {
           console.error(`[payment] /confirm: Stripe refund failed for ${body.paymentIntentId}:`, refundErr?.message);
         }
       }
+      // 決済画面を閉じていても気づけるように本人へ通知（ベル+プッシュ）
+      notifyPurchaseFailed(result.reservation.userId, result.reservation.bagId, "sold_out").catch(() => {});
       res.status(409).json({
         error: "sold_out_refunded",
         message: "残念ながら他の方が一足先にご購入されました。お支払いは自動的に全額返金されます（数日以内に反映）。",
@@ -795,6 +824,7 @@ router.post("/payment/confirm", requireAuth, async (req, res) => {
           console.error(`[payment] /confirm: Stripe refund failed for ${body.paymentIntentId}:`, refundErr?.message);
         }
       }
+      notifyPurchaseFailed(result.reservation.userId, result.reservation.bagId, "unpublished").catch(() => {});
       res.status(409).json({
         error: "unpublished_refunded",
         message: "店舗側でこの商品の販売が停止されました。お支払いは自動的に全額返金されます（数日以内に反映）。",
@@ -857,7 +887,7 @@ router.post("/payment/confirm", requireAuth, async (req, res) => {
           await db.insert(notificationsTable).values({ userId: store.ownerId, type: "bag_sold", title: ownerTitle, body: ownerBody, storeId: updated.storeId });
         }
         let ownerPushSent = 0;
-        if (await storeOrderPushEnabled(store.ownerId)) ownerPushSent = await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${updated.id}`, url: "/store/orders" });
+        if (await storeOrderPushEnabled(store.ownerId)) ownerPushSent = await sendPushToUser(store.ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${updated.id}`, url: "/store/dashboard", channelId: "orders" });
         // Web Push が届かない環境 (ブラウザのみ / 通知拒否 / iOS PWA 未追加) の補完として
         // 店舗オーナーへ注文メールを送信。 例外は内部で握り潰されるので await のみで OK。
         // ★ push が1台も届かなかった場合 (ownerPushSent===0) は opt-out を無視して必ず送る
@@ -1202,7 +1232,7 @@ router.get("/checkout/verify", async (req, res) => {
     type VerifyResult =
       | { kind: "already_cancelled" }
       | { kind: "already_paid" }
-      | { kind: "out_of_stock" }
+      | { kind: "out_of_stock"; userId: string; bagId: number }
       | { kind: "paid" };
 
     const finalizeResult: VerifyResult = await db.transaction(async (tx) => {
@@ -1235,7 +1265,7 @@ router.get("/checkout/verify", async (req, res) => {
             ...(stripePaymentId ? { paymentIntentId: stripePaymentId } : {}),
           })
           .where(eq(reservationsTable.id, reservation.id));
-        return { kind: "out_of_stock" };
+        return { kind: "out_of_stock", userId: reservation.userId, bagId: reservation.bagId };
       }
 
       const newStock = bag.stockCount - reservation.quantity;
@@ -1286,6 +1316,7 @@ router.get("/checkout/verify", async (req, res) => {
           console.error(`[payment] /verify: Stripe refund failed for ${stripePaymentId}:`, refundErr?.message);
         }
       }
+      notifyPurchaseFailed(finalizeResult.userId, finalizeResult.bagId, "sold_out").catch(() => {});
       res.status(409).json({
         error: "sold_out_refunded",
         message: "残念ながら他の方が一足先にご購入されました。お支払いは自動的に全額返金されます（数日以内に反映）。",
@@ -1414,7 +1445,7 @@ router.get("/checkout/verify", async (req, res) => {
             await db.insert(notificationsTable).values({ userId: ownerId, type: "bag_sold", title: ownerTitle, body: ownerBody, storeId: reservationFull.storeId ?? undefined });
           }
           let ownerPushSent = 0;
-          if (await storeOrderPushEnabled(ownerId)) ownerPushSent = await sendPushToUser(ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${reservationId}`, url: "/store/orders" });
+          if (await storeOrderPushEnabled(ownerId)) ownerPushSent = await sendPushToUser(ownerId, { title: ownerTitle, body: ownerBody, tag: `bag-sold-${reservationId}`, url: "/store/dashboard" });
           if (existingOwner.length === 0) {
           await sendOrderEmailToStoreOwnerById({
             ownerId,

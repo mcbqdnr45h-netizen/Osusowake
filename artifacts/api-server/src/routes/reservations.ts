@@ -1005,6 +1005,30 @@ router.post("/reservations/:reservationId/cancel", requireAuth, async (req, res)
       await cancelStripePI(existing.paymentIntentId);
     }
 
+    // ⑤ ★ 決済済みを返金したときは店舗オーナーへベル通知を残す。
+    //    返金は売上が消える操作なので、 万一の誤操作でも店がその場で気付けるようにする
+    //    (2026-07-29: 受取操作の流れで返金ボタンが押され、 店が気付けなかった事故の再発防止)。
+    if (wasPaid) {
+      try {
+        const [store] = await db
+          .select({ ownerId: storesTable.ownerId })
+          .from(storesTable)
+          .where(eq(storesTable.id, existing.storeId));
+        if (store?.ownerId) {
+          await db.insert(notificationsTable).values({
+            userId: store.ownerId,
+            type: "reservation_refunded",
+            title: "ご注文を返金しました",
+            body: `受取コード ${existing.pickupCode ?? "------"} のご注文をキャンセルし、お客様に ¥${existing.totalPrice.toLocaleString()} を返金しました。お心当たりがない場合はサポートまでご連絡ください。`,
+            storeId: existing.storeId,
+          });
+        }
+      } catch (notifyErr: unknown) {
+        const msg = notifyErr instanceof Error ? notifyErr.message : String(notifyErr);
+        console.error("[cancel] store refund notification failed (non-critical):", msg);
+      }
+    }
+
     const updated = await getReservationWithDetails(reservationId);
     res.json(updated);
   } catch (err: unknown) {

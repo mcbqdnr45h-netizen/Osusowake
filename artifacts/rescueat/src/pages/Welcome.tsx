@@ -180,6 +180,17 @@ export default function Welcome() {
           >
             ログイン
           </button>
+
+          {/* ★ 登録せずに商品を見る導線。 これが無いと未ログインで保護ページを踏んで
+              /welcome に飛ばされた人が「登録かログインしか選べない行き止まり」になり、
+              閲覧すらできずに離脱してしまう。 */}
+          <button
+            type="button"
+            onClick={() => navigate('/', { replace: true })}
+            className="w-full text-white/80 font-bold text-[13px] py-[10px] active:scale-[0.98] transition-transform hover:text-white underline underline-offset-4 decoration-white/40"
+          >
+            登録せずに商品を見てみる
+          </button>
         </motion.div>
       </div>
 

@@ -637,6 +637,44 @@ export default function Settings() {
     navigate('/welcome');
   }
 
+  // ★ お客様向けの通知トグル（お気に入り店舗の更新など）。JSXを変数に切り出している。
+  const consumerNotifRows = (
+    <>
+                <div className="flex items-center gap-3.5 px-4 min-h-[56px] border-b border-border/60">
+                  <div className="w-9 h-9 rounded-xl bg-blue-100 flex items-center justify-center shrink-0">
+                    <Bell className="w-4 h-4 text-blue-500" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-bold text-sm text-foreground">新しいおすそわけのお知らせ</p>
+                    <p className="text-xs text-muted-foreground">新しいバッグが出たとき（1日最大5件・夜間を除く）</p>
+                  </div>
+                  <Toggle value={notifNewListing} onChange={handleNotifNewListingToggle} />
+                </div>
+
+                <div className="flex items-center gap-3.5 px-4 min-h-[56px] border-b border-border/60">
+                  <div className="w-9 h-9 rounded-xl bg-rose-100 flex items-center justify-center shrink-0">
+                    <Bell className="w-4 h-4 text-rose-500" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-bold text-sm text-foreground">お気に入り店舗の更新</p>
+                    <p className="text-xs text-muted-foreground">フォロー中の店舗が出品したとき</p>
+                  </div>
+                  <Toggle value={notifFavoriteUpdate} onChange={handleNotifFavoriteUpdateToggle} />
+                </div>
+
+                <div className="flex items-center gap-3.5 px-4 min-h-[56px]">
+                  <div className="w-9 h-9 rounded-xl bg-orange-100 flex items-center justify-center shrink-0">
+                    <Bell className="w-4 h-4 text-orange-500" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-bold text-sm text-foreground">毎日のおすそわけ情報</p>
+                    <p className="text-xs text-muted-foreground">昼前と夕方、出品があるときにお届け</p>
+                  </div>
+                  <Toggle value={notifDailyEngagement} onChange={handleNotifDailyEngagementToggle} />
+                </div>
+    </>
+  );
+
   return (
     <SettingsWrapper>
       <AnimatePresence>
@@ -656,7 +694,13 @@ export default function Settings() {
           />
         )}
       </AnimatePresence>
-      <div className="max-w-md md:max-w-2xl mx-auto pb-16">
+      {/* ★ 左右の余白 px-4 を追加 (2026-08-06)
+          この画面だけ左右パディングが無く、カードが画面の端にピッタリ張り付いていた。
+          そのため右端のトグルや「編集」ボタンが画面の縁ギリギリ〜はみ出して見え、
+          Android の細い端末で【見切れる】状態になっていた（店舗様・マロから報告）。
+          他ページ(HelpPage 等)は px-4 が入っており、こちらだけ抜けていた。
+          w-full + overflow-x-hidden は、万一はみ出す要素が出ても横スクロールさせない保険。 */}
+      <div className="w-full max-w-md md:max-w-2xl mx-auto px-4 pb-16 overflow-x-hidden">
 
         {/* Header */}
         <div className="flex items-center gap-3 px-4 pt-4 pb-4 sticky bg-background/90 backdrop-blur-sm z-10 border-b border-border/50"
@@ -685,7 +729,7 @@ export default function Settings() {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/jpeg,image/png,image/webp"
+                accept="image/*"
                 className="hidden"
                 onChange={handleAvatarFileChange}
                 aria-hidden="true"
@@ -798,7 +842,11 @@ export default function Settings() {
           </div>
           </>)}
 
-          {/* ── NOTIFICATIONS ── */}
+          {/* ── NOTIFICATIONS ──
+              ★ 店舗オーナーには【お店の通知だけ】を出す (2026-08-06)。
+                店の端末は注文を受け取るためのもの。他店の出品通知はサーバー側で
+                送らないようにしたため(bags.ts / new-listing-broadcast.ts / daily-engagement.ts)、
+                お客様向けトグルをここに出す必要はない。設定を増やさない方が見落としも減る。 */}
           <SectionLabel>通知設定</SectionLabel>
           <div className="bg-card border border-border rounded-2xl overflow-hidden shadow-sm mb-1">
             {isStoreOwner ? (
@@ -840,41 +888,11 @@ export default function Settings() {
               </>
             ) : (
               <>
-                <div className="flex items-center gap-3.5 px-4 min-h-[56px] border-b border-border/60">
-                  <div className="w-9 h-9 rounded-xl bg-blue-100 flex items-center justify-center shrink-0">
-                    <Bell className="w-4 h-4 text-blue-500" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-bold text-sm text-foreground">新しいおすそわけのお知らせ</p>
-                    <p className="text-xs text-muted-foreground">新しいバッグが出たとき（1日最大5件・夜間を除く）</p>
-                  </div>
-                  <Toggle value={notifNewListing} onChange={handleNotifNewListingToggle} />
-                </div>
-
-                <div className="flex items-center gap-3.5 px-4 min-h-[56px] border-b border-border/60">
-                  <div className="w-9 h-9 rounded-xl bg-rose-100 flex items-center justify-center shrink-0">
-                    <Bell className="w-4 h-4 text-rose-500" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-bold text-sm text-foreground">お気に入り店舗の更新</p>
-                    <p className="text-xs text-muted-foreground">フォロー中の店舗が出品したとき</p>
-                  </div>
-                  <Toggle value={notifFavoriteUpdate} onChange={handleNotifFavoriteUpdateToggle} />
-                </div>
-
-                <div className="flex items-center gap-3.5 px-4 min-h-[56px]">
-                  <div className="w-9 h-9 rounded-xl bg-orange-100 flex items-center justify-center shrink-0">
-                    <Bell className="w-4 h-4 text-orange-500" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="font-bold text-sm text-foreground">毎日のおすそわけ情報</p>
-                    <p className="text-xs text-muted-foreground">昼前と夕方、出品があるときにお届け</p>
-                  </div>
-                  <Toggle value={notifDailyEngagement} onChange={handleNotifDailyEngagementToggle} />
-                </div>
+                {consumerNotifRows}
               </>
             )}
           </div>
+
 
           {/* ★ ランキング参加トグルは削除 (RankingPage 内にプレビュー付きトグルがあるため重複)。
                 ニックネーム入力 (上のアカウント情報) は残し、 ON/OFF は RankingPage で完結させる。 */}
@@ -920,9 +938,12 @@ export default function Settings() {
             </button>
           </div>
 
-          <p className="text-center text-xs text-muted-foreground pb-4">おすそわけ v1.0.0</p>
+          <p className="text-center text-xs text-muted-foreground pb-4">
+            おすそわけ v1.0.0
+          </p>
         </div>
       </div>
     </SettingsWrapper>
   );
 }
+

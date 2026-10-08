@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { storesTable, surpriseBagsTable, reportsTable, reviewsTable, reservationsTable, notificationsTable } from "@workspace/db/schema";
-import { eq, sql, and, ne, gte, count, desc } from "drizzle-orm";
+import { eq, sql, and, ne, gte, lt, inArray, count, desc } from "drizzle-orm";
 import { supabaseAdmin } from "../lib/supabase";
 import { escapeHtml } from "../lib/escape.js";
 import { requireAuth, requireStoreOwner } from "../middlewares/auth.js";
@@ -18,6 +18,7 @@ import {
 import { Resend } from "resend";
 import { sendStoreApprovalEmail } from "../utils/emails";
 import { normalizeForCompare, storeIdentityKey, normalizeLicenseNumber } from "../lib/normalize-store.js";
+import { calcFees } from "../lib/pricing.js";
 
 const REPORT_TYPES = ["closed", "temp_closed", "wrong_hours", "wrong_info", "inappropriate_review", "other"] as const;
 
@@ -182,8 +183,31 @@ function splitTownLine1(town: string, line1: string): { town: string; line1: str
 }
 
 /**
+ * カナ住所を Stripe が受け付ける文字集合（カタカナ・英数字・半角スペース・ハイフン・ドット）へ強制正規化。
+ * ★ ConteCafe (2026-09-29): カナ番地に全角数字・漢字（丁目等）が入り
+ *   "Invalid katakana address" で会社住所+代表者住所がまとめて拒否され法人登録が全滅していた。
+ *   店主に直させるのではなくサーバーで吸収する。
+ */
+function sanitizeKanaAddressField(s: string): string {
+  let out = (s ?? '').trim();
+  // ひらがな → カタカナ
+  out = out.replace(/[ぁ-ゖ]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0x60));
+  // 住所に頻出する漢字をカタカナへ
+  out = out
+    .replace(/丁目/g, 'チョウメ').replace(/番地/g, 'バンチ').replace(/番町/g, 'バンチョウ')
+    .replace(/号室/g, 'ゴウシツ').replace(/号/g, 'ゴウ').replace(/番/g, 'バン').replace(/条/g, 'ジョウ');
+  // 半角カナ→全角カナ・全角英数→半角
+  out = toFullWidthKana(out);
+  // ハイフン類・全角スペースを許容文字へ
+  out = out.replace(/[－‐−–—〜~]/g, '-').replace(/　/g, ' ');
+  // 許容外の文字（残った漢字・記号など）を除去
+  out = out.replace(/[^ァ-ヶーA-Za-z0-9 .\-]/g, '');
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+/**
  * Stripe JP に送る address_kanji / address_kana をまとめて正規化。
- * - kana側: 半角カナ→全角カナ + 数字を半角化
+ * - kana側: 半角カナ→全角カナ + 数字を半角化 + Stripe許容文字への強制正規化
  * - 両方: townに数字混入してたら line1 に分離
  */
 function buildJpAddress(k: {
@@ -191,12 +215,18 @@ function buildJpAddress(k: {
   stateKanji: string; cityKanji: string; townKanji: string; line1Kanji: string;
   stateKana:  string; cityKana:  string; townKana:  string; line1Kana:  string;
 }) {
-  const postal = (k.postalCode ?? '').replace(/[^0-9]/g, '');
+  // ★ 全角数字(５６９...)を半角に直してから数字以外を落とす (2026-08-05)。
+  //   旧実装は全角数字をそのまま捨てていたため postal_code が空文字になり、
+  //   Stripe に「登録済みの住所を消そうとした」と判定されて
+  //   "you cannot unset any of it" で再提出が丸ごと失敗していた。
+  const postal = (k.postalCode ?? '')
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/[^0-9]/g, '');
   const kanjiSplit = splitTownLine1(k.townKanji ?? '', k.line1Kanji ?? '');
   const kanaRaw    = splitTownLine1(k.townKana  ?? '', k.line1Kana  ?? '');
   const kanaSplit = {
-    town:  toFullWidthKana(kanaRaw.town),
-    line1: toFullWidthKana(kanaRaw.line1),
+    town:  sanitizeKanaAddressField(kanaRaw.town),
+    line1: sanitizeKanaAddressField(kanaRaw.line1),
   };
   return {
     address_kanji: {
@@ -208,8 +238,8 @@ function buildJpAddress(k: {
     },
     address_kana: {
       postal_code: postal,
-      state:       toFullWidthKana((k.stateKana ?? '').trim()),
-      city:        toFullWidthKana((k.cityKana  ?? '').trim()),
+      state:       sanitizeKanaAddressField(k.stateKana ?? ''),
+      city:        sanitizeKanaAddressField(k.cityKana  ?? ''),
       town:        kanaSplit.town,
       line1:       kanaSplit.line1,
     },
@@ -305,14 +335,28 @@ const publicStoreSelectFields = {
   holiday: storesTable.holiday,
   pickupHours: storesTable.pickupHours,
   createdAt: storesTable.createdAt,
-  // 本日完売 (social proof): 今日 JST に作られたバッグが在庫0なら true。
+  // 本日完売 (social proof): 「受取日が今日」のバッグが売り切れたら true。
   //   ★ 決済で在庫0になると isActive=false になる (totalBagsAvailable からは消える) ため、
   //     ここは isActive を見ない (= 完売済み非アクティブも拾う)。
-  //     前日出品 (pickupNextDay) のバッグは作成日が前日なので「今日 or 昨日 JST 作成」を対象にする。
+  //   ★ 2026-09-13 日付判定を /bags/ended-today と同一定義に統一:
+  //     通常バッグ = 今日作成 / 翌日受取(pickupNextDay) = 昨日作成(受取が今日)。
+  //     旧実装の「今日 or 昨日作成」だと、昨日売り切れた通常バッグが翌日も
+  //     「🔥本日完売」と誤表示され続けていた(マロ報告)。
+  //   ★ 支払済み予約が1件以上あるバッグのみ完売扱い
+  //     (在庫0で出品/手動0編集した“売れてないバッグ”を完売と偽らない — ended-today と同じ)。
   soldOutToday: sql<boolean>`COALESCE(BOOL_OR(
     ${surpriseBagsTable.stockCount} <= 0
-    AND DATE(${surpriseBagsTable.createdAt} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo')
-        >= DATE(NOW() AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 day'
+    AND (
+      (${surpriseBagsTable.pickupNextDay} IS NOT TRUE
+        AND DATE(${surpriseBagsTable.createdAt} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo')
+            = DATE(NOW() AT TIME ZONE 'Asia/Tokyo'))
+      OR
+      (${surpriseBagsTable.pickupNextDay} IS TRUE
+        AND DATE(${surpriseBagsTable.createdAt} AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo')
+            = DATE(NOW() AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 day')
+    )
+    AND EXISTS (SELECT 1 FROM reservations pr
+                WHERE pr.bag_id = ${surpriseBagsTable.id} AND pr.payment_status = 'paid')
   ), false)`.as("soldOutToday"),
   // ★ 可視条件は共有SQL(lib/bag-visibility.ts)に一本化。 2部制(受取2枠)の期限延長もそこで対応。
   totalBagsAvailable: sql<number>`COALESCE(SUM(CASE
@@ -350,6 +394,10 @@ router.get("/stores", async (req, res) => {
         OR (${storesTable.status} = 'approved' AND coalesce(${storesTable.stripeChargesEnabled}, false) = true)
       )`)
       .groupBy(storesTable.id)
+      // ★ 2026-08-12: ORDER BY が無く、DBが返す順のまま＝更新のたびに並びが変わっていた。
+      //   お気に入り画面はこの並びをそのまま表示するため、開くたびに店の順番が入れ替わって見える。
+      //   （地図/検索は自前で並べ替えているので影響なし）。新しい店が上＝毎回同じ並びに固定する。
+      .orderBy(desc(storesTable.id))
     );
 
     res.json(stores);
@@ -387,6 +435,121 @@ router.post("/stores", requireAdmin, async (req, res) => {
 });
 
 // Public: apply for store registration — sets status to "pending" for admin review
+// ── POST /stores/:storeId/request-listing ─────────────────────────────────────
+// お気に入り店への「出品リクエスト」。
+//   ★ 2026-08-29 マロ発案。供給（店の出品）が最大のボトルネックのため、
+//     「待っているお客様がいる」ことを店に届けて出品の動機にする。
+//   ・1ユーザー×1店×1日(JST)で1回まで（DBのUNIQUEで保証。連打しても店に迷惑なし）
+//   ・店主にはベル通知のみ（プッシュは送らない＝通知疲れさせない）
+router.post("/stores/:storeId/request-listing", requireAuth, async (req: any, res) => {
+  const storeId = parseInt(String(req.params.storeId ?? ""), 10);
+  if (Number.isNaN(storeId)) { res.status(400).json({ error: "bad_request" }); return; }
+  try {
+    const [store] = await db
+      .select({ id: storesTable.id, name: storesTable.name, status: storesTable.status, ownerId: storesTable.ownerId })
+      .from(storesTable)
+      .where(eq(storesTable.id, storeId))
+      .limit(1);
+    if (!store || store.status !== "approved") {
+      res.status(404).json({ error: "not_found", message: "店舗が見つかりません" }); return;
+    }
+    const jstDate = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+    const inserted = await db.execute(sql`
+      INSERT INTO listing_requests (store_id, user_id, jst_date)
+      VALUES (${storeId}, ${req.authUser.id}, ${jstDate})
+      ON CONFLICT (store_id, user_id, jst_date) DO NOTHING
+      RETURNING id
+    `);
+    const already = (inserted.rows?.length ?? 0) === 0;
+    let todayCount = 0;
+    const cnt = await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM listing_requests WHERE store_id = ${storeId} AND jst_date = ${jstDate}
+    `);
+    todayCount = Number((cnt.rows?.[0] as any)?.n ?? 0);
+
+    // 過去の出品からの「また食べたい」: 商品名つきリクエスト (2026-09-13)。
+    //   店主に「どの商品が求められているか」まで届けて再出品の動機を強くする。
+    const rawTitle = (req.body as { bagTitle?: unknown })?.bagTitle;
+    const bagTitle = typeof rawTitle === "string" ? rawTitle.trim().slice(0, 60) : "";
+
+    // 新規リクエストのときだけ店主へベル通知（同一人物の連打では通知しない）
+    if (!already && store.ownerId) {
+      const wantLine = bagTitle ? `リクエストされた商品:「${bagTitle}」。` : "";
+      await db.insert(notificationsTable).values({
+        userId: store.ownerId,
+        type: "announcement",
+        title: "🙏 出品リクエストが届きました",
+        body: `お客様が「${store.name}」の出品を待っています（本日${todayCount}人目）。${wantLine}出品すると、お気に入り登録のお客様に通知が届きます。`,
+        read: false,
+      }).catch(() => {});
+    }
+    res.json({ ok: true, already, todayCount });
+  } catch (err: any) {
+    console.error("[stores/request-listing]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── GET /stores/:storeId/past-bags ────────────────────────────────────────────
+// 店舗情報ページの「過去の出品」(公開・認証不要)。
+//   ★ 2026-09-13 マロ発案。出品が無い時間帯に店ページを開いた客に
+//     「この店はこういうバッグが出る」を見せて、お気に入り登録・出品リクエストへ繋ぐ。
+//   ・過去60日のバッグを商品名でまとめ、最新の1件＋出品回数を返す（最大8種・新しい順）
+//   ・「今日の分」(受取日が今日) は現在出品側と重複するため除外
+//   ・価格/写真/回数のみ。PII なし。60秒キャッシュ。
+router.get("/stores/:storeId/past-bags", async (req, res) => {
+  const storeId = parseInt(String(req.params.storeId ?? ""), 10);
+  if (Number.isNaN(storeId)) { res.status(400).json({ error: "bad_request" }); return; }
+  try {
+    const items = await cached(`store:${storeId}:past-bags`, 60_000, async () => {
+      const result = await db.execute(sql`
+        SELECT title, image_url, original_price, discounted_price, item_type, category, created_at, times_listed
+        FROM (
+          SELECT DISTINCT ON (b.title)
+            b.title,
+            CASE WHEN b.image_url LIKE 'data:%' THEN NULL ELSE b.image_url END AS image_url,
+            b.original_price, b.discounted_price, b.item_type, b.category, b.created_at,
+            COUNT(*) OVER (PARTITION BY b.title)::int AS times_listed
+          FROM surprise_bags b
+          JOIN stores s ON s.id = b.store_id
+          WHERE b.store_id = ${storeId}
+            -- タイトル未入力時のデフォルト名「おすそわけ袋」は商品情報が無いため過去の出品に出さない
+            -- (2026-09-13 マロ指示: Taps の「おすそわけ袋」表示が不要だった件。全店共通ルールで対応)
+            AND b.title <> 'おすそわけ袋'
+            AND s.is_active = true
+            AND (COALESCE(s.show_on_map, false) = true OR s.status = 'approved')
+            AND b.created_at >= NOW() - INTERVAL '60 days'
+            AND (
+              -- 「受取日が今日」の分は除外 (現在出品/本日完売の側で見せる)
+              (b.pickup_next_day IS NOT TRUE
+                AND DATE(b.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo') < DATE(NOW() AT TIME ZONE 'Asia/Tokyo'))
+              OR
+              (b.pickup_next_day IS TRUE
+                AND DATE(b.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo') < DATE(NOW() AT TIME ZONE 'Asia/Tokyo') - INTERVAL '1 day')
+            )
+          ORDER BY b.title, b.created_at DESC
+        ) t
+        ORDER BY t.created_at DESC
+        LIMIT 8
+      `);
+      return (result.rows ?? []).map((r: any) => ({
+        title: r.title,
+        imageUrl: r.image_url ?? null,
+        originalPrice: r.original_price != null ? Number(r.original_price) : null,
+        discountedPrice: r.discounted_price != null ? Number(r.discounted_price) : null,
+        itemType: r.item_type ?? null,
+        category: r.category ?? null,
+        timesListed: Number(r.times_listed ?? 1),
+        lastListedAt: r.created_at,
+      }));
+    });
+    res.json({ items });
+  } catch (err: any) {
+    console.error("[stores/past-bags]", err);
+    res.status(500).json({ error: "internal_error", message: "Failed to fetch past bags" });
+  }
+});
+
 router.post("/stores/apply", requireAuth, async (req, res) => {
   try {
     const body = req.body;
@@ -396,6 +559,25 @@ router.post("/stores/apply", requireAuth, async (req, res) => {
 
     if (!body.name || !body.address || !body.city) {
       return res.status(400).json({ error: "bad_request", message: "必須項目（店舗名・住所・市区町村）が不足しています" });
+    }
+
+    // ★ 2026-08-04: 審査が終わっていない店舗を持つオーナーは新しい店舗を追加できない。
+    //   (審査中に2号店・3号店を積み増せるとテスト登録や不正のスパム経路になるため。
+    //    承認済みの店だけを持つオーナーは従来どおり複数店舗を追加できる)
+    const [inflight] = await db
+      .select({ id: storesTable.id, name: storesTable.name, status: storesTable.status })
+      .from(storesTable)
+      .where(and(
+        eq(storesTable.ownerId, ownerId),
+        sql`${storesTable.status} IN ('pending', 'applied', 'pending_review')`,
+      ))
+      .limit(1);
+    if (inflight) {
+      console.warn(`[/stores/apply] 🚫 審査中店舗あり ownerId=${ownerId} blockedBy=${inflight.id}:${inflight.name}(${inflight.status})`);
+      return res.status(403).json({
+        error: "pending_store_exists",
+        message: `「${inflight.name}」の審査が完了するまで、新しい店舗は追加できません。審査完了後にもう一度お試しください。`,
+      });
     }
 
     // ── 住所構造バリデーション (改ざん/旧クライアント/手入力テスト対策) ───
@@ -1430,6 +1612,11 @@ router.get("/stores/:storeId", async (req, res) => {
     }
     res.json(store);
   } catch (err) {
+    // 不正な storeId (数値でない等) は 400 (bags/:bagId と同じ扱い。zod直接依存なしのためname判定)
+    if ((err as any)?.name === "ZodError" || (err as any)?.name === "$ZodError") {
+      res.status(400).json({ error: "bad_request", message: "Invalid storeId" });
+      return;
+    }
     console.error(err);
     res.status(500).json({ error: "internal_error", message: "Failed to fetch store" });
   }
@@ -1792,6 +1979,291 @@ router.get("/stores/:storeId/today-sales", requireAuth, requireStoreOwner, async
   }
 });
 
+// GET /api/stores/:storeId/statement
+//   - パラメータ無し   → 振込一覧 { payouts: [...] }（セレクタ用）
+//   - ?payout=po_xxx  → その振込の明細 { payout, items, totals, ... }
+//
+// 振込(payout)単位の明細。 Stripe の payout に含まれる balance transaction から
+// 送金(transfer)を辿り、 metadata.reservationId でうちのDBの注文に紐付けて明細化する。
+// → 銀行に着金した額と、その内訳(注文)が 1 対 1 で照合できる。
+// 金額は payment.ts と同一の calcFees で算出するため実送金額と一致する。
+// ※ これは「売上明細書」であり適格請求書(インボイス)ではない。
+router.get("/stores/:storeId/statement", requireAuth, requireStoreOwner, async (req, res) => {
+  try {
+    const storeId = parseInt(String(req.params.storeId));
+    if (isNaN(storeId)) {
+      res.status(400).json({ error: "bad_request", message: "Invalid storeId" });
+      return;
+    }
+
+    const [store] = await db
+      .select({ id: storesTable.id, name: storesTable.name, stripeAccountId: storesTable.stripeAccountId })
+      .from(storesTable)
+      .where(eq(storesTable.id, storeId));
+    if (!store) {
+      res.status(404).json({ error: "not_found", message: "Store not found" });
+      return;
+    }
+    if (!store.stripeAccountId) {
+      res.json({ connected: false, storeName: store.name, payouts: [] });
+      return;
+    }
+
+    const stripeKey = process.env["STRIPE_SECRET_KEY"];
+    if (!stripeKey) {
+      res.json({ connected: true, noKey: true, storeName: store.name, payouts: [] });
+      return;
+    }
+    const stripe = await import("stripe").then((m) => new m.default(stripeKey));
+    const acct = store.stripeAccountId;
+
+    const toJst = (unixSec: number) =>
+      new Date(unixSec * 1000 + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const STATUS_JA: Record<string, string> = {
+      paid: "着金済", in_transit: "送金中", pending: "振込予定", failed: "失敗", canceled: "取消",
+    };
+
+    const payoutId = String(req.query.payout ?? "").trim();
+
+    // ── モード1: 振込一覧（セレクタ用）─────────────────────────────
+    // 60秒キャッシュ: 画面を開くたびの Stripe 往復を削減
+    if (!payoutId) {
+      const payouts = await cached(`stmt-list:${acct}`, 60_000, async () => {
+        const list = await stripe.payouts.list({ limit: 24 }, { stripeAccount: acct });
+        return list.data.map((p) => ({
+          id:          p.id,
+          arrivalDate: toJst(p.arrival_date),
+          amount:      p.amount,
+          status:      p.status,
+          statusLabel: STATUS_JA[p.status] ?? p.status,
+        }));
+      });
+      res.json({ connected: true, storeName: store.name, payouts });
+      return;
+    }
+
+    // ── モード2: 指定振込の明細 ───────────────────────────────────
+    // ★ 確定した振込の内訳は変わらないため 10 分キャッシュ。 2回目以降は即返し。
+    //   キャッシュキーに storeId を含める（同一 Stripe アカウント共有の複数店で
+    //   他店の明細が混ざらないように。 DB 照会側too storeId で絞る）。
+    const payload = await cached(`stmt:${storeId}:${payoutId}`, 600_000, async () => {
+      // 振込の実在確認。 「存在しない」だけ null(=404)。 一時エラー(レート制限等)は
+      // throw する — cached() は例外を保存しないため、 誤った 404 が10分固定される事故を防ぐ。
+      let payout: any;
+      try {
+        payout = await stripe.payouts.retrieve(payoutId, { stripeAccount: acct });
+      } catch (e: any) {
+        if (e?.code === "resource_missing" || e?.statusCode === 404) return null;
+        throw e;
+      }
+
+      // この振込に含まれる balance transaction（★has_more ページングで全件取得。
+      // limit:100 固定だと101件以上の振込で明細が欠落し、合計が着金額と合わなくなる）
+      const btAll: any[] = [];
+      let startingAfter: string | undefined;
+      for (let page = 0; page < 20; page++) { // 安全上限 2000 件
+        const chunk: any = await stripe.balanceTransactions.list(
+          {
+            payout: payoutId, limit: 100, expand: ["data.source"],
+            ...(startingAfter ? { starting_after: startingAfter } : {}),
+          },
+          { stripeAccount: acct },
+        );
+        btAll.push(...chunk.data);
+        if (!chunk.has_more) break;
+        startingAfter = chunk.data[chunk.data.length - 1]?.id;
+      }
+      const btxns = { data: btAll };
+
+      const asId = (v: any): string | null =>
+        typeof v === "string" ? v : (v && typeof v === "object" && typeof v.id === "string" ? v.id : null);
+      const parseRid = (v: unknown): number | undefined => {
+        const n = v != null ? parseInt(String(v), 10) : NaN;
+        return isNaN(n) ? undefined : n;
+      };
+      // 送金から reservationId / PaymentIntent ID を解決する。
+      // ★ デスティネーションチャージでは送金は Stripe 自動生成で metadata が空。
+      //   reservationId は PaymentIntent の metadata (payment.ts の feeMetadata) にあるため、
+      //   送金 → source_transaction(プラットフォームcharge) → payment_intent と expand で辿る。
+      //   metadata に無い古い注文のために PI の ID も返し、 後で DB の
+      //   reservations.payment_intent_id から逆引きする（最終フォールバック）。
+      // 失敗時は 1 回リトライ後 throw する — 握り潰すと未解決分が「その他（返金・調整等）」に
+      // 化けて誤った巨額調整が表示され、 さらに10分キャッシュされてしまうため。
+      // throw なら cached() は保存せず、 フロントに「取得に失敗」が出て再試行できる。
+      const resolveTransfer = async (trId: string, attempt = 0): Promise<{ rid?: number; piId?: string }> => {
+        try {
+          const tr = await stripe.transfers.retrieve(trId, {
+            expand: ["source_transaction.payment_intent"],
+          });
+          const ch: any = tr.source_transaction;
+          const rid = parseRid(tr.metadata?.["reservationId"])            // separate CT 経路
+            ?? parseRid(ch?.metadata?.reservationId)                      // charge に載る場合
+            ?? parseRid(ch?.payment_intent?.metadata?.reservationId);     // destination charge の本命
+          const piId = typeof ch?.payment_intent === "string"
+            ? ch.payment_intent
+            : ch?.payment_intent?.id;
+          return { rid, piId };
+        } catch (e) {
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 500));
+            return resolveTransfer(trId, 1);
+          }
+          throw e;
+        }
+      };
+
+      // ★ 金額の権威は「実際に振り込まれた bt.amount」。 calcFees での再計算は
+      //   過去の手数料条件・丸めと数円ズレ得るため、 受取額には使わない。
+      //   payout 以外の bt を全部拾う: プラス=注文の入金 / マイナス=返金・調整。
+      //   Stripe の構造上 Σ(payout以外のbt) = payout.amount が保証される
+      //   → 明細合計 + 調整額 = 振込額が必ず一致する。
+      const parts = btxns.data.filter((bt: any) => bt.type !== "payout");
+      // ★ Stripe レート制限対策: 全件一斉でなく 4 件ずつ解決する
+      const resolved: Array<{ rid?: number; piId?: string; amount: number }> = [];
+      for (let i = 0; i < parts.length; i += 4) {
+        const batch = await Promise.all(parts.slice(i, i + 4).map(async (bt: any) => {
+          const src = bt.source as any;
+          const stId = asId(src?.source_transfer) ?? asId(src?.transfer) ?? asId(src);
+          let rid: number | undefined;
+          let piId: string | undefined;
+          if (bt.amount > 0) {
+            if (stId && stId.startsWith("tr_")) {
+              const r = await resolveTransfer(stId);
+              rid = r.rid; piId = r.piId;
+            }
+            if (rid === undefined) rid = parseRid(src?.metadata?.reservationId);
+            if (piId === undefined) {
+              const p = src?.payment_intent;
+              piId = typeof p === "string" ? p : p?.id;
+            }
+          }
+          return { rid, piId, amount: bt.amount };
+        }));
+        resolved.push(...batch);
+      }
+
+      // metadata で特定できなかった分を PaymentIntent ID → DB 逆引きで救済
+      const orphanPiIds = [...new Set(
+        resolved.filter((r) => r.rid === undefined && r.piId).map((r) => r.piId!),
+      )];
+      if (orphanPiIds.length > 0) {
+        const piRows = await db
+          .select({ id: reservationsTable.id, piId: reservationsTable.paymentIntentId })
+          .from(reservationsTable)
+          .where(and(
+            eq(reservationsTable.storeId, storeId),
+            inArray(reservationsTable.paymentIntentId, orphanPiIds),
+          ));
+        const ridByPi = new Map(piRows.filter((p) => p.piId).map((p) => [p.piId!, p.id]));
+        for (const r of resolved) {
+          if (r.rid === undefined && r.piId) r.rid = ridByPi.get(r.piId);
+        }
+      }
+
+      // 注文ID → 実送金額（同一注文が複数btに分かれても合算）
+      const amountByRid = new Map<number, number>();
+      let unmatchedAmount = 0; // 注文に紐付かない調整分（返金・手数料調整等。正負あり）
+      for (const r of resolved) {
+        if (r.rid === undefined) { unmatchedAmount += r.amount; continue; }
+        amountByRid.set(r.rid, (amountByRid.get(r.rid) ?? 0) + r.amount);
+      }
+      const reservationIds = [...amountByRid.keys()];
+
+      const rows = reservationIds.length > 0
+        ? await db
+            .select({
+              id:                reservationsTable.id,
+              createdAt:         reservationsTable.createdAt,
+              quantity:          reservationsTable.quantity,
+              totalPrice:        reservationsTable.totalPrice,
+              merchandiseAmount: reservationsTable.merchandiseAmount,
+              status:            reservationsTable.status,
+              title:             surpriseBagsTable.title,
+            })
+            .from(reservationsTable)
+            .leftJoin(surpriseBagsTable, eq(reservationsTable.bagId, surpriseBagsTable.id))
+            // ★ storeId でも絞る: 同一 Stripe アカウント共有の複数店で
+            //   他店の注文明細（商品名・金額）が混ざるのを防ぐ。
+            //   他店分の金額は「その他」(unmatchedAmount) 側に集計される。
+            .where(and(
+              inArray(reservationsTable.id, reservationIds),
+              eq(reservationsTable.storeId, storeId),
+            ))
+            .orderBy(reservationsTable.createdAt)
+        : [];
+
+      // DB に見つからなかった注文（削除等）の実額も調整分へ回し、 合計の整合を守る
+      const foundIds = new Set(rows.map((r) => r.id));
+      for (const [rid, amt] of amountByRid) {
+        if (!foundIds.has(rid)) unmatchedAmount += amt;
+      }
+
+      const items = rows.map((r) => {
+        const merch = r.merchandiseAmount ?? r.totalPrice;
+        const { shopGross } = calcFees(r.totalPrice, merch);
+        const actualNet = amountByRid.get(r.id) ?? 0;  // ★ 実際に振り込まれた額（権威）
+        const commission = merch - shopGross;          // おすそわけ手数料(20%)
+        // 決済手数料は実額から逆算 = 当時の実際の控除額。
+        // 行内で 商品代金 - 手数料20% - 決済手数料 = 受取額 が恒等的に成立する。
+        const stripeFee = shopGross - actualNet;
+        const dateJst = new Date(r.createdAt.getTime() + 9 * 60 * 60 * 1000)
+          .toISOString().slice(0, 10);
+        return {
+          date:         dateJst,
+          orderId:      r.id,
+          title:        r.title ?? "(商品名なし)",
+          quantity:     r.quantity,
+          customerPaid: r.totalPrice,
+          merchandise:  merch,
+          commission,
+          stripeFee,
+          storeNet:     actualNet,
+          status:       r.status,
+        };
+      });
+
+      const totals = items.reduce(
+        (a, it) => ({
+          count:        a.count + 1,
+          customerPaid: a.customerPaid + it.customerPaid,
+          merchandise:  a.merchandise + it.merchandise,
+          commission:   a.commission + it.commission,
+          stripeFee:    a.stripeFee + it.stripeFee,
+          storeNet:     a.storeNet + it.storeNet,
+        }),
+        { count: 0, customerPaid: 0, merchandise: 0, commission: 0, stripeFee: 0, storeNet: 0 },
+      );
+
+      return {
+        connected: true,
+        issuer: "おすそわけ",
+        isQualifiedInvoice: false,
+        taxNote: "商品代金は軽減税率8%対象、各種手数料は10%対象です。本書は売上明細書であり適格請求書ではありません。",
+        payout: {
+          id:          payout.id,
+          arrivalDate: toJst(payout.arrival_date),
+          amount:      payout.amount,
+          status:      payout.status,
+          statusLabel: STATUS_JA[payout.status] ?? payout.status,
+        },
+        unmatchedAmount,
+        items,
+        totals,
+      };
+    });
+
+    if (!payload) {
+      res.status(404).json({ error: "not_found", message: "Payout not found" });
+      return;
+    }
+    // 店名はキャッシュ外で付与（同一Stripeアカウント共有の複数店で他店名が出ないように）
+    res.json({ ...payload, storeName: store.name });
+  } catch (err: any) {
+    console.error("[statement] error:", err?.message);
+    res.status(500).json({ error: "internal_error", message: "Failed to build statement" });
+  }
+});
+
 // GET /api/stores/:storeId/connect/status
 // Stripe アカウントのオンボーディング完了状況を返す
 router.get("/stores/:storeId/connect/status", requireAuth, requireStoreOwner, async (req, res) => {
@@ -1842,6 +2314,74 @@ router.get("/stores/:storeId/connect/status", requireAuth, requireStoreOwner, as
         .where(eq(storesTable.id, storeId));
     } catch (syncErr) {
       console.error("[connect/status] DB write-through failed (non-fatal):", syncErr);
+    }
+
+    // ★ 2026-08-04 自己修復: Stripe が完全に通っている(決済◯かつ入金◯)のに
+    //   こちらのステータスが審査中のまま残っている店を、この参照のタイミングで承認する。
+    //   自動承認は webhook(account.updated) 依存だったため、Stripe からの通知を
+    //   取りこぼす／通知後に条件が揃うケースで「Stripe は完了しているのにアプリは
+    //   ずっと審査中」という詰みが発生していた。店主がダッシュボードを開くたびに
+    //   ここで救済されるので、通知の取りこぼしが恒久的な詰みにならない。
+    try {
+      const stripeFullyVerified = account.charges_enabled === true && account.payouts_enabled === true;
+      const [cur] = await db
+        .select({ status: storesTable.status, name: storesTable.name, ownerId: storesTable.ownerId })
+        .from(storesTable)
+        .where(eq(storesTable.id, storeId))
+        .limit(1);
+      let autoApprove = true; // 既定ON（このファイル内の他経路と同じ方針）
+      try {
+        const settingRows = await db.execute(sql`SELECT value FROM app_settings WHERE key = 'auto_approve_stripe_verified'`);
+        autoApprove = ((settingRows.rows[0] as any)?.value ?? "true") !== "false";
+      } catch (_) { /* 読めない場合は既定ONのまま */ }
+      if (
+        autoApprove &&
+        stripeFullyVerified &&
+        cur &&
+        (cur.status === "applied" || cur.status === "pending_review" || cur.status === "pending")
+      ) {
+        await db
+          .update(storesTable)
+          .set({ status: "approved" as any, isActive: true })
+          .where(eq(storesTable.id, storeId));
+        console.log(`[connect/status] ✅ 自己修復で承認: store ${storeId} (${cur.name})`);
+        if (cur.ownerId) {
+          try {
+            await db.insert(notificationsTable).values({
+              userId: cur.ownerId,
+              type: "store_approved",
+              title: "🎉 店舗が承認されました！",
+              body: `${cur.name} がおすそわけに公開されました。おすそわけバッグを出品しましょう！`,
+              read: false,
+            });
+          } catch (_) { /* 通知失敗は握り潰す */ }
+        }
+      }
+      // ★ 2026-08-05 自己修復(逆方向): Stripe が再提出を求めている(書類却下 / past_due)のに
+      //   こちらが 'applied'(審査中) のまま残っている店を 'pending' に差し戻す。
+      //   これは stripe-webhook.ts が account.updated 受信時に元々やっている処理と同一。
+      //   webhook を取りこぼすと「Stripeは却下しているのにアプリは"審査中"一点張りで
+      //   再入力フォームが出ない」という詰みになる(高槻駅 2026-08-05)。
+      //   'pending' に戻れば従来どおり bank-setup の再入力フォーム(不足項目つき)が出る。
+      else if (cur && cur.status === "applied") {
+        const reqs: any = (account as any).requirements ?? {};
+        const pastDue: string[] = reqs.past_due ?? [];
+        const errs: any[] = reqs.errors ?? [];
+        if (pastDue.length > 0 || errs.length > 0) {
+          const needsBankReregister = pastDue.some(
+            (f: string) => f === "external_account" || f.startsWith("external_account"),
+          );
+          await db
+            .update(storesTable)
+            .set({ status: "pending" as any, stripeNeedsBankReregister: needsBankReregister || false })
+            .where(eq(storesTable.id, storeId));
+          console.log(
+            `[connect/status] ⚠️ 自己修復で再入力へ差し戻し: store ${storeId} (${cur.name}) past_due=[${pastDue.join(", ")}] errors=${errs.length}`,
+          );
+        }
+      }
+    } catch (healErr) {
+      console.error("[connect/status] 自己修復スキップ (non-fatal):", healErr);
     }
 
     res.json({
@@ -1967,6 +2507,17 @@ router.get("/stores/:storeId/connect/account-data", requireAuth, requireStoreOwn
         url: biz?.url ?? '',
       },
       bankAccount,
+      // ★ 2026-08-05 診断ログ: 「生年月日だけ再入力フォームに引き継がれない」調査用。
+      //   値そのものは出さず、Stripeが返してきたか(有無)と除外条件だけを記録する。
+      _dobDiag: (() => {
+        console.log(
+          `[account-data] storeId=${storeId} dob present y/m/d=` +
+          `${ind?.dob?.year != null}/${ind?.dob?.month != null}/${ind?.dob?.day != null} ` +
+          `currently_due=[${(account.requirements?.currently_due ?? []).join(",")}] ` +
+          `err_reqs=[${(account.requirements?.errors ?? []).map((e: any) => e.requirement).join(",")}]`,
+        );
+        return undefined;
+      })(),
       // 不備フィールド（フロント側でこれらは空欄にする）
       rejectedFields: [
         ...(account.requirements?.currently_due  ?? []),
@@ -2124,7 +2675,7 @@ router.post("/stores/:storeId/connect/account-link", requireAuth, requireStoreOw
       return;
     }
 
-    const { returnUrl, refreshUrl } = req.body as { returnUrl?: string; refreshUrl?: string };
+    const { returnUrl, refreshUrl, full } = req.body as { returnUrl?: string; refreshUrl?: string; full?: boolean };
 
     const [store] = await db
       .select({ stripeAccountId: storesTable.stripeAccountId })
@@ -2154,8 +2705,22 @@ router.post("/stores/:storeId/connect/account-link", requireAuth, requireStoreOw
     const currentlyDue = account.requirements?.currently_due ?? [];
 
     // currently_due があれば account_update（差分更新）、なければ account_onboarding
+    // ★ リンク種別の選択 (2026-08-04 実挙動にもとづき確定):
+    //   account_update     = 全項目フォーム。**前回入力した値が埋まった状態**で開き、
+    //                        不足・不備の欄だけ空 or 要修正になる。最後に一括送信。
+    //   account_onboarding = 不足項目だけを順に聞く差分ウィザード。
+    //
+    //   一度でも登録を終えた店 (details_submitted) には **必ず account_update** を使う。
+    //   理由: 生年月日や氏名を打ち間違えている店では Stripe の要求が
+    //   「本人確認書類を出せ」だけになることがあり、差分ウィザードには
+    //   生年月日の欄が無いため、正しい書類を出しても登録値と一致せず
+    //   却下 → 再提出 → 却下 … と抜け出せなくなる。全項目フォームなら
+    //   店主が自分で登録値の誤りを見つけて直せる。
+    //   (full:true が来た場合も同じく全項目フォームを開く)
+    //
+    //   まだ登録を終えていない店だけ account_onboarding (初回の案内フロー)。
     const linkType: "account_onboarding" | "account_update" =
-      account.details_submitted && currentlyDue.length > 0
+      account.details_submitted || full === true
         ? "account_update"
         : "account_onboarding";
 
@@ -2190,7 +2755,21 @@ router.post("/stores/:storeId/connect/account-link", requireAuth, requireStoreOw
     });
   } catch (err: any) {
     console.error("Stripe Account Link error:", err);
-    res.status(500).json({ error: "stripe_error", message: err?.message ?? "Failed to create account link" });
+    // ★ 恒久却下(rejected.*)のアカウントは Stripe が account link の発行を拒否する。
+    //   英語の生エラーを店主に見せても詰むため、日本語でサポート導線を返す。
+    const raw = String(err?.message ?? "");
+    if (/rejected/i.test(raw)) {
+      return res.status(409).json({
+        error: "account_rejected",
+        message:
+          "このアカウントはStripeの審査で受付できない状態になっており、アプリ内での再提出ができません。" +
+          "LINEサポートへご連絡ください（別アカウントでの再登録をご案内します）。",
+      });
+    }
+    res.status(500).json({
+      error: "stripe_error",
+      message: "修正ページを開けませんでした。時間をおいて再度お試しください。解決しない場合はLINEサポートへご連絡ください。",
+    });
   }
 });
 
@@ -2313,10 +2892,27 @@ router.get("/stores/:storeId/connect/balance", requireAuth, requireStoreOwner, a
     } else if (schedule?.interval === "monthly" && schedule.monthly_anchor) {
       const year   = baseDate.getFullYear();
       const month  = baseDate.getMonth();
+      const day    = baseDate.getDate();
       const anchor = schedule.monthly_anchor;
-      let next = new Date(year, month, anchor);
-      if (next <= baseDate) next = new Date(year, month + 1, anchor);
-      nextPayoutDate = next.toISOString().slice(0, 10);
+      // ★ ここは日付ベース比較にする (旧: epoch 比較) 。
+      //   baseDate は JST +9h シフト epoch。 一方 new Date(y,m,d) はサーバ TZ (UTC) の
+      //   Y-M-D 00:00 epoch。 epoch 直接比較すると JST anchor日 00:00 の瞬間から
+      //   `next < baseDate` になり anchor 日当日ずっと翌月にドリフトする。
+      //   例: JST 7/25 00:00 → baseDate epoch=UTC 7/24 15:00、 next epoch=UTC 7/25 00:00
+      //       → next < baseDate ではないが、 実測では baseDate は +9h されて
+      //       UTC 上は7/25 15:00 相当になり next(UTC 7/25 00:00) < baseDate → 翌月へ。
+      //   → anchor 日 (JST) 当日は当月 anchor をキープしたい。
+      const advance = day > anchor;
+      const next = advance
+        ? new Date(year, month + 1, anchor)
+        : new Date(year, month, anchor);
+      // toISOString ではなく手動フォーマット (サーバ TZ が UTC で
+      //   new Date(y,m,d) は UTC 0:00 → toISOString でそのまま同日なので実害はないが、
+      //   将来 TZ 変わった時に off-by-one を避けるため明示化)。
+      const y2 = next.getFullYear();
+      const m2 = String(next.getMonth() + 1).padStart(2, "0");
+      const d2 = String(next.getDate()).padStart(2, "0");
+      nextPayoutDate = `${y2}-${m2}-${d2}`;
     }
 
     // 最近の振込履歴（最大5件）— 並列ブロック1で取得済みの結果を流用
@@ -2594,15 +3190,16 @@ router.put("/stores/:storeId/connect/kyc", requireAuth, requireStoreOwner, async
       .set({ stripeChargesEnabled: account.charges_enabled })
       .where(eq(storesTable.id, storeId));
 
-    // charges_enabled なら自動承認（デフォルトON。app_settings で 'false' を明示すると無効）
+    // ★ 自動承認は「Stripeが完全にOK = 決済◯かつ入金◯」の時だけ（2026-08-04厳格化）。
+    //   charges_enabled 単独では承認しない（入金停止のままマップ公開される事故の防止）。
     let kycAutoApproved = false;
-    if (account.charges_enabled) {
+    if (account.charges_enabled && account.payouts_enabled) {
       try {
         const settingRows = await db.execute(sql`SELECT value FROM app_settings WHERE key = 'auto_approve_stripe_verified'`);
         const settingVal = (settingRows.rows[0] as any)?.value ?? 'true';
         if (settingVal !== 'false') kycAutoApproved = true;
       } catch (_) {
-        kycAutoApproved = true; // DB読み込みエラー時もデフォルトON
+        kycAutoApproved = true; // 完全体確認済みならDB読み込みエラー時も承認してよい
       }
     }
 
@@ -2804,6 +3401,40 @@ router.post("/stores/:storeId/connect/kyc-document", requireAuth, requireStoreOw
 });
 
 // ─── Stripe Custom Account 銀行口座セットアップ ───────────────────────────────
+// ── 住所「町名に一致する候補が複数」エラーの自動補正ヘルパー ──────────────────
+//   mokopan (2026-09-02, 個人) → 2026-09-28 法人(company)・代表者(person) にも適用拡張。
+//   番地欄の先頭に書かれた「◯丁目/◯番町/◯条」を町名側へ移す（例: 日吉台 + 5番町11-1 → 日吉台5番町 + 11-1）。
+function moveChomeToTown(town?: string, line1?: string): [string, string] | null {
+  if (!town || !line1) return null;
+  const m = line1.match(/^\s*([0-9０-９一二三四五六七八九十]+)\s*(丁目|番町|条|チョウメ|バンチョウ|ジョウ)\s*/);
+  if (!m) return null;
+  const rest = line1.slice(m[0].length).replace(/^[-ー‐−–ｰ\s]+/, '');
+  if (!rest) return null;
+  return [town + m[1] + m[2], rest];
+}
+// individual / company / person のペイロードを受け取り、address_kanji/kana の町名を補正した複製を返す。
+// 補正できる形でなければ null（リトライしない）。
+function retryEntityWithFixedTown<T extends Record<string, any>>(entity: T): T | null {
+  const kj = moveChomeToTown(entity?.address_kanji?.town, entity?.address_kanji?.line1);
+  if (!kj) return null;
+  const copy: any = JSON.parse(JSON.stringify(entity));
+  copy.address_kanji.town  = kj[0];
+  copy.address_kanji.line1 = kj[1];
+  const kn = moveChomeToTown(copy.address_kana?.town, copy.address_kana?.line1);
+  if (kn) { copy.address_kana.town = kn[0]; copy.address_kana.line1 = kn[1]; }
+  return copy;
+}
+
+// ── 法人番号の検査用数字 (国税庁告示の計算式) ─────────────────────────────────
+//   登記簿の会社法人等番号(12桁)の先頭に付ける1桁。12桁しか手元にない店主が
+//   0埋めして無効な13桁を作る事故(ConteCafe 2026-09-28)を自動変換で根絶する。
+//   検証済み: トヨタ/ソフトバンク/楽天の公開法人番号で計算値が一致。
+function corporateCheckDigit12(base12: string): number {
+  let sum = 0;
+  for (let n = 1; n <= 12; n++) sum += Number(base12[12 - n]) * (n % 2 === 1 ? 1 : 2);
+  return 9 - (sum % 9);
+}
+
 // POST /api/stores/:storeId/connect/bank-setup
 // STEP1-2（アカウント作成＋口座登録）を同期で実行してクライアントにレスポンスを返し、
 // STEP3-5（書類アップロード＋KYC更新＋DB更新）をバックグラウンドで継続する。
@@ -3057,7 +3688,10 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       stateKanji: k.stateKanji ?? '', cityKanji: k.cityKanji ?? '', townKanji: k.townKanji ?? '', line1Kanji: k.line1Kanji ?? '',
       stateKana:  k.stateKana  ?? '', cityKana:  k.cityKana  ?? '', townKana:  k.townKana  ?? '', line1Kana:  k.line1Kana  ?? '',
     });
-    console.log(`[bank-setup] 住所正規化結果 — kanji.town="${jpAddr.address_kanji.town}" line1="${jpAddr.address_kanji.line1}" / kana.town="${jpAddr.address_kana.town}" line1="${jpAddr.address_kana.line1}"`);
+    // ★ 番地(line1)は自宅住所PIIのため数字をマスクしてログ出力 (2026-10-03)。
+    //   町名+文字種はmokopan/ConteCafe級の住所デバッグに必須なので残す。
+    const maskNum = (s: string) => (s ?? '').replace(/[0-9０-９]/g, '#');
+    console.log(`[bank-setup] 住所正規化結果 — kanji.town="${jpAddr.address_kanji.town}" line1="${maskNum(jpAddr.address_kanji.line1)}" / kana.town="${jpAddr.address_kana.town}" line1="${maskNum(jpAddr.address_kana.line1)}"`);
 
     const indiv: Record<string, any> = {};
     if (k.firstNameKana?.trim())  indiv.first_name_kana  = toFullWidthKana(k.firstNameKana.trim());
@@ -3115,11 +3749,57 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       if (Object.keys(indiv).length > 0) step4Payload.individual = indiv;
     }
 
-    console.log(`📤 [bank-setup] STEP4 accounts.update (sync): ${JSON.stringify(step4Payload, null, 2)}`);
+    // ★★ 安全装置 (2026-08-05): 空文字の項目を送信直前に全部取り除く。
+    //   Stripe は空文字を「その項目を削除しろ」という意味に取る。すでに本人確認が
+    //   済んでいる口座に対して1つでも空文字を送ると
+    //   "Once a full set of basic legal entity information has been provided ...
+    //    you cannot unset any of it" で【更新まるごと失敗】する。
+    //   実際に郵便番号が空文字になった店で再提出が丸ごと弾かれた(高槻駅 2026-08-05)。
+    //   「送らない」= Stripe側の既存値がそのまま残る、が常に正しい挙動。
+    const pruneEmpty = (o: any): any => {
+      if (Array.isArray(o)) return o;
+      if (o === null || typeof o !== "object") return o;
+      const out: Record<string, any> = {};
+      for (const [key, val] of Object.entries(o)) {
+        if (val === "" || val === null || val === undefined) continue;
+        if (typeof val === "object" && !Array.isArray(val)) {
+          const child = pruneEmpty(val);
+          if (Object.keys(child).length > 0) out[key] = child;
+          continue;
+        }
+        out[key] = val;
+      }
+      return out;
+    };
+    const droppedEmptyKeys: string[] = [];
+    (function findEmpty(o: any, path = "") {
+      if (o === null || typeof o !== "object" || Array.isArray(o)) return;
+      for (const [key, val] of Object.entries(o)) {
+        const p = path ? `${path}.${key}` : key;
+        if (val === "" || val === null || val === undefined) droppedEmptyKeys.push(p);
+        else findEmpty(val, p);
+      }
+    })(step4Payload);
+    if (droppedEmptyKeys.length > 0) {
+      console.warn(`⚠️  [bank-setup] STEP4 空欄のため送信対象から除外: ${droppedEmptyKeys.join(", ")}`);
+    }
+    const step4Clean = pruneEmpty(step4Payload);
+
+    // ★ セキュリティ (2026-10-03): KYC PII(氏名/生年月日/住所/電話)はログに出さない。
+    //   デバッグには「どのフィールドを送ったか」のキー一覧で十分 (7/08監査ポリシー準拠)。
+    const step4Keys = Object.entries(step4Clean as Record<string, any>).map(([k, v]) =>
+      (v && typeof v === 'object' && !Array.isArray(v)) ? `${k}{${Object.keys(v).join(',')}}` : k).join(' ');
+    console.log(`📤 [bank-setup] STEP4 accounts.update (sync) fields: ${step4Keys}`);
     let kycWarning = false;
+    // ★ 2026-08-05 警告の中身をクライアントに返す。旧実装は kycWarning(真偽値)だけを返し、
+    //   画面には「個人情報の一部が正しく送信されませんでした」という同じ文言しか出せなかった。
+    //   実際には書類のアップロードは別途成功しているケースが多く(高槻駅)、店主が
+    //   「全部失敗した」と誤解して何度も送り直す原因になっていた。
+    let kycMissingFields: string[] = [];
+    let kycErrorMessage: string | null = null;
     try {
       const kycAcc = await stripeCall(
-        stripe.accounts.update(accountId!, step4Payload as any),
+        stripe.accounts.update(accountId!, step4Clean as any),
         "accounts.update(kyc-sync)", 30000
       ) as any;
       console.log(`✅ [bank-setup] STEP4 accounts.update OK (charges_enabled=${kycAcc?.charges_enabled})`);
@@ -3139,18 +3819,56 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       if (missingIndividual.length > 0) {
         console.warn(`⚠️  [bank-setup] Individual fields still missing after STEP4 — reverting to pending: ${missingIndividual.join(', ')}`);
         await db.update(storesTable).set({ status: 'pending' }).where(eq(storesTable.id, storeId));
+        kycMissingFields = missingIndividual;
         kycWarning = true;
       } else {
         console.log(`✅ [bank-setup] STEP4 OK — remaining currently_due (verification docs expected): ${JSON.stringify(stillDue)}`);
       }
     } catch (kycErr: any) {
       const errMsg = kycErr?.raw?.message ?? kycErr?.message ?? '';
-      console.warn(`⚠️  [bank-setup] STEP4 accounts.update FAILED — reverting to pending: ${errMsg}`);
-      // 個人情報が届かなかったのでステータスを pending に戻して再入力を促す
-      try {
-        await db.update(storesTable).set({ status: 'pending' }).where(eq(storesTable.id, storeId));
-      } catch (_) {}
-      kycWarning = true;
+      // ★ 自動リカバリ (2026-09-02 mokopan): Stripe の「町名に一致する候補が複数あります」は、
+      //   番地欄の先頭に書かれた「◯丁目/◯番町/◯条」を町名側へ移すと通る
+      //   (高槻の日吉台は正式町名が「日吉台一〜七番町」のため「日吉台」だけでは特定不能)。
+      //   1回だけ補正して再試行し、それでもダメなら従来どおり pending に戻す。
+      let recovered = false;
+      if (/matching the provided town/i.test(errMsg)) {
+        // individual / company どちらのペイロードでも補正 (2026-09-28 法人拡張)
+        const entKey = (step4Clean as any).individual ? 'individual' : (step4Clean as any).company ? 'company' : null;
+        const fixedEnt = entKey ? retryEntityWithFixedTown((step4Clean as any)[entKey]) : null;
+        if (entKey && fixedEnt) {
+          const retryPayload: any = JSON.parse(JSON.stringify(step4Clean));
+          retryPayload[entKey] = fixedEnt;
+          console.log(`♻️  [bank-setup] STEP4 自動リカバリ(${entKey}): 町名を "${fixedEnt.address_kanji.town}" に補正して再試行`);
+          try {
+            const kycAcc2 = await stripeCall(
+              stripe.accounts.update(accountId!, retryPayload),
+              "accounts.update(kyc-retry-town)", 30000
+            ) as any;
+            console.log(`✅ [bank-setup] STEP4 リトライ成功 (charges_enabled=${kycAcc2?.charges_enabled})`);
+            recovered = true;
+            const stillDue2: string[] = kycAcc2?.requirements?.currently_due ?? [];
+            const missing2 = stillDue2.filter((f: string) =>
+              (f.startsWith('individual.') || f.startsWith('company.')) && !f.includes('verification') && !f.includes('document'));
+            if (missing2.length > 0) {
+              console.warn(`⚠️  [bank-setup] リトライ成功だが不足項目あり — reverting to pending: ${missing2.join(', ')}`);
+              await db.update(storesTable).set({ status: 'pending' }).where(eq(storesTable.id, storeId));
+              kycMissingFields = missing2;
+              kycWarning = true;
+            }
+          } catch (retryErr: any) {
+            console.warn(`⚠️  [bank-setup] STEP4 リトライも失敗: ${retryErr?.raw?.message ?? retryErr?.message}`);
+          }
+        }
+      }
+      if (!recovered) {
+        console.warn(`⚠️  [bank-setup] STEP4 accounts.update FAILED — reverting to pending: ${errMsg}`);
+        // 個人情報が届かなかったのでステータスを pending に戻して再入力を促す
+        try {
+          await db.update(storesTable).set({ status: 'pending' }).where(eq(storesTable.id, storeId));
+        } catch (_) {}
+        kycErrorMessage = errMsg || null;
+        kycWarning = true;
+      }
     }
 
     // ── STEP 4b: 法人代表者を Persons API で同期登録/更新 ──
@@ -3187,7 +3905,8 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       // Stripe JP: 代表者の政治的関与を明示（未設定だと KYC pending になる場合がある）
       repPayload.political_exposure = "none";
 
-      console.log(`📤 [bank-setup] STEP4b person payload: ${JSON.stringify(repPayload, null, 2)}`);
+      // ★ セキュリティ (2026-10-03): 代表者PIIはログに出さない。キー一覧のみ (7/08監査ポリシー準拠)。
+      console.log(`📤 [bank-setup] STEP4b person payload fields: ${Object.keys(repPayload).join(',')}`);
       try {
         const existingPersons = await stripeCall(
           stripe.accounts.listPersons(accountId!, { limit: 10 }),
@@ -3210,10 +3929,45 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
           console.log(`✅ [bank-setup] STEP4b Persons.create OK id=${created?.id}`);
         }
       } catch (personErr: any) {
-        // エラーをログに出すが処理は継続（書類なしでは一部要件が残るのは正常）
-        console.warn(`⚠️  [bank-setup] STEP4b Persons API FAILED: ${personErr?.raw?.message ?? personErr?.message}`);
+        const pMsg = personErr?.raw?.message ?? personErr?.message ?? '';
+        console.warn(`⚠️  [bank-setup] STEP4b Persons API FAILED: ${pMsg}`);
         console.warn(`   type=${personErr?.type} code=${personErr?.raw?.code ?? personErr?.code} param=${personErr?.raw?.param ?? personErr?.param}`);
         console.warn(`   raw: ${JSON.stringify(personErr?.raw ?? { message: personErr?.message })}`);
+
+        // ★ 代表者住所の町名エラーも自動リカバリ (2026-09-28: STEP4 と同じ補正を person にも適用)
+        let personRecovered = false;
+        if (/matching the provided town/i.test(pMsg)) {
+          const fixedRep = retryEntityWithFixedTown(repPayload);
+          if (fixedRep) {
+            console.log(`♻️  [bank-setup] STEP4b 自動リカバリ: 代表者住所の町名を "${fixedRep.address_kanji.town}" に補正して再試行`);
+            try {
+              const ppl = await stripeCall(stripe.accounts.listPersons(accountId!, { limit: 10 }), "persons.list-retry", 10000) as any;
+              const rep2 = (ppl?.data ?? []).find((p: any) => p.relationship?.representative === true);
+              if (rep2) {
+                await stripeCall(stripe.accounts.updatePerson(accountId!, rep2.id, fixedRep as any), "persons.update-retry", 30000);
+                syncPersonId = rep2.id;
+              } else {
+                const created2 = await stripeCall(stripe.accounts.createPerson(accountId!, fixedRep as any), "persons.create-retry", 30000) as any;
+                syncPersonId = created2?.id ?? null;
+              }
+              personRecovered = !!syncPersonId;
+              console.log(`✅ [bank-setup] STEP4b リトライ成功 id=${syncPersonId}`);
+            } catch (r2: any) {
+              console.warn(`⚠️  [bank-setup] STEP4b リトライも失敗: ${r2?.raw?.message ?? r2?.message}`);
+            }
+          }
+        }
+
+        // ★ 2026-09-28 ConteCafe: 代表者未登録のまま「登録完了」と表示され、店主は成功したと
+        //   思い込み、後日 Stripe から「代表者を指定してください」等5件の制限が届いていた。
+        //   法人にとって代表者登録の失敗は確実に入金停止になるため、店主の画面に必ず出す。
+        if (!personRecovered) {
+          kycWarning = true;
+          if (!kycErrorMessage) kycErrorMessage = pMsg || null;
+          try {
+            await db.update(storesTable).set({ status: 'pending' }).where(eq(storesTable.id, storeId));
+          } catch (_) {}
+        }
       }
     }
 
@@ -3227,16 +3981,29 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
         );
         console.log(`✅ [bank-setup] STEP4b-2 directors_provided=true submitted`);
       } catch (dirErr: any) {
-        console.warn(`⚠️  [bank-setup] STEP4b-2 directors_provided FAILED (non-fatal): ${dirErr?.raw?.message ?? dirErr?.message}`);
+        // ★ 2026-09-28: 失敗すると後日「取締役を指定してください」の制限になる。黙らせない。
+        console.warn(`⚠️  [bank-setup] STEP4b-2 directors_provided FAILED: ${dirErr?.raw?.message ?? dirErr?.message}`);
+        kycWarning = true;
+        if (!kycErrorMessage) kycErrorMessage = `役員情報の確定に失敗しました: ${dirErr?.raw?.message ?? dirErr?.message ?? ''}`;
       }
     }
 
     // ── STEP 4c: 法人番号（tax_id）同期送信 ──
     if (businessType === "company") {
       const isTestKey = (process.env.STRIPE_SECRET_KEY ?? "").startsWith("sk_test_");
-      const rawTaxId  = (kycData.companyTaxId ?? "").replace(/-/g, '').trim();
+      const rawTaxId  = (kycData.companyTaxId ?? "").replace(/[^0-9]/g, '').trim();
       // ⚠️ "0000000000000" は Stripe JP テスト環境で invalid。テスト時は "9999999999999" を使用する
-      const taxId = rawTaxId.length === 13 ? rawTaxId : (isTestKey ? "9999999999999" : null);
+      // ★ 2026-09-28: 12桁(登記の会社法人等番号)は検査用数字を頭に付けて正式な13桁に自動変換。
+      //   13桁は検査用数字を照合し、不正(0埋め等)なら送らずに店主へ差し戻す。
+      let taxId: string | null = null;
+      if (rawTaxId.length === 12) {
+        taxId = String(corporateCheckDigit12(rawTaxId)) + rawTaxId;
+        console.log(`♻️  [bank-setup] STEP4c 12桁→13桁自動変換で送信`);
+      } else if (rawTaxId.length === 13 && Number(rawTaxId[0]) === corporateCheckDigit12(rawTaxId.slice(1))) {
+        taxId = rawTaxId;
+      } else if (isTestKey) {
+        taxId = "9999999999999";
+      }
       if (taxId) {
         try {
           await stripeCall(
@@ -3245,14 +4012,32 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
           );
           console.log(`✅ [bank-setup] STEP4c company.tax_id submitted (test=${isTestKey})`);
         } catch (taxErr: any) {
-          console.warn(`⚠️  [bank-setup] STEP4c tax_id FAILED (non-fatal): ${taxErr?.raw?.message ?? taxErr?.message}`);
+          // ★ 2026-09-28: 法人番号未達は後日「法人番号を指定してください」の制限になる。黙らせない。
+          console.warn(`⚠️  [bank-setup] STEP4c tax_id FAILED: ${taxErr?.raw?.message ?? taxErr?.message}`);
+          kycWarning = true;
+          if (!kycErrorMessage) kycErrorMessage = `法人番号の登録に失敗しました: ${taxErr?.raw?.message ?? taxErr?.message ?? ''}`;
+          try { await db.update(storesTable).set({ status: 'pending' }).where(eq(storesTable.id, storeId)); } catch (_) {}
         }
+      } else {
+        // 桁数不正・検査用数字の不一致(0埋め等)は送らずに店主へ差し戻す
+        console.warn(`⚠️  [bank-setup] STEP4c tax_id SKIPPED — 不正な法人番号: len=${rawTaxId.length}`);
+        kycWarning = true;
+        if (!kycErrorMessage) kycErrorMessage = '法人番号が正しくありません。登記簿の12桁（会社法人等番号）をお持ちの場合は、0を足さずに12桁のまま入力してください（自動で正式な13桁に変換されます）。';
+        try { await db.update(storesTable).set({ status: 'pending' }).where(eq(storesTable.id, storeId)); } catch (_) {}
       }
     }
 
     // STEP1-4 完了 → クライアントにレスポンスを返す（BG は書類アップロードのみ）
     console.log(`✅ [bank-setup] STEP1-4 complete — responding to client (syncPersonId=${syncPersonId}, kycWarning=${kycWarning})`);
-    res.json({ success: true, accountId, partial: true, kycWarning });
+    res.json({
+      success: true, accountId, partial: true, kycWarning,
+      // 何が足りないのか / なぜ弾かれたのかを画面で出し分けるための情報
+      kycMissingFields,
+      kycErrorMessage,
+      // 本人確認書類はこのリクエストで受け取り済み(この後バックグラウンドでStripeへ送る)。
+      // 個人情報の更新が失敗しても書類提出は別経路で成立するため、画面で明示する。
+      docsReceived: !!docFrontBase64,
+    });
 
   } catch (err: any) {
     console.error("❌ [bank-setup] Fatal error (STEP1-4):", err?.raw?.message ?? err?.message ?? err);
@@ -3312,8 +4097,14 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       const backFileRaw = backResult.status  === "fulfilled" ? backResult.value  : null;
       const backFileId  = backFileRaw ? (backFileRaw as any).id : undefined;
 
+      // ★ 2026-08-05 書類がStripeに渡らなかったことを「握り潰さない」ための判定用。
+      //   旧実装は警告ログを出すだけで、店主の画面には「登録完了！」と表示されていた。
+      let docAttachFailed = false;
       if (frontFile) console.log(`✅ [bank-setup] BG Front doc: ${(frontFile as any).id}`);
-      else           console.warn(`⚠️  [bank-setup] BG Front doc upload failed`);
+      else {
+        docAttachFailed = true;
+        console.warn(`⚠️  [bank-setup] BG Front doc upload failed`);
+      }
       if (backFileId) console.log(`✅ [bank-setup] BG Back doc: ${backFileId}`);
 
       // 営業許可証を Supabase Storage に保存
@@ -3389,6 +4180,7 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
           );
           console.log(`✅ [bank-setup] BG Person docs updated OK: person=${syncPersonId2}`);
         } catch (personDocErr: any) {
+          docAttachFailed = true;
           console.warn(`⚠️  [bank-setup] BG person doc update FAILED: ${personDocErr?.raw?.message ?? personDocErr?.message}`);
         }
       } else if (businessType === "individual" && frontFile) {
@@ -3409,12 +4201,19 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
           );
           console.log(`✅ [bank-setup] BG individual verification docs updated OK`);
         } catch (indDocErr: any) {
+          docAttachFailed = true;
           console.warn(`⚠️  [bank-setup] BG individual doc update FAILED: ${indDocErr?.raw?.message ?? indDocErr?.message}`);
         }
+      } else if (businessType === "company" && frontFile && !syncPersonId2) {
+        // ★ 2026-09-28: 代表者 Person が存在しないと書類はどこにも添付されない。
+        //   旧実装はこのケースを黙って素通りしていた(ConteCafe)。必ず失敗扱いにする。
+        docAttachFailed = true;
+        console.warn(`⚠️  [bank-setup] BG doc attach SKIPPED — 代表者Personが存在しません (storeId=${storeId})`);
       }
 
       // 書類添付後の charges_enabled / payouts_enabled を確認
       let kycPayoutsEnabled: boolean | null = null;
+      let postDocsDue: string[] = [];
       try {
         const refreshed = await stripeCall(
           stripe.accounts.retrieve(accountId!),
@@ -3423,24 +4222,75 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
         kycChargesEnabled = refreshed?.charges_enabled ?? false;
         kycPayoutsEnabled = refreshed?.payouts_enabled ?? false;
         console.log(`   post-docs charges_enabled=${refreshed?.charges_enabled} payouts_enabled=${refreshed?.payouts_enabled}`);
+        postDocsDue = refreshed?.requirements?.currently_due ?? [];
         console.log(`   post-docs currently_due: ${JSON.stringify(refreshed?.requirements?.currently_due)}`);
         console.log(`   post-docs eventually_due: ${JSON.stringify(refreshed?.requirements?.eventually_due)}`);
       } catch (_) {}
 
+      // ★★ 2026-08-05 サイレント失敗の封鎖:
+      //   本人確認書類がStripeに届かなかった場合、旧実装は警告ログを出すだけで
+      //   店主の画面には「登録完了！」と表示され、そのまま永久に待ち続ける詰みになっていた。
+      //   届いていないと判定できたときは status を pending に戻して【再入力フォームを出し】、
+      //   ベル通知でも本人に知らせる。判定は安全側(迷ったら知らせる)に倒す。
+      let docDeliveryFailed = false;
+      try {
+        const docStillDue = postDocsDue.some(
+          (f: string) => f.includes("verification") || f.includes("document"),
+        );
+        const fullyOk = kycChargesEnabled === true && kycPayoutsEnabled === true;
+        docDeliveryFailed = (docAttachFailed || docStillDue) && !fullyOk;
+        if (docDeliveryFailed) {
+          console.warn(
+            `❌ [bank-setup] BG 本人確認書類がStripeに届いていない — storeId=${storeId} ` +
+            `attachFailed=${docAttachFailed} stillDue=[${postDocsDue.join(",")}] → pending に差し戻し`,
+          );
+          // ※ status はここでは書き換えない。直後の STEP5 が status を上書きするため、
+          //   STEP5 側の newStatus 決定に docDeliveryFailed を渡して 'pending' にさせる。
+          const [cur] = await db
+            .select({ status: storesTable.status, ownerId: storesTable.ownerId, name: storesTable.name })
+            .from(storesTable)
+            .where(eq(storesTable.id, storeId))
+            .limit(1);
+          if (cur?.ownerId) {
+            try {
+              // ★ 「届かなかった」のか「Stripeがまだ求めている」のかで文言を分ける。
+              //   一律に「送信できませんでした」と出すと、実際は届いているのに
+              //   同じ書類を何度も送り直させることになる。
+              await db.insert(notificationsTable).values({
+                userId: cur.ownerId,
+                type: "store_kyc_doc_failed",
+                title: docAttachFailed
+                  ? "⚠️ 本人確認書類が送信できませんでした"
+                  : "⚠️ 本人確認書類の再提出が必要です",
+                body: docAttachFailed
+                  ? "通信の問題などで書類が届きませんでした。お手数ですが、もう一度撮影して再提出してください。"
+                  : "決済会社が本人確認書類の提出を引き続き求めています。アプリの出品管理から再提出してください。",
+                read: false,
+              });
+            } catch (_) { /* 通知失敗は握り潰す */ }
+          }
+        }
+      } catch (docCheckErr: any) {
+        console.error("[bank-setup] BG 書類到達チェック失敗 (non-fatal):", docCheckErr?.message);
+      }
+
       // STEP 5: DB 更新 + オーナーの role を確実に store_owner に設定
       // charges_enabled なら自動承認（デフォルトON。app_settings で 'false' を明示すると無効）
       let autoApproved = false;
-      if (kycChargesEnabled === true) {
+      // ★ 自動承認は決済◯かつ入金◯の完全体だけ（2026-08-04厳格化）
+      if (kycChargesEnabled === true && kycPayoutsEnabled === true) {
         try {
           const settingRows = await db.execute(sql`SELECT value FROM app_settings WHERE key = 'auto_approve_stripe_verified'`);
           const settingVal = (settingRows.rows[0] as any)?.value ?? 'true';
           if (settingVal !== 'false') autoApproved = true;
         } catch (_) {
-          autoApproved = true; // DB読み込みエラー時もデフォルトON
+          autoApproved = true; // 完全体確認済みならDB読み込みエラー時も承認してよい
         }
       }
 
-      const newStatus = autoApproved ? "approved" : "applied";
+      // ★ 書類がStripeに届いていない場合は「審査中(applied)」にせず
+      //   'pending' に落として再入力フォームを出す (2026-08-05)。
+      const newStatus = autoApproved ? "approved" : (docDeliveryFailed ? "pending" : "applied");
       // 現在の store を更新（許可証アップロード追跡フラグ含む）
       await db.update(storesTable).set({
         status: newStatus,

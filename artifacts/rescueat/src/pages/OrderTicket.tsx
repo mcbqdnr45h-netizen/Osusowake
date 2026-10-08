@@ -15,6 +15,7 @@ import { toUserErrorMessage } from '@/lib/error-message';
 import { ReviewModal } from '@/components/ReviewModal';
 import { useUserId } from '@/hooks/use-user';
 import { authedFetch } from '@/lib/authed-fetch';
+import { optimizedImage, IMG_W } from '@/lib/image-utils';
 
 // ─── localStorage helpers ─────────────────────────────────────────────────
 
@@ -386,7 +387,7 @@ export default function OrderTicket() {
         )}
       </AnimatePresence>
 
-      <div className="max-w-md md:max-w-none mx-auto pb-10 overflow-x-hidden w-full">
+      <div className="w-full max-w-md md:max-w-none mx-auto pb-10 overflow-x-hidden w-full">
 
         {/* ヘッダー */}
         <div className="flex items-center gap-3 px-4 pt-4 pb-4 sticky top-0 md:top-16 bg-background/90 backdrop-blur-sm z-10 border-b border-border/40">
@@ -438,6 +439,25 @@ export default function OrderTicket() {
             )}
           </AnimatePresence>
 
+          {/* ★ 受取場所・注意（2026-08-28 サンドイッチピコリの報告より）
+              受取場所が店頭と違う店（ホテルフロント渡し等）があり、
+              客が店の前まで行って諦めて帰る事故が実際に起きた。
+              受取の瞬間に必ず見るこの画面に、注意を目立つ形で常設する。 */}
+          {!isCancelled && (reservation.bag as { pickupNote?: string | null })?.pickupNote?.trim() && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
+              className="bg-amber-50 dark:bg-amber-950/40 border-2 border-amber-400 rounded-2xl px-4 py-3.5"
+            >
+              <p className="text-[12px] font-black text-amber-700 dark:text-amber-400 flex items-center gap-1.5 mb-1.5">
+                <MapPin className="w-3.5 h-3.5" />
+                受取場所・受取時の注意
+              </p>
+              <p className="text-[13px] font-bold text-amber-900 dark:text-amber-200 leading-relaxed whitespace-pre-wrap">
+                {(reservation.bag as { pickupNote?: string | null }).pickupNote}
+              </p>
+            </motion.div>
+          )}
+
           {/* 店舗情報 */}
           <motion.div
             initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
@@ -446,7 +466,7 @@ export default function OrderTicket() {
             <div className="flex gap-3 items-center mb-3">
               <div className="w-12 h-12 bg-muted rounded-xl overflow-hidden shrink-0">
                 <img
-                  src={reservation.store?.iconUrl || reservation.store?.imageUrl || 'https://images.unsplash.com/photo-1542838132-92c53300491e?w=200&q=70'}
+                  src={optimizedImage(reservation.store?.iconUrl, IMG_W.icon) || optimizedImage(reservation.store?.imageUrl, IMG_W.icon) || 'https://images.unsplash.com/photo-1542838132-92c53300491e?w=200&q=70'}
                   alt=""
                   className="w-full h-full object-cover"
                 />

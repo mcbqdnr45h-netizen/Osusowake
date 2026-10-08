@@ -69,7 +69,7 @@ export async function sendStoreApprovalEmail(params: {
 
       <!-- CTAボタン -->
       <div style="text-align:center;margin-bottom:28px;">
-        <a href="${appUrl}/store"
+        <a href="${appUrl}/store/dashboard"
            style="display:inline-block;background:linear-gradient(135deg,#F26419,#E04E00);color:#ffffff;font-size:16px;font-weight:900;padding:16px 40px;border-radius:14px;text-decoration:none;letter-spacing:0.02em;">
           店舗ダッシュボードへ →
         </a>
@@ -166,7 +166,7 @@ export async function sendStoreOrderNotificationEmail(params: {
         <p style="color:#666;font-size:11px;margin:8px 0 0;">お客様がご来店時にこのコードを提示します</p>
       </div>
       <div style="text-align:center;margin:24px 0 12px;">
-        <a href="${appUrl}/store/orders" style="display:inline-block;background:linear-gradient(135deg,#F26419,#E04E00);color:#fff;font-size:15px;font-weight:900;padding:14px 36px;border-radius:12px;text-decoration:none;">
+        <a href="${appUrl}/store/dashboard" style="display:inline-block;background:linear-gradient(135deg,#F26419,#E04E00);color:#fff;font-size:15px;font-weight:900;padding:14px 36px;border-radius:12px;text-decoration:none;">
           注文一覧を見る →
         </a>
       </div>

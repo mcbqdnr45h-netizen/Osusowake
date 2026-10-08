@@ -18,6 +18,20 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- ★ 2026-08-12 サイトのリンクをアプリで開く (App Links)。
+                 これが無いと LINE やメールに貼った osusowakejapan.org のリンクを
+                 踏んでも【ブラウザが開くだけでアプリが起動しない】。
+                 autoVerify=true にすると、インストール時に Android が
+                 https://osusowakejapan.org/.well-known/assetlinks.json を取得して
+                 署名を照合する（サーバー側で配信済み）。 -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="osusowakejapan.org" />
+                <data android:scheme="https" android:host="www.osusowakejapan.org" />
+            </intent-filter>
         </activity>
 
         <provider
@@ -27,6 +41,16 @@
             android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- ★ プッシュ通知のステータスバー用アイコン。Android は白シルエット+透過が必須で、
+             未指定だとランチャーアイコンが単色の四角に潰れて表示される。手のロゴの
+             シルエット (ic_stat_notify) とブランドピンクを明示指定して iPhone 同等の見た目にする。 -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@drawable/ic_stat_notify" />
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_color"
+            android:resource="@color/notificationIconColor" />
     </application>
 
     <!-- Permissions -->

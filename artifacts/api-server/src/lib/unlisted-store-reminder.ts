@@ -4,6 +4,7 @@ import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { sendPushToUser, type PushPayload } from "./push.js";
 import { supabaseAdmin } from "./supabase.js";
 import { parseHolidayWeekdays } from "./recurring-publisher.js";
+import { claimOncePerDay } from "./once-per-day.js";
 
 // ── 店への「未出品リマインド」──
 //   今のおすそわけ最大のボトルネックは供給（店が出品しない）。
@@ -47,8 +48,15 @@ export async function remindUnlistedStores(): Promise<void> {
   if (!Number.isFinite(targetHour) || hour !== targetHour) return;
 
   // 3. 当日1回に制限
+  //    ★ メモリ(sentLog)だけだと【サーバー再起動で記録が消えて再送】される。
+  //      デプロイの多い日に店舗様へリマインドが2回飛ぶ事故が実際に発生したため、
+  //      DBで「その日1回」を保証する（再起動しても、machineが増えても1回）。
   const logKey = `unlisted:${dateStr}`;
   if (sentLog.has(logKey)) return;
+  if (!(await claimOncePerDay("unlisted-reminder", dateStr))) {
+    sentLog.add(logKey); // 他プロセス/再起動前に送信済み → このプロセスでも以後スキップ
+    return;
+  }
   sentLog.add(logKey);
 
   try {

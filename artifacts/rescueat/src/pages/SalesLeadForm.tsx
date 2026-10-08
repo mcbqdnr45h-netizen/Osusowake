@@ -47,7 +47,7 @@ export default function SalesLeadForm() {
         {/* ヘッダー */}
         <div className="sticky z-40 bg-white/90 backdrop-blur-xl border-b border-border/40"
           style={{ top: 'env(safe-area-inset-top)' }}>
-          <div className="max-w-lg md:max-w-3xl mx-auto px-4 h-14 flex items-center gap-3">
+          <div className="w-full max-w-lg md:max-w-3xl mx-auto px-4 h-14 flex items-center gap-3">
             <button
               onClick={() => navigate('/mypage')}
               className="p-2 -ml-2 rounded-xl hover:bg-secondary transition-colors"
@@ -61,7 +61,7 @@ export default function SalesLeadForm() {
           </div>
         </div>
 
-        <div className="max-w-lg md:max-w-3xl mx-auto px-4 py-6 space-y-5">
+        <div className="w-full max-w-lg md:max-w-3xl mx-auto px-4 py-6 space-y-5">
           <AnimatePresence mode="wait">
             {submitted ? (
               <motion.div

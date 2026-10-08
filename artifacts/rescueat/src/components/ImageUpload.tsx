@@ -182,11 +182,15 @@ export function ImageUpload({ value, onChange, required }: ImageUploadProps) {
         </div>
       )}
 
-      {/* ファイル選択 input — capture なし → iOS がカメラ/ライブラリ選択シートを表示 */}
+      {/* ファイル選択 input — capture なし → iOS がカメラ/ライブラリ選択シートを表示
+          ★ accept は image/* にする (2026-08-05)。MIMEを列挙すると Android の
+            ピッカーが対象を絞り込みすぎて【写真を1枚も選べない】状態になる
+            (店舗様から報告)。HEIC等も含めて選択後に canvas で webp/jpeg へ
+            変換しているため、種類を広く受けても問題ない。 */}
       <input
         ref={inputRef}
         type="file"
-        accept="image/jpeg,image/png,image/webp"
+        accept="image/*"
         className="hidden"
         onChange={handleChange}
       />

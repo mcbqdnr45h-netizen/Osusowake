@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { CreditCard, Loader2, AlertCircle, Clock, RefreshCw } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { authedFetch } from '@/lib/authed-fetch';
+import { isNonBusinessDayYMD, shiftYMDToBusinessDay, formatYmdWithWeekday } from '@/lib/jp-business-days';
 
 type Props = {
   storeId: number;
@@ -13,6 +14,12 @@ type Props = {
    */
   aggregated?: boolean;
 };
+
+// 振込予定日の土日・祝日補正は @/lib/jp-business-days に集約。
+// バックエンド (stores.ts の nextPayoutDate) は anchor日を素直に返すため、
+// 25日が土日祝にあたる月は「25日表示 → 実際は翌営業日着金」のズレが出る。
+// そこを銀行営業日（＝Stripe payout 着金日: 土日・国民の祝日・振替休日・
+// 国民の休日・年末年始を除く）に繰り下げて表示し、注意書きを出す。
 
 function translateStripeRequirement(key: string): string {
   const map: Record<string, string> = {
@@ -277,10 +284,26 @@ export function StoreBalanceCard({ storeId, stripeAccountId, aggregated = false 
             </span>
             {balanceData.nextPayoutDate && (
               <span className="font-bold text-foreground/70">
-                次回: {balanceData.nextPayoutDate.replace(/-/g, '/')}
+                次回: {shiftYMDToBusinessDay(balanceData.nextPayoutDate).replace(/-/g, '/')}
               </span>
             )}
           </div>
+          {balanceData.nextPayoutDate && isNonBusinessDayYMD(balanceData.nextPayoutDate) && (
+            <div className="bg-amber-50/70 border border-amber-100 rounded-xl px-3 py-2 flex items-start gap-2">
+              <AlertCircle className="w-3.5 h-3.5 text-amber-500 mt-0.5 shrink-0" />
+              <div>
+                {/* ★ 月次/週次いずれも安全に表現するため、
+                     anchor 日を明示せず「振込予定日」で統一する
+                     (weekly でも同じ動作、legacy 別 anchor でも正しく表示) */}
+                <p className="text-xs text-amber-700 font-bold">
+                  振込予定日{formatYmdWithWeekday(balanceData.nextPayoutDate)}が土日・祝日のため、翌営業日{formatYmdWithWeekday(shiftYMDToBusinessDay(balanceData.nextPayoutDate))}に着金予定
+                </p>
+                <p className="text-[11px] text-amber-600 leading-relaxed mt-0.5">
+                  決済システムの都合上、土日祝・年末年始の振込は翌営業日に自動で繰り下がります。ご了承ください。
+                </p>
+              </div>
+            </div>
+          )}
 
           {(() => {
             const payouts = (balanceData.recentPayouts ?? []) as Array<{ id: string; amount: number; arrivalDate: string; status: string }>;

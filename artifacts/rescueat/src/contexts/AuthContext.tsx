@@ -527,6 +527,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
         return { error: '登録中にエラーが発生しました。もう一度お試しください', needsConfirmation: false };
       }
+      // ★ 白画面バグの真因対策 (店舗側 signUpAsStore と同じ処置を顧客側にも):
+      //   auth.signUp が SIGNED_IN を即発火 → onAuthStateChange の fetchProfile が
+      //   create-profile の INSERT 完了前に走って users 行なし → profile=null のまま。
+      //   GuestRoute は「user あり・profile なし」の間 null 描画 = 真っ白で固まる。
+      //   create-profile 完了後にここで再取得して profile を確定させる。
+      onProgress?.('仕上げ中…');
+      try { await fetchProfile(data.user.id); } catch (_) { /* ignore */ }
     }
 
     const needsConfirmation = !data.session;

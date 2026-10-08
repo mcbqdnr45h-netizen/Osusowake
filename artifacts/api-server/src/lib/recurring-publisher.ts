@@ -5,6 +5,7 @@ import {
   storesTable,
 } from "@workspace/db/schema";
 import { eq, desc } from "drizzle-orm";
+import { notifyFavoritesOfRecurring } from "./recurring-fan-notify.js";
 
 /** 現在の JST 日付(YYYY-MM-DD)/時刻(HH:MM)/曜日(0=日..6=土) を返す。 */
 function getJstNow(): { date: string; time: string; dow: number } {
@@ -222,12 +223,23 @@ async function runPublish(): Promise<void> {
           .where(eq(surpriseBagsTable.id, prevBagId));
       }
 
-      // ★ 定期出品はお気に入り登録者への通知を行わない（マロ指示 2026-07-08 / Aプラン）。
-      //   定期出品は毎日同じ店が同じ商品を自動公開するため、お気に入り登録ユーザーに
-      //   毎日「新しいおすそわけを出品」プッシュ/ベルが飛び、スパム化していた。
-      //   新規性のある手動出品（bags.ts createBag）の通知は従来どおり残し、
-      //   定期出品の自動公開だけは通知を出さず静かに行う。
-      //   建てるな注意: ここに通知を戻すと定期出品ファンへの毎日スパムが再発する。
+      // 定期出品はお気に入り登録者にだけ、上限つきで知らせる（同じ店は7日に1回・全体で1日1回）。
+      //   上限なしで送ると毎日同じ店から届くスパムになる（2026-07-08 に全停止した原因）。
+      //   上限は recurring-fan-notify.ts 側で判定する。全体配信(broadcastNewListing)は呼ばない。
+      if (bag) {
+        try {
+          await notifyFavoritesOfRecurring({
+            storeId: tpl.storeId,
+            storeName: store.name,
+            bagId: bag.id,
+            bagTitle: tpl.title,
+            discountedPrice: tpl.discountedPrice,
+            stockCount: stockToPublish,
+          });
+        } catch (notifyErr) {
+          console.error(`[recurring] fan notify error (non-fatal) tpl=${tpl.id}:`, notifyErr);
+        }
+      }
     } catch (err) {
       console.error(`[recurring] publish error tpl=${tpl.id}:`, err);
     }

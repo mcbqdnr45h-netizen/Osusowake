@@ -6,7 +6,7 @@ import { ChevronLeft } from 'lucide-react';
 export default function Privacy() {
   return (
     <Layout>
-      <div className="max-w-2xl mx-auto px-5 py-8">
+      <div className="w-full max-w-2xl mx-auto px-5 py-8">
         <Link
           href="/"
           className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-primary transition-colors mb-6"

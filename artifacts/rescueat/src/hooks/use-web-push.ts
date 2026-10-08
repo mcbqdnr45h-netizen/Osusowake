@@ -31,6 +31,10 @@ export function useWebPush() {
   // 'none' 未購読 / 'anon' 匿名購読済 / 'user' 会員購読済。
   //   匿名で購読後にログインしたら 'anon' → 'user' へ昇格させたいので単純 boolean にしない。
   const modeRef = useRef<'none' | 'anon' | 'user'>('none');
+  // ★ 購読を登録した userId。 同一ページ表示のままアカウントを切り替えた場合でも
+  //   (mode==='user' のままでも) userId が変わっていれば再登録して、 サーバー側の
+  //   購読名義を新アカウントへ付け替える。 これが無いと前アカウント宛の通知が届き続ける。
+  const subscribedUserIdRef = useRef<string | null>(null);
 
   // ── 購読処理。 promptIfNeeded=true なら未決定時にブラウザ許可ダイアログを出す。
   //   false なら「既に granted の人だけ」購読する(勝手にダイアログを出さない)。
@@ -39,9 +43,11 @@ export function useWebPush() {
     if (Capacitor.isNativePlatform()) return false; // ネイティブは Capacitor push
     if (!webPushSupported()) return false;           // iOS Safari 通常タブ等は非対応
 
-    const loggedIn = !!sessionRef.current?.user?.id;
-    // 既に会員登録済み、または「匿名購読済みでまだ未ログイン」なら何もしない。
-    if (modeRef.current === 'user') return true;
+    const currentUserId = sessionRef.current?.user?.id ?? null;
+    const loggedIn = !!currentUserId;
+    // 既に会員登録済み(同じユーザー)、または「匿名購読済みでまだ未ログイン」なら何もしない。
+    // ★ mode==='user' でも userId が変わっていたら再登録する(アカウント切替時の名義付け替え)。
+    if (modeRef.current === 'user' && subscribedUserIdRef.current === currentUserId) return true;
     if (modeRef.current === 'anon' && !loggedIn) return true;
 
     try {
@@ -83,6 +89,7 @@ export function useWebPush() {
           body: JSON.stringify(payload),
         });
         modeRef.current = 'user';
+        subscribedUserIdRef.current = currentUserId;
         console.log('[webpush] subscribed ✅ (会員)');
       } else {
         // 非会員: 匿名購読（requireAuth 無し）。 ログインしたら会員側へ昇格される。

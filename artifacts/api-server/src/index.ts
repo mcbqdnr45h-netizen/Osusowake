@@ -1,7 +1,7 @@
 import app from "./app";
 import { pool } from "@workspace/db";
 import { releaseExpiredCartReservations, cancelStaleUnpaidReservations } from "./routes/reservations";
-import { sendPickupReminders } from "./lib/pickup-reminder.js";
+import { sendPickupReminders, sendPickupDeadlineReminders } from "./lib/pickup-reminder.js";
 import { runDailyEngagementNotifications } from "./lib/daily-engagement.js";
 import { publishDueRecurringListings } from "./lib/recurring-publisher.js";
 import { remindUnlistedStores } from "./lib/unlisted-store-reminder.js";
@@ -325,6 +325,20 @@ async function runMigrations() {
     `);
     console.log('[migration] anonymous_web_push_subscriptions table ✅');
 
+    // ── listing_requests テーブル（お気に入り店への「出品リクエスト」）──────────
+    //   1ユーザー×1店×1日(JST) で1件に制限（UNIQUE）。連打でも店に迷惑がかからない。
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS listing_requests (
+        id SERIAL PRIMARY KEY,
+        store_id INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        jst_date TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (store_id, user_id, jst_date)
+      );
+    `);
+    console.log('[migration] listing_requests table ✅');
+
     // ── store_status enum に suspended を追加 ─────────────────────────────────
     await client.query(`ALTER TYPE store_status ADD VALUE IF NOT EXISTS 'suspended'`);
     console.log('[migration] store_status suspended ✅');
@@ -348,10 +362,19 @@ async function runMigrations() {
         ('auto_approve_stripe_verified',  'true')
       ON CONFLICT (key) DO NOTHING;
     `);
-    // 管理者審査廃止に伴い auto_approve_stripe_verified をデフォルト ON に更新
+    // ★ 2026-08-04 マロ最終判断: 自動承認は維持する。ただし発動条件を
+    //   「Stripeが完全にOK = charges_enabled かつ payouts_enabled」に厳格化した
+    //   (webhook / KYC提出 / fill-requirements の3経路とも)。
+    //   一回限りの移行: 直前の一時対応でOFFにした値をONへ戻す (フラグ管理・再上書きなし)。
     await client.query(`
-      UPDATE app_settings SET value = 'true'
-      WHERE key = 'auto_approve_stripe_verified' AND value = 'false';
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM app_settings WHERE key = 'auto_approve_strict_2026_08'
+        ) THEN
+          UPDATE app_settings SET value = 'true' WHERE key = 'auto_approve_stripe_verified';
+          INSERT INTO app_settings (key, value) VALUES ('auto_approve_strict_2026_08', 'done');
+        END IF;
+      END $$;
     `);
     console.log('[migration] app_settings table ✅');
 
@@ -399,6 +422,7 @@ async function runMigrations() {
         SET status = 'approved', is_active = true
         WHERE status = 'applied'
           AND stripe_charges_enabled = true
+          AND stripe_payouts_enabled = true
           AND (SELECT value FROM app_settings WHERE key = 'auto_approve_stripe_verified') = 'true'
         RETURNING id, name;
       `);
@@ -864,6 +888,11 @@ setInterval(() => {
 // 受取1時間前リマインダーを5分ごとに送信
 setInterval(() => {
   sendPickupReminders().catch(() => {});
+}, 5 * 60_000);
+
+// 受取終了30分前・未受取者への最終リマインダーを5分ごとに送信
+setInterval(() => {
+  sendPickupDeadlineReminders().catch(() => {});
 }, 5 * 60_000);
 
 // 毎日のエンゲージメント通知（昼前11:45・夕方16:30 JST）を1分ごとにチェック

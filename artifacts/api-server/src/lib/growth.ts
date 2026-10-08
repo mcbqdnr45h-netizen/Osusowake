@@ -798,7 +798,7 @@ export function buildDailyChecklist(growth: GrowthData, appstore: AppStoreMetric
     ],
     targets: top ? [{ label: storeName(top), sub: `${top.title}・在庫${top.stock}個・${yen(computeUserTotal(top.discountedPrice))}${top.pickupStart ? `・受取${top.pickupStart}〜${top.pickupEnd ?? ""}` : ""}` }] : undefined,
     template: top
-      ? `本日のおすそわけ🎁\n${top.city || "高槻"}の【${top.name}】さん\n「${top.title}」が${top.stock}個限定で登場！\n${topDiscount > 0 ? `${yen(top.originalPrice)}→${yen(computeUserTotal(top.discountedPrice))}（${topDiscount}%OFF）` : yen(computeUserTotal(top.discountedPrice))}\n${top.pickupStart ? `受取 ${top.pickupStart}〜${top.pickupEnd ?? ""}\n` : ""}売り切れ前にアプリから👇 #おすそわけ #高槻 #フードロス削減`
+      ? `本日のおすそわけ🎁\n${top.city || "高槻"}の【${top.name}】さん\n「${top.title}」が${top.stock}個限定で登場！\n${topDiscount > 0 ? `${yen(computeUserTotal(top.originalPrice))}→${yen(computeUserTotal(top.discountedPrice))}（${topDiscount}%OFF）` : yen(computeUserTotal(top.discountedPrice))}\n${top.pickupStart ? `受取 ${top.pickupStart}〜${top.pickupEnd ?? ""}\n` : ""}売り切れ前にアプリから👇 #おすそわけ #高槻 #フードロス削減`
       : "本日のおすそわけ🎁 高槻の【店名】さんのサプライズバッグ、◯個限定！売り切れ前にアプリから👇 #おすそわけ #高槻 #フードロス削減",
     bestTime: "8:00〜9:00（通勤・朝の可処分時間）",
   });

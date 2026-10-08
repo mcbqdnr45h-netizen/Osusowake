@@ -17,13 +17,16 @@ const ROWS: { label: string; value: React.ReactNode }[] = [
   { label: '商品の引渡し時期', value: '購入完了後、電子チケット（QRコード）を即時発行。各店舗指定の受取時間内にご来店いただき商品を受け取ってください' },
   { label: '返品・キャンセルについて', value: '食品の特性上、注文確定後のキャンセル・返品・返金は原則お受けできません。ただし、商品未提供・システムエラーによる二重決済など当社の責に帰すべき事由がある場合はこの限りではありません' },
   { label: '動作環境', value: 'iOS / Android の最新ブラウザ（Safari / Chrome）推奨' },
-  { label: '手数料', value: <>購入者にご請求する金額はアプリに表示される販売価格そのもの（<span className="font-bold">サービス手数料込みの総額表示</span>）です。販売店舗からは出品時に登録した販売額の <span className="font-bold">20%</span> を当プラットフォーム手数料として申し受けます（決済代行手数料は別途控除されます）。</> },
+  // ★ 2026-08-21: 店舗側の手数料(20%)はお客様向けの特商法ページには載せない。
+  //   消費者向けに必要な開示は「総額表示・追加手数料なし」のみで、
+  //   店舗側の料金体系は出店者規約(/merchant-terms)に記載がある。
+  { label: '手数料', value: <>購入者にご請求する金額はアプリに表示される販売価格そのもの（<span className="font-bold">サービス手数料込みの総額表示</span>）です。追加の手数料は発生しません。</> },
 ];
 
 export default function TokushoPage() {
   return (
     <Layout showBottomNav={false}>
-      <div className="max-w-md md:max-w-2xl mx-auto">
+      <div className="w-full max-w-md md:max-w-2xl mx-auto">
 
         {/* ヘッダー */}
         <div className="sticky z-10 bg-background/90 backdrop-blur-sm border-b border-border/50 px-4 h-14 flex items-center gap-3"
@@ -44,9 +47,15 @@ export default function TokushoPage() {
 
         <div className="bg-card border border-border rounded-2xl overflow-hidden shadow-sm">
           {ROWS.map((row, i) => (
-            <div key={i} className={`flex gap-4 px-4 py-3.5 ${i < ROWS.length - 1 ? 'border-b border-border/60' : ''}`}>
-              <dt className="text-xs font-bold text-muted-foreground w-28 shrink-0 leading-relaxed pt-0.5">{row.label}</dt>
-              <dd className="text-sm text-foreground leading-relaxed flex-1">{row.value}</dd>
+            // ★ 360px未満は縦積み(ラベル上・本文全幅): 320px級の狭い端末では
+            //   2列(ラベル112px固定+本文)だと本文が極細になり折り返しだらけになるため
+            <div key={i} className={`flex flex-col min-[360px]:flex-row gap-1 min-[360px]:gap-4 px-4 py-3.5 ${i < ROWS.length - 1 ? 'border-b border-border/60' : ''}`}>
+              <dt className="text-xs font-bold text-muted-foreground min-[360px]:w-28 shrink-0 leading-relaxed pt-0.5">{row.label}</dt>
+              {/* ★ overflow-wrap:anywhere が必須 (2026-08-11)。
+                  メールアドレスのような「途中で切れない一語」があると、break-words では
+                  【最小幅が語の長さのまま】なので行が縮まず、画面幅を押し広げて右端が切れる。
+                  anywhere だけが最小幅も縮めてくれる。break-words に戻すと再発する。 */}
+              <dd className="text-sm text-foreground leading-relaxed flex-1 min-w-0 [overflow-wrap:anywhere]">{row.value}</dd>
             </div>
           ))}
         </div>

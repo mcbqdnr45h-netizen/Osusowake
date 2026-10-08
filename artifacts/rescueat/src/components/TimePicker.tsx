@@ -119,7 +119,9 @@ export function TimePicker({ value, onChange, label }: TimePickerProps) {
         <span className={`text-sm font-black flex-1 text-left ${value ? 'text-foreground' : 'text-muted-foreground'}`}>
           {value || '--:--'}
         </span>
-        <span className="text-[11px] text-muted-foreground/60 font-medium group-hover:text-primary/60 transition-colors">
+        {/* ★ whitespace-nowrap + 360px未満では非表示: 320px級の狭い端末で
+            「タ/ッ/プ/し/て/設/定」と縦に崩れるのを防ぐ(時計アイコン+時刻表示で意味は伝わる) */}
+        <span className="hidden min-[360px]:inline whitespace-nowrap text-[11px] text-muted-foreground/60 font-medium group-hover:text-primary/60 transition-colors">
           タップして設定
         </span>
       </button>

@@ -736,7 +736,7 @@ export default function HelpPage() {
 
   return (
     <Layout showBottomNav>
-      <div className="max-w-md md:max-w-2xl mx-auto px-4 pt-4 pb-28">
+      <div className="w-full max-w-md md:max-w-2xl mx-auto px-4 pt-4 pb-28">
 
         {/* 戻るボタン */}
         <button

@@ -16,7 +16,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="おすそわけ" />
-    <link rel="apple-touch-icon" href="/images/logo.jpg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
 
     <!-- iOS PWA 起動画像 (ホーム画面追加時の白画面対策)
          HTML がロードされる前から OS が表示してくれる。クリーム BG + 中央ロゴ -->
@@ -41,8 +41,15 @@
     <meta property="og:description" content="お近くのお店からお得なサプライズバッグをゲットしよう" />
     <meta property="og:site_name" content="おすそわけ" />
     <meta property="og:locale" content="ja_JP" />
-    <meta property="og:image" content="/opengraph.jpg" />
+    <!-- ★ og:image は絶対URL必須。 相対パスだと LINE / Instagram / X のクローラーが
+         画像を解決できず、 シェア時に画像なしのカードになる（バイラルの機会損失）。 -->
+    <meta property="og:image" content="https://osusowakejapan.org/opengraph.jpg" />
+    <meta property="og:url" content="https://osusowakejapan.org/" />
     <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="おすそわけ - ご近所のお店からおトクにシェア" />
+    <meta name="twitter:description" content="お近くのお店からお得なサプライズバッグをゲットしよう" />
+    <meta name="twitter:image" content="https://osusowakejapan.org/opengraph.jpg" />
 
     <!-- Fonts: Noto Sans JP (body) + Outfit (display) -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -55,8 +62,14 @@
     <link rel="dns-prefetch" href="https://maps.googleapis.com">
     <link rel="dns-prefetch" href="https://maps.gstatic.com">
 
-    <!-- Favicon -->
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- Favicon
+         ★ 旧: favicon.svg(ロゴ無しのピンク四角のみ) + favicon.ico 実体なし(SPAのHTMLが
+           返っていた) → Google がアイコンを取得できず検索結果の表示が崩れていた。
+         アプリアイコンと同じ絵柄の実体ファイル(ICO + 48倍数PNG=Google推奨)を配信する。 -->
+    <link rel="icon" href="/favicon.ico" sizes="32x32" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png" />
+    <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png" />
   </head>
   <body>
     <!--
@@ -203,7 +216,109 @@
             .then(reg => console.log('[SW] registered:', reg.scope))
             .catch(err => console.warn('[SW] registration failed:', err));
         });
+
+        // ★ 新しいデプロイを SW が検知したら、その場で最新を読み込み直す。
+        //   旧実装は反映が「次回起動時」で、その間アプリは古い HTML のまま
+        //   削除済み JS チャンクを 404 で引いて白画面になっていた。
+        //   無限ループ防止に 1 分のクールダウンを置く。
+        navigator.serviceWorker.addEventListener('message', (e) => {
+          if (!e.data || e.data.type !== 'NEW_VERSION') return;
+          try {
+            var K = 'osusowake_sw_reload_at';
+            var last = Number(sessionStorage.getItem(K) || 0);
+            if (Date.now() - last < 60000) return;
+            sessionStorage.setItem(K, String(Date.now()));
+          } catch (_) {}
+          var u = new URL(window.location.href);
+          u.searchParams.set('_v', String(Date.now()));
+          window.location.replace(u.toString());
+        });
       }
+
+      // ★★ CSS のプリロード失敗でページごと死ぬのを止める (2026-08-12)
+      //   Vite が生成する読み込み処理は、遅延ページに紐づく CSS が 1 本でも取れないと
+      //   【そのページの読み込み自体を失敗させる】。つまり CSS の 404 が白画面になる。
+      //   実際、旧ビルドの JS が「存在しない CSS 名」を指しており、端末が 1 年キャッシュで
+      //   その JS を掴んでいると、注文ページ等が永久に開かなくなる状態だった。
+      //   本体の CSS は <link> で先に読み込まれているので、遅延分の 1 本が欠けても
+      //   見た目はほぼ変わらない。ページが開かない方が圧倒的に害が大きいため握り潰す。
+      //   ※ JS チャンクの失敗は下の unhandledrejection で従来どおり再読込する。
+      window.addEventListener('vite:preloadError', function (ev) {
+        var pm = String((ev && ev.payload && (ev.payload.message || ev.payload)) || '');
+        if (/Unable to preload CSS/i.test(pm)) {
+          if (ev.preventDefault) ev.preventDefault();
+        }
+      });
+
+      // ★ 保険: 動的 import の失敗 (デプロイで消えたチャンクを 404 で引く) は
+      //   Promise の unhandledrejection として飛び、React の ErrorBoundary では
+      //   捕まらないことがある。ここで拾ってキャッシュバスト付きで再読込する。
+      window.addEventListener('unhandledrejection', function (ev) {
+        var m = String((ev && ev.reason && (ev.reason.message || ev.reason)) || '');
+        var isChunkFail = /Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module|Loading chunk .* failed/i.test(m);
+        if (!isChunkFail) return;
+        try {
+          var K2 = 'osusowake_chunk_reload_at';
+          var last2 = Number(sessionStorage.getItem(K2) || 0);
+          if (Date.now() - last2 < 60000) return;
+          sessionStorage.setItem(K2, String(Date.now()));
+        } catch (_) {}
+        var u2 = new URL(window.location.href);
+        u2.searchParams.set('_cb', String(Date.now()));
+        window.location.replace(u2.toString());
+      });
+
+      // ★★ アプリ復帰時の更新チェック (2026-08-06)
+      //   店舗の端末はアプリを開きっぱなし/バックグラウンドのままで何日も使われるため、
+      //   デプロイしても【古い画面のまま気づかない】ことが繰り返し起きていた
+      //   (修正済みの表示崩れが「まだ直ってない」と報告される原因)。
+      //   → 画面に戻ってきたタイミングでサーバーの最新 index.html を取得し、
+      //     エントリJSのファイル名が変わっていたら、その場で最新に入れ替える。
+      //   ・30秒以上離れていた時だけ実行 (通常操作では走らない)
+      //   ・チェックは最短5分に1回 (通信の無駄打ち防止)
+      //   ・リロードは1分のクールダウン付き (ループ防止)
+      (function () {
+        var running = '';
+        try {
+          var el = document.querySelector('script[type="module"][src*="/assets/index-"]');
+          var m0 = el && el.src && el.src.match(/assets\/index-[A-Za-z0-9_-]+\.js/);
+          if (m0) running = m0[0];
+        } catch (_) {}
+        if (!running) return; // 開発時 (/src/main.tsx) は対象外
+
+        var hiddenAt = 0;
+        var lastCheck = 0;
+
+        function applyUpdate() {
+          try {
+            var K = 'osusowake_resume_reload_at';
+            var last = Number(sessionStorage.getItem(K) || 0);
+            if (Date.now() - last < 60000) return;
+            sessionStorage.setItem(K, String(Date.now()));
+          } catch (_) {}
+          var u = new URL(window.location.href);
+          u.searchParams.set('_v', String(Date.now()));
+          window.location.replace(u.toString());
+        }
+
+        function checkForUpdate() {
+          if (Date.now() - lastCheck < 5 * 60 * 1000) return;
+          lastCheck = Date.now();
+          fetch('/?_probe=' + Date.now(), { cache: 'no-store' })
+            .then(function (r) { return r.ok ? r.text() : null; })
+            .then(function (html) {
+              if (!html) return;
+              var m = html.match(/assets\/index-[A-Za-z0-9_-]+\.js/);
+              if (m && m[0] !== running) applyUpdate();
+            })
+            .catch(function () {});
+        }
+
+        document.addEventListener('visibilitychange', function () {
+          if (document.hidden) { hiddenAt = Date.now(); return; }
+          if (hiddenAt && Date.now() - hiddenAt > 30000) checkForUpdate();
+        });
+      })();
     </script>
   </body>
 </html>

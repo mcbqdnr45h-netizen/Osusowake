@@ -291,7 +291,7 @@ export default function StoreReapply() {
   /* ── メインフォーム ── */
   return (
     <StoreLayout showHeader={false}>
-      <div className="max-w-2xl mx-auto w-full pb-36">
+      <div className="w-full max-w-2xl mx-auto w-full pb-36">
 
         {/* ヘッダー */}
         <div
@@ -367,7 +367,7 @@ export default function StoreReapply() {
             <input
               ref={imageInputRef}
               type="file"
-              accept="image/jpeg,image/png,image/webp"
+              accept="image/*"
               className="hidden"
               onChange={handleImageFile}
             />
@@ -407,7 +407,7 @@ export default function StoreReapply() {
             <input
               ref={bizLicenseInputRef}
               type="file"
-              accept="image/jpeg,image/png,image/webp,application/pdf"
+              accept="image/*,application/pdf"
               className="hidden"
               onChange={handleBizLicenseFile}
             />

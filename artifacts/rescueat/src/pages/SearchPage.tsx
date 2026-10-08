@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { Layout } from '@/components/Layout';
+import { formatYmdWithWeekday } from '@/lib/jp-business-days';
 import * as geo from '@/lib/geo';
 import { MapView, MapBounds, MapViewHandle } from '@/components/Map';
 import { BagCard, BagCardSkeleton } from '@/components/BagCard';
@@ -24,6 +25,8 @@ import { normalizeBrand } from '@/lib/brand-text';
 import { pickupWindowsLabel } from '@/lib/utils';
 import { useUserLocation, updateCachedCoords, haversineMeters, metersToWalkMinutes, formatDistanceLabel } from '@/hooks/use-user-location';
 import { getDisplayPrice, getDisplayDiscountPercent } from '@/lib/price-display';
+import { optimizedImage, IMG_W } from '@/lib/image-utils';
+import { useBackGuard } from '@/lib/back-guard';
 
 type ViewMode = 'list' | 'map';
 type SortKey  = 'default' | 'distance' | 'price_asc' | 'price_desc' | 'stock_desc';
@@ -93,6 +96,8 @@ function StoreBottomSheet({
   store: Store; bags: SurpriseBagWithStore[];
   userPos: { lat: number; lng: number } | null; onClose: () => void;
 }) {
+  // Android の「戻る」で、地図に戻らずこのシートだけ閉じる
+  useBackGuard(true, onClose);
   const [expanded, setExpanded] = useState(false);
   // ★ お気に入りトグル: マップ上で店舗をタップしたシート内からも追加/解除できるようにする。
   //   既に BagCard などで使われている FavoritesContext と同じ実装。
@@ -113,6 +118,20 @@ function StoreBottomSheet({
         if (!alive || !d) return;
         setReviewInfo({ avgRating: d.avgRating ?? null, count: d.count ?? 0 });
       })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [store.id]);
+
+  // ★ 次回の出品予定: 今この店に出品が無くても「もうやっていない店」に見せないための表示。
+  //   定期出品を設定している店だけ、次に受け取れる日と時間帯を返す（公開API・認証不要）。
+  //   取得失敗時は単に非表示になるだけで、シートの他の表示は壊さない。
+  const [nextDrop, setNextDrop] = useState<{ pickupDate: string; pickupStart: string | null; pickupEnd: string | null } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const base = (import.meta.env.BASE_URL as string).replace(/\/$/, '');
+    fetch(`${base}/api/stores/${store.id}/next-drop`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (alive && d) setNextDrop(d.next ?? null); })
       .catch(() => {});
     return () => { alive = false; };
   }, [store.id]);
@@ -217,7 +236,7 @@ function StoreBottomSheet({
           {/* 店舗画像バナー */}
           <div className="relative mx-4 mt-1 mb-3 rounded-2xl overflow-hidden bg-muted shrink-0 shadow-md shadow-black/10" style={{ height: 148 }}>
             <img
-              src={store.imageUrl || getCategoryImage(store.category, store.id)}
+              src={optimizedImage(store.imageUrl, IMG_W.hero) || getCategoryImage(store.category, store.id)}
               alt={store.name}
               className="w-full h-full object-cover"
             />
@@ -252,21 +271,25 @@ function StoreBottomSheet({
               {/* 店名 + 店舗アイコン (iconUrl が imageUrl と異なる場合のみ表示)
                   審査待ちでマップにピンが立たない店でも、店舗オーナーがアップしてくれた
                   アイコン写真がここで活きる */}
-              <div className="flex items-end gap-2.5">
-                {store.iconUrl && store.iconUrl !== store.imageUrl && (
-                  <div className="w-12 h-12 rounded-full overflow-hidden ring-2 ring-white/90 shrink-0 shadow-md shadow-black/30 bg-white">
-                    <img
-                      src={store.iconUrl}
-                      alt={`${store.name} アイコン`}
-                      className="w-full h-full object-cover"
-                      loading="lazy"
-                    />
-                  </div>
-                )}
-                <h2 className="text-white font-black text-xl leading-tight tracking-tight line-clamp-2 drop-shadow-sm flex-1 min-w-0 [overflow-wrap:anywhere]">
-                  {store.name}
-                </h2>
-              </div>
+              {/* アイコン・店名タップ → 店舗詳細ページ（過去の出品・店舗情報）2026-09-13 マロ指示 */}
+              <Link href={`/stores/${store.id}`}>
+                <div className="flex items-end gap-2.5 cursor-pointer active:opacity-70 transition-opacity">
+                  {store.iconUrl && store.iconUrl !== store.imageUrl && (
+                    <div className="w-12 h-12 rounded-full overflow-hidden ring-2 ring-white/90 shrink-0 shadow-md shadow-black/30 bg-white">
+                      <img
+                        src={store.iconUrl}
+                        alt={`${store.name} アイコン`}
+                        className="w-full h-full object-cover"
+                        loading="lazy"
+                      />
+                    </div>
+                  )}
+                  <h2 className="text-white font-black text-xl leading-tight tracking-tight line-clamp-2 drop-shadow-sm flex-1 min-w-0 [overflow-wrap:anywhere]">
+                    {store.name}
+                  </h2>
+                  <ChevronRight className="w-5 h-5 text-white/80 shrink-0 mb-0.5" />
+                </div>
+              </Link>
             </div>
           </div>
 
@@ -379,7 +402,7 @@ function StoreBottomSheet({
                                 同じ店の複数バッグが全部同じ画像で表示されるバグになる (本番ユーザ報告)。 */}
                           <img
                             key={bag.imageUrl || bag.store.imageUrl || bag.id}
-                            src={bag.imageUrl || bag.store.imageUrl || getCategoryImage(bag.store.category, bag.id)}
+                            src={optimizedImage(bag.imageUrl, IMG_W.thumb) || optimizedImage(bag.store.imageUrl, IMG_W.thumb) || getCategoryImage(bag.store.category, bag.id)}
                             alt={bag.title}
                             loading="lazy"
                             decoding="async"
@@ -402,20 +425,28 @@ function StoreBottomSheet({
                             <Clock className="w-3 h-3 shrink-0" />
                             <span>受取 {pickupWindowsLabel(bag.pickupStart, bag.pickupEnd, (bag as { pickupStart2?: string | null }).pickupStart2, (bag as { pickupEnd2?: string | null }).pickupEnd2)}</span>
                           </div>
-                          <div className="flex items-center justify-between">
-                            <div>
-                              {discountPct > 0 && <span className="text-[10px] text-muted-foreground line-through mr-1">¥{getDisplayPrice(bag.originalPrice).toLocaleString()}</span>}
-                              <span className="text-base font-black text-primary">¥{getDisplayPrice(bag.discountedPrice).toLocaleString()}</span>
+                          {/* ★ 価格行の折り返し崩れ対策 (2026-08-06)
+                              旧実装は左側が素の <div> だったため、Android の広めの文字幅で
+                              「残り1個！」が『残り1』『個！』に分断され、下に溢れて
+                              「おすそわけ」ボタンに重なっていた（店舗様から報告）。
+                              ・親に gap を入れてボタンと接触させない
+                              ・左側を flex-wrap にして、溢れるときは【語のかたまりごと】折り返す
+                              ・各要素に whitespace-nowrap を付けて語の途中で切らせない */}
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0 flex flex-wrap items-baseline gap-x-1">
+                              {discountPct > 0 && <span className="text-[10px] text-muted-foreground line-through whitespace-nowrap">¥{getDisplayPrice(bag.originalPrice).toLocaleString()}</span>}
+                              <span className="text-base font-black text-primary whitespace-nowrap">¥{getDisplayPrice(bag.discountedPrice).toLocaleString()}</span>
                               {isSoldOut
-                                ? <span className="text-[10px] text-muted-foreground font-bold ml-1">完売</span>
+                                ? <span className="text-[10px] text-muted-foreground font-bold whitespace-nowrap">完売</span>
                                 : isLowStock
-                                  ? <span className="text-[10px] text-amber-600 font-black animate-pulse ml-1">残り{bag.stockCount}個！</span>
-                                  : <span className="text-[10px] text-muted-foreground font-bold ml-1">残り{bag.stockCount}個</span>
+                                  ? <span className="text-[10px] text-amber-600 font-black animate-pulse whitespace-nowrap">残り{bag.stockCount}個！</span>
+                                  : <span className="text-[10px] text-muted-foreground font-bold whitespace-nowrap">残り{bag.stockCount}個</span>
                               }
                             </div>
                             {!isSoldOut ? (
                               <Link href={`/bags/${bag.id}`}>
-                                <button className="flex items-center gap-1.5 bg-primary text-primary-foreground text-sm font-black px-4 py-2 rounded-xl tap-scale shadow-md shadow-primary/25 hover:bg-primary/90 active:scale-95 transition-all">
+                                {/* ★ whitespace-nowrap: 320px級の狭い端末で「おすそわ/け」と改行される崩れの防止 */}
+                                <button className="flex items-center gap-1.5 whitespace-nowrap shrink-0 bg-primary text-primary-foreground text-sm font-black px-3 min-[360px]:px-4 py-2 rounded-xl tap-scale shadow-md shadow-primary/25 hover:bg-primary/90 active:scale-95 transition-all">
                                   おすそわけ <ChevronRight className="w-4 h-4" />
                                 </button>
                               </Link>
@@ -436,10 +467,25 @@ function StoreBottomSheet({
                 <p className="text-xs text-muted-foreground mt-1">人気のお店です。次回は早めにチェックを！</p>
               </div>
             ) : (
-              <div className="text-center py-8 bg-secondary/50 rounded-2xl border border-dashed border-border">
+              <div className="text-center py-8 bg-secondary/50 rounded-2xl border border-dashed border-border px-4">
                 <ShoppingBag className="w-10 h-10 text-muted-foreground/40 mx-auto mb-3" />
                 <p className="text-sm font-bold text-foreground">現在出品中のバッグはありません</p>
-                <p className="text-xs text-muted-foreground mt-1">また後でチェックしてみてください</p>
+                {nextDrop ? (
+                  <>
+                    <div className="mt-3 inline-flex flex-col items-center gap-0.5 bg-white border border-primary/25 rounded-xl px-4 py-2.5">
+                      <span className="text-[11px] font-bold text-muted-foreground">次回のおすそわけ予定</span>
+                      <span className="text-sm font-black text-primary">
+                        {formatYmdWithWeekday(nextDrop.pickupDate)}
+                        {nextDrop.pickupStart && nextDrop.pickupEnd && (
+                          <span className="text-foreground font-bold"> {nextDrop.pickupStart}〜{nextDrop.pickupEnd}</span>
+                        )}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground mt-2">お気に入り登録すると、出品時にお知らせします</p>
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground mt-1">また後でチェックしてみてください</p>
+                )}
               </div>
             )}
           </div>
@@ -447,7 +493,7 @@ function StoreBottomSheet({
           {/* 店主からのメッセージ — 出品ありの店ではバッグ一覧の「下」に表示。
               バッグが目立つようにメッセージを下に逃がす意図。 */}
           {store.description && hasBags && (
-            <div className="px-4 pb-10 -mt-4">
+            <div className="px-4 pb-2 -mt-4">
               <div className="bg-secondary/60 border border-border/60 rounded-2xl px-3.5 py-2.5">
                 <p className="text-[10px] font-black text-muted-foreground tracking-wide mb-1">
                   💬 店主からのメッセージ
@@ -458,6 +504,8 @@ function StoreBottomSheet({
               </div>
             </div>
           )}
+
+          <div className="pb-8" />
         </div>
       </motion.div>
 
@@ -478,20 +526,55 @@ function StoreBottomSheet({
 }
 
 // ─── ゼロ件ステート ────────────────────────────────────────────────────────────
-function ZeroResultsState({ query, category, onClear, recommendBags }: {
+// ── 語順ちがいに強い店名照合（2026-08-30 マウンテンコーヒー問題）─────────────
+//   店名「自家焙煎コーヒー マウンテン」を「マウンテンコーヒー」で検索すると、
+//   連続部分文字列では一致せず見つからなかった。クエリの先頭から
+//   「店名に含まれる最長のかたまり(2文字以上)」を順に削り、全部消せたら一致とみなす。
+//   （語順の入れ替え・スペース有無・複合語に対応。2文字未満の断片は使わないので誤爆しにくい）
+function normForMatch(s: string | null | undefined): string {
+  return (s || '').normalize('NFKC').toLowerCase().replace(/[\s・･/／\-–—]/g, '');
+}
+function looseNameMatch(name: string | null | undefined, query: string): boolean {
+  const hay = normForMatch(name);
+  const q = normForMatch(query);
+  if (!hay || !q || q.length < 2) return false;
+  if (hay.includes(q)) return true;
+  if (q.length < 3) return false;
+  let rest = q;
+  while (rest.length > 0) {
+    let len = 0;
+    for (let l = rest.length; l >= 2; l--) {
+      if (hay.includes(rest.slice(0, l))) { len = l; break; }
+    }
+    if (len === 0) return false;
+    rest = rest.slice(len);
+  }
+  return true;
+}
+
+function ZeroResultsState({ query, category, onClear, recommendBags, matchedStoreCount = 0 }: {
   query: string; category: string; onClear: () => void; recommendBags: SurpriseBagWithStore[];
+  matchedStoreCount?: number;
 }) {
   const catLabel = CATEGORIES.find(c => c.value === category)?.label;
 
-  const title = catLabel && !query
-    ? `「${catLabel}」のおすそわけはまだありません`
-    : query
-      ? `「${query}」は見つかりませんでした`
-      : '条件に合うおすそわけがありませんでした';
+  // ★ 出品は0件でも「店」は検索に一致している場合がある（未出品の店を名前で探したとき）。
+  //   その時に「見つかりませんでした」と言うと地図のピンと矛盾するので、言い分ける。
+  const storeOnly = !!query && matchedStoreCount > 0;
 
-  const subtitle = catLabel && !query
-    ? 'お店が準備中です。代わりにこちらはいかがですか？🌸'
-    : 'スペルや条件を変えて探してみましょう 🔍';
+  const title = storeOnly
+    ? `お店は見つかりました`
+    : catLabel && !query
+      ? `「${catLabel}」のおすそわけはまだありません`
+      : query
+        ? `「${query}」は見つかりませんでした`
+        : '条件に合うおすそわけがありませんでした';
+
+  const subtitle = storeOnly
+    ? '今日の出品はまだありません。地図のピンをタップすると、お店の情報や次回の出品予定が見られます 📍'
+    : catLabel && !query
+      ? 'お店が準備中です。代わりにこちらはいかがですか？🌸'
+      : 'スペルや条件を変えて探してみましょう 🔍';
 
   return (
     <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.28 }}>
@@ -699,8 +782,8 @@ export default function SearchPage() {
     if (liveQuery) {
       const q = liveQuery.toLowerCase();
       result = result.filter(b =>
-        b.title.toLowerCase().includes(q) ||
-        b.store.name.toLowerCase().includes(q) ||
+        looseNameMatch(b.title, liveQuery) ||
+        looseNameMatch(b.store.name, liveQuery) ||
         b.store.city?.toLowerCase().includes(q) ||
         b.store.category?.toLowerCase().includes(q)
       );
@@ -750,6 +833,20 @@ export default function SearchPage() {
     [filteredBags],
   );
 
+  // ★ 2026-08-21: 「店そのもの」がテキスト検索に一致するか。
+  //   これまで検索は【出品(バッグ)】しか見ておらず、今日出品していない店は
+  //   店名を正確に入力しても一切ヒットしなかった（マロ報告）。
+  //   店名・市区・カテゴリのいずれかが一致すれば、未出品でもマップに出す。
+  const storeMatchesQuery = useCallback((st: any): boolean => {
+    if (!liveQuery) return false;
+    const q = liveQuery.toLowerCase();
+    return !!(
+      looseNameMatch(st.name, liveQuery) ||
+      st.city?.toLowerCase().includes(q) ||
+      st.category?.toLowerCase().includes(q)
+    );
+  }, [liveQuery]);
+
   const displayStores = useMemo(() => {
     // approved を優先して並べ替え（同じ場所に複数申請がある場合、approved を優先）
     const sorted = [...(stores || [])].sort((a, b) => {
@@ -780,6 +877,19 @@ export default function SearchPage() {
       if (!hasMarkerFilter) return true;
       // バッグ一致店舗は無条件 OK
       if (filteredStoreIds.has(s.id)) return true;
+      // ★ 未出品でも店自体が検索語に一致すればマップに出す（受付外ピンとして見える）。
+      //   カテゴリ・エリア絞り込みが併用されていればそれとは AND。
+      //   在庫絞り込み(inStockOnly)は「買えるバッグ」の条件なので、店ピンの表示までは消さない。
+      if (liveQuery && storeMatchesQuery(s)) {
+        if (category && normalizeCategory((s as any).category) !== category) return false;
+        if (areaSearchActive && mapBounds) {
+          const lat = (s as any).lat, lng = (s as any).lng;
+          if (lat == null || lng == null) return false;
+          return lat >= mapBounds.south && lat <= mapBounds.north &&
+                 lng >= mapBounds.west  && lng <= mapBounds.east;
+        }
+        return true;
+      }
       // バッグ未出品・別カテゴリでも、 店舗自体のカテゴリが一致すればマップ上は表示する。
       //   (店舗オーナー視点: パン屋なのに「パン・スイーツ」フィルタで自店が消えるバグ対策)
       //   ただし category フィルタ単独のときに限る — 検索ワード/在庫絞り込み中は
@@ -807,7 +917,7 @@ export default function SearchPage() {
       }
       return false;
     });
-  }, [stores, liveQuery, category, inStockOnly, areaSearchActive, mapBounds, filteredStoreIds]);
+  }, [stores, liveQuery, category, inStockOnly, areaSearchActive, mapBounds, filteredStoreIds, storeMatchesQuery]);
 
   const isFiltering       = !!liveQuery || category !== '' || inStockOnly || sort !== 'default' || areaSearchActive;
   const activeFilterCount = [category !== '', inStockOnly, sort !== 'default'].filter(Boolean).length;
@@ -828,11 +938,16 @@ export default function SearchPage() {
   useEffect(() => {
     if (!query) return;
 
-    // 一致した店舗の座標を収集（重複除去）
-    const uniqueLocations = filteredBags
+    // 一致した店舗の座標を収集（重複除去）。
+    // ★ バッグ一致に加えて「店そのものの一致」も含める。未出品の店を名前で
+    //   検索したとき、ここに座標が無いとマップが動かず「無い」ように見える。
+    const matchedStoreLocs = (stores || [])
+      .filter(st => storeMatchesQuery(st) && (st as any).lat && (st as any).lng)
+      .map(st => ({ lat: Number((st as any).lat), lng: Number((st as any).lng) }));
+    const uniqueLocations = [...filteredBags
       .filter(b => b.store.lat && b.store.lng)
-      .reduce<{ lat: number; lng: number }[]>((acc, b) => {
-        const ll = { lat: b.store.lat!, lng: b.store.lng! };
+      .map(b => ({ lat: b.store.lat!, lng: b.store.lng! })), ...matchedStoreLocs]
+      .reduce<{ lat: number; lng: number }[]>((acc, ll) => {
         if (!acc.some(l => l.lat === ll.lat && l.lng === ll.lng)) acc.push(ll);
         return acc;
       }, []);
@@ -843,7 +958,7 @@ export default function SearchPage() {
       mapViewRef.current?.fitStores(uniqueLocations, { minZoom: 13, maxZoom: 16 });
     }, 350);
     return () => clearTimeout(timer);
-  }, [query, filteredBags]);
+  }, [query, filteredBags, stores, storeMatchesQuery]);
 
   return (
     <Layout hideFooter={view === 'map'}>
@@ -1102,7 +1217,7 @@ export default function SearchPage() {
 
         {/* ── リストビュー ── */}
         {view === 'list' && (
-          <div className="max-w-4xl mx-auto w-full pb-6">
+          <div className="w-full max-w-4xl mx-auto w-full pb-6">
 
             {/* ローディング演出 */}
             <AnimatePresence>
@@ -1155,7 +1270,7 @@ export default function SearchPage() {
                     </motion.div>
 
                   ) : isFiltering ? (
-                    <ZeroResultsState key="zero" query={liveQuery} category={category} onClear={clearAllFilters} recommendBags={recommendBags} />
+                    <ZeroResultsState key="zero" query={liveQuery} category={category} onClear={clearAllFilters} recommendBags={recommendBags} matchedStoreCount={(stores || []).filter(st => storeMatchesQuery(st)).length} />
 
                   ) : (
                     <motion.div key="empty" initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }}

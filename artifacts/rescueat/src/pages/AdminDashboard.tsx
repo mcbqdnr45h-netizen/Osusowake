@@ -265,7 +265,12 @@ function statusBadge(store: AdminStore) {
   switch (store.status) {
     case 'approved':      return { label: '承認済み',  cls: 'bg-emerald-100 text-emerald-700' };
     case 'pending_review':
-    case 'pending':       return { label: '審査待ち',  cls: 'bg-amber-100 text-amber-700' };
+    case 'pending':
+      // ★ 同じ pending でも実態は2種類ある。口座を作った後にStripeから
+      //   差し戻された店を「審査待ち」と表示すると、待っていれば進むように
+      //   見えてしまう（実際は店の再提出待ち）。口座の有無で言い分ける。
+      if (store.stripe_account_id) return { label: '書類の再提出待ち', cls: 'bg-rose-100 text-rose-700' };
+      return { label: '口座未登録', cls: 'bg-amber-100 text-amber-700' };
     case 'applied':       return { label: '口座申請済', cls: 'bg-blue-100 text-blue-700' };
     case 'rejected':      return { label: '却下',      cls: 'bg-red-100 text-red-700' };
     case 'suspended':     return { label: '停止中',    cls: 'bg-red-100 text-red-700' };
@@ -395,6 +400,29 @@ interface GrowthData {
 export default function AdminDashboard() {
   const { user, session, signOut, isLoading: authLoading, isAdmin } = useAuth();
   const [, navigate] = useLocation();
+  // 通知の稼働状況（iPhone/Android/ブラウザの配信設定と端末登録数）
+  type PushStatus = {
+    configured: { apns: boolean; fcm: boolean; webPush: boolean };
+    devices: {
+      iphone: { devices: number; users: number };
+      android: { devices: number; users: number };
+      browser: { devices: number };
+    };
+    audit?: {
+      consumerRecipients: number;
+      leakedCount: number;
+      owners: { name: string; iphone: number; android: number; browser: number }[];
+      anonymous: { ios: number; web: number };
+    };
+  };
+  const [pushStatus, setPushStatus] = React.useState<PushStatus | null | false>(null);
+  React.useEffect(() => {
+    if (!isAdmin) return;
+    authedFetch(`${BASE}/api/admin/push-status`, { headers: {} })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => setPushStatus(d && d.ok ? d : false))
+      .catch(() => setPushStatus(false));
+  }, [isAdmin]);
   const { toast } = useToast();
 
   useEffect(() => {
@@ -423,6 +451,11 @@ export default function AdminDashboard() {
   const [annSending, setAnnSending] = useState(false);
 
   const [notifTitle, setNotifTitle] = useState('');
+  // 個別通知（支払いIDで1人に送る）
+  const [dmPi, setDmPi]       = useState('');
+  const [dmTitle, setDmTitle] = useState('');
+  const [dmBody, setDmBody]   = useState('');
+  const [dmSending, setDmSending] = useState(false);
   const [notifBody, setNotifBody]   = useState('');
   const [notifSending, setNotifSending] = useState(false);
 
@@ -792,7 +825,9 @@ export default function AdminDashboard() {
             };
           });
           const fileTag = data.licenseFileId ? ` / File: ✅ 取得済み` : '';
-          toast({ title: '✅ Stripe再同期完了', description: `決済: ${data.chargesEnabled ? '有効' : '制限中'} / 入金: ${data.payoutsEnabled ? '有効' : '停止中'}${fileTag}` });
+          // ★ Stripeが却下していて審査中のまま詰んでいた店を再入力フォームへ戻した場合は明示する
+          const revertTag = data.revertedToPending ? ' ／ 🔁 この店を「再入力フォーム」に戻しました' : '';
+          toast({ title: '✅ Stripe再同期完了', description: `決済: ${data.chargesEnabled ? '有効' : '制限中'} / 入金: ${data.payoutsEnabled ? '有効' : '停止中'}${fileTag}${revertTag}` });
         }
       } else {
         toast({ title: 'エラー', description: '再同期に失敗しました', variant: 'destructive' });
@@ -931,6 +966,30 @@ export default function AdminDashboard() {
     } finally { setNotifSending(false); }
   }
 
+  // ── 個別通知: 支払いID(pi_...)から購入者を特定してベル+プッシュを送る ──
+  //   メールが不達（アドレス打ち間違い等）のお客様への唯一の連絡経路。
+  async function sendDirectNotification() {
+    if (!dmPi.trim() || !dmTitle.trim() || !dmBody.trim()) {
+      toast({ title: '支払いID・タイトル・本文をすべて入力してください', variant: 'destructive' }); return;
+    }
+    if (!window.confirm('この支払いをしたお客様1名に通知を送ります。よろしいですか？')) return;
+    setDmSending(true);
+    try {
+      const res = await authedFetch(`${BASE}/api/admin/notify-user`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paymentIntentId: dmPi.trim(), title: dmTitle.trim(), body: dmBody.trim() }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        toast({ title: `📩 送信しました${data.bagTitle ? `（${data.bagTitle} の購入者）` : ''}`, description: data.pushed ? 'ベル通知とプッシュで届きます' : 'ベル通知で届きます' });
+        setDmPi(''); setDmTitle(''); setDmBody('');
+      } else {
+        toast({ title: data.message || data.error || '送信に失敗しました', variant: 'destructive' });
+      }
+    } finally { setDmSending(false); }
+  }
+
   async function fetchStoreDetail(storeId: number) {
     if (storeDetails[storeId] || detailLoading === storeId) return;
     setDetailLoading(storeId);
@@ -1004,7 +1063,7 @@ export default function AdminDashboard() {
       {/* ヘッダー */}
       <div className="sticky top-0 z-40 bg-white/90 backdrop-blur-xl border-b border-border/40"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}>
-        <div className="max-w-4xl mx-auto px-4 h-14 flex items-center justify-between gap-2">
+        <div className="w-full max-w-4xl mx-auto px-4 h-14 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
             <ShieldCheck className="w-5 h-5 text-purple-600 shrink-0" />
             <span className="font-black text-foreground truncate">管理者ダッシュボード</span>
@@ -1025,7 +1084,7 @@ export default function AdminDashboard() {
         </div>
       </div>
 
-      <div className="max-w-4xl mx-auto px-4 py-6 space-y-6">
+      <div className="w-full max-w-4xl mx-auto px-4 py-6 space-y-6">
 
         {/* ── ヒーロー指標バナー ── */}
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
@@ -1062,7 +1121,7 @@ export default function AdminDashboard() {
                       <p className={`text-2xl font-black ${stores.filter(s => s.status === 'pending').length > 0 ? 'text-orange-300' : 'text-white/50'}`}>
                         {stores.filter(s => s.status === 'pending').length}
                       </p>
-                      <p className="text-[9px] text-white/60 mt-0.5 leading-tight">口座未登録</p>
+                      <p className="text-[9px] text-white/60 mt-0.5 leading-tight">口座・書類待ち</p>
                     </div>
                     <div className="bg-white/10 backdrop-blur-sm rounded-xl p-2 text-center border border-white/10">
                       <p className={`text-2xl font-black ${stores.filter(s => s.status === 'pending_review').length > 0 ? 'text-amber-300' : 'text-white/50'}`}>
@@ -1111,7 +1170,7 @@ export default function AdminDashboard() {
           const reviewCount  = stores.filter(s => s.status === 'pending_review').length;
           const items = [
             { key: 'apply',    label: '新規申請 (KYC審査中)', n: appliedCount,                      color: 'blue',   icon: Clock,       anchor: '#stores-section', filter: 'applied' as const },
-            { key: 'pending',  label: '口座未登録',           n: pendingCount,                      color: 'orange', icon: AlertCircle, anchor: '#stores-section', filter: 'pending' as const },
+            { key: 'pending',  label: '口座・書類待ち',       n: pendingCount,                      color: 'orange', icon: AlertCircle, anchor: '#stores-section', filter: 'pending' as const },
             { key: 'review',   label: '要確認 (審査待ち)',    n: reviewCount,                       color: 'amber',  icon: ShieldCheck, anchor: '#stores-section', filter: 'pending_review' as const },
             { key: 'reports',  label: 'ユーザ通報',           n: a?.openReportsCount ?? 0,          color: 'red',    icon: AlertTriangle, anchor: '#stores-section' },
             { key: 'license',  label: '営業許可証 問題',      n: a?.licenseIssueCount ?? 0,         color: 'red',    icon: FileWarning, anchor: '#license-section' },
@@ -1213,6 +1272,80 @@ export default function AdminDashboard() {
                       className="min-h-[44px] rounded-lg bg-gray-100 active:bg-gray-200 text-[11px] font-bold text-gray-700 px-2 py-1.5"
                     >月次売上</button>
                   </div>
+                </div>
+                {/* ★ 通知の稼働状況 (2026-08-06)
+                    「通知バグ起きてないよな」を毎回コードやログで確かめるのは非現実的なので、
+                    iPhone / Android / ブラウザ それぞれの配信設定と端末登録数をここで見える化する。 */}
+                <div className="mt-3 pt-3 border-t border-gray-100">
+                  <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">🔔 通知の稼働状況</p>
+                  {pushStatus === null ? (
+                    <p className="text-[11px] text-gray-400">読み込み中…</p>
+                  ) : pushStatus === false ? (
+                    <p className="text-[11px] text-rose-600 font-bold">取得できませんでした</p>
+                  ) : (
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {([
+                        ['iPhone',  pushStatus.configured.apns,    pushStatus.devices.iphone.devices,  pushStatus.devices.iphone.users],
+                        ['Android', pushStatus.configured.fcm,     pushStatus.devices.android.devices, pushStatus.devices.android.users],
+                        ['ブラウザ', pushStatus.configured.webPush, pushStatus.devices.browser.devices, null],
+                      ] as [string, boolean, number, number | null][]).map(([label, ok, devices, users]) => (
+                        <div key={label} className={`rounded-lg px-2 py-2 ${ok ? 'bg-emerald-50' : 'bg-rose-50'}`}>
+                          <p className={`text-[10px] font-black ${ok ? 'text-emerald-700' : 'text-rose-700'}`}>
+                            {ok ? '✅' : '❌'} {label}
+                          </p>
+                          <p className="text-[10px] text-gray-600 mt-0.5">
+                            {devices}台{users != null ? ` / ${users}人` : ''}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* ★ 店舗への誤配信監査 (2026-08-20)
+                      「店舗の人に客向け通知が届いてないか」を、実データで宛先計算を再現して検査する。
+                      0件=3経路(日次/全体配信/お気に入り)とも店舗・管理者に飛ばない状態。 */}
+                  {pushStatus && pushStatus !== null && (pushStatus as any).audit && (() => {
+                    const a = (pushStatus as any).audit as NonNullable<PushStatus['audit']>;
+                    const registeredOwners = a.owners.filter(o => o.iphone + o.android + o.browser > 0);
+                    return (
+                      <div className="mt-2 space-y-1.5">
+                        <div className={`rounded-lg px-2.5 py-2 ${a.leakedCount === 0 ? 'bg-emerald-50' : 'bg-rose-50'}`}>
+                          <p className={`text-[11px] font-black ${a.leakedCount === 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
+                            {a.leakedCount === 0
+                              ? `✅ 店舗への客向け通知の漏れなし（宛先${a.consumerRecipients}人を検査）`
+                              : `🚨 店舗/管理者が宛先に${a.leakedCount}人混ざっています！`}
+                          </p>
+                        </div>
+                        <details className="text-[10px] text-gray-500">
+                          <summary className="cursor-pointer font-bold">店舗オーナーの通知登録状況（{registeredOwners.length}/{a.owners.length}店が登録済み）・匿名 iOS{a.anonymous.ios}/Web{a.anonymous.web}</summary>
+                          <div className="mt-1 space-y-0.5 max-h-40 overflow-y-auto">
+                            {a.owners.map(o => (
+                              <p key={o.name} className="flex justify-between">
+                                <span className="truncate">{o.name}</span>
+                                <span className="flex-none tabular-nums">📱{o.iphone} 🤖{o.android} 🌐{o.browser}</span>
+                              </p>
+                            ))}
+                            <p className="pt-1 text-gray-400 leading-relaxed">登録がある店＝会員として登録済み＝客向け通知から確実に除外。0台の店がログアウトのままブラウザで通知許可してると「匿名」扱いで届く場合がある→その店舗アカウントで一度ログインすれば自動で除外される。</p>
+                          </div>
+                        </details>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {/* ★ 店舗様に見せる用の利用データ1枚レポート (2026-08-05)
+                    営業先の店から「利用者層のデータが欲しい」と要望があったため。
+                    他店の店名・売上は含まないので、そのまま見せられる。 */}
+                <div className="mt-3 pt-3 border-t border-gray-100">
+                  <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">📊 店舗様に見せる資料</p>
+                  <button
+                    onClick={() => navigate('/admin/insights')}
+                    className="w-full min-h-[44px] rounded-lg bg-orange-500 active:bg-orange-600 text-white text-[12px] font-black px-3 py-2.5"
+                  >
+                    利用データレポートを開く（印刷・PDF可）
+                  </button>
+                  <p className="text-[10px] text-gray-400 mt-1.5 leading-relaxed">
+                    受取率・リピート率・売れる時間帯をまとめた1枚。他店の情報は含みません。
+                  </p>
                 </div>
               </div>
             </motion.div>
@@ -1954,7 +2087,7 @@ export default function AdminDashboard() {
           <div className="flex gap-1.5 mb-4 overflow-x-auto pb-1">
             {([
               { key: 'applied',        label: 'KYC審査中',  urgent: stores.filter(s => s.status === 'applied').length > 0 },
-              { key: 'pending',        label: '口座未登録',  urgent: false },
+              { key: 'pending',        label: '口座・書類待ち', urgent: false },
               { key: 'pending_review', label: '要確認',      urgent: stores.filter(s => s.status === 'pending_review').length > 0 },
               { key: 'approved',       label: '公開中',       urgent: false },
               { key: 'suspended',      label: '停止/却下',    urgent: false },
@@ -2459,6 +2592,28 @@ export default function AdminDashboard() {
                                 </button>
                               </div>
                             )}
+                            {/* 書類差し戻し中の店へ「再提出のお願い」を送る（ベル+プッシュ） */}
+                            {store.stripe_account_id && (store.status === 'pending' || store.status === 'pending_review') && (
+                              <div className="mb-2">
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    if (!window.confirm(`${store.name} に「本人確認書類の再提出のお願い」を通知しますか？`)) return;
+                                    try {
+                                      const res = await authedFetch(`${BASE}/api/admin/stores/${store.id}/request-kyc`, { method: 'POST' });
+                                      const d = await res.json().catch(() => ({}));
+                                      if (!res.ok) throw new Error((d as any).message || '送信に失敗しました');
+                                      toast({ title: '📩 再提出のお願いを送りました', description: 'ベル通知' + ((d as any).pushed ? 'とプッシュ' : '') + 'で店舗に届きます' });
+                                    } catch (e) {
+                                      toast({ title: (e as Error).message, variant: 'destructive' });
+                                    }
+                                  }}
+                                  className="w-full flex items-center justify-center gap-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold text-xs py-2 rounded-xl transition-colors border border-rose-200"
+                                >
+                                  📩 書類再提出のお願いを店舗に送る
+                                </button>
+                              </div>
+                            )}
                             {/* Stripe ID 手動リンク — stripe_account_id が未設定の店舗向け */}
                             {!store.stripe_account_id && (
                               <div className="mb-2">
@@ -2635,6 +2790,36 @@ export default function AdminDashboard() {
                 {notifSending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Bell className="w-4 h-4" />}
                 全ユーザーに通知する
               </button>
+            </div>
+
+            {/* ── 個別通知（1人だけに送る）── */}
+            <div className="mt-5 pt-4 border-t border-border/50">
+              <p className="text-xs font-bold text-muted-foreground mb-1">📩 個別通知（1人だけに送る）</p>
+              <p className="text-[11px] text-muted-foreground/80 mb-3 leading-relaxed">
+                Stripeの支払いID（pi_...）を貼ると、その購入をしたお客様1名だけにベル通知＋プッシュを送ります。メールが届かないお客様への連絡用。
+              </p>
+              <div className="space-y-3">
+                <input
+                  type="text" value={dmPi} onChange={e => setDmPi(e.target.value)}
+                  placeholder="pi_XXXXXXXXXXXX（Stripeの支払いID）"
+                  className="w-full px-4 py-3 bg-secondary/50 rounded-xl text-sm font-mono border border-border/50 focus:outline-none focus:ring-2 focus:ring-primary/30"
+                />
+                <input
+                  type="text" value={dmTitle} onChange={e => setDmTitle(e.target.value)}
+                  placeholder="タイトル（例：ご購入いただけなかった件のお詫び）"
+                  className="w-full px-4 py-3 bg-secondary/50 rounded-xl text-sm font-medium border border-border/50 focus:outline-none focus:ring-2 focus:ring-primary/30"
+                />
+                <textarea
+                  value={dmBody} onChange={e => setDmBody(e.target.value)} rows={5}
+                  placeholder="本文"
+                  className="w-full px-4 py-3 bg-secondary/50 rounded-xl text-sm font-medium border border-border/50 focus:outline-none focus:ring-2 focus:ring-primary/30 resize-none"
+                />
+                <button onClick={sendDirectNotification} disabled={dmSending || !dmPi.trim() || !dmTitle.trim() || !dmBody.trim()}
+                  className="w-full h-12 bg-rose-500 text-white font-black rounded-xl flex items-center justify-center gap-2 disabled:opacity-50 transition-all active:scale-[0.98]">
+                  {dmSending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Bell className="w-4 h-4" />}
+                  この購入者だけに送る
+                </button>
+              </div>
             </div>
           </div>
         </motion.div>
@@ -2955,7 +3140,7 @@ export default function AdminDashboard() {
               exit={{ scale: 0.85 }}
               src={lightboxImg}
               alt="書類確認"
-              className="max-w-full max-h-full rounded-2xl shadow-2xl object-contain cursor-zoom-out"
+              className="w-full max-w-full max-h-full rounded-2xl shadow-2xl object-contain cursor-zoom-out"
               onClick={e => e.stopPropagation()}
             />
             <button

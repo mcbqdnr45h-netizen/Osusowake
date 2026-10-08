@@ -20,9 +20,12 @@
         <!-- 旧 (Android 11 以下) 用フォールバック -->
         <item name="android:background">@drawable/splash</item>
         <!-- Android 12+ システムスプラッシュ: 背景を #FBF8F4 に揃えてグレーを消す。
-             アイコンはランチャーアイコン (おすそわけロゴ) が自動で中央に出る。
+             ★ アイコンは既定だとランチャーアイコン(フルブリード正方形)が円マスクで
+               切り抜かれ、 ロゴの手が欠けて周囲のピンクがはみ出す表示になっていた。
+               円マスクに収まるよう余白を付けた専用アイコン(splash_icon)を明示指定する。
              スプラッシュ後はノーアクションバーテーマへ遷移。 -->
         <item name="android:windowSplashScreenBackground">@color/splashBg</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon</item>
         <item name="postSplashScreenTheme">@style/AppTheme.NoActionBar</item>
     </style>
 </resources>

@@ -393,3 +393,22 @@
 html.screenshot-mode [data-sshide] {
   display: none !important;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   古い Android WebView 向けフォールバック (2026-08-11)
+   `dvh` は Chrome 108 以降でしか解釈されない。WebView を更新していない
+   端末（Android 7〜9 に多い）では `height:100dvh` の指定が【まるごと無視】され、
+   画面の高さが決まらずレイアウトが潰れる。
+   @supports で「dvh が使えない環境だけ」に vh を当てて、そこを埋める。
+   新しい端末ではこのブロック自体が適用されないので、挙動は一切変わらない。
+   ───────────────────────────────────────────────────────────────────────── */
+@supports not (height: 100dvh) {
+  .min-h-dvh { min-height: 100vh; }
+  .h-dvh     { height: 100vh; }
+  .max-h-dvh { max-height: 100vh; }
+  .max-h-\[85dvh\] { max-height: 85vh; }
+  .max-h-\[88dvh\] { max-height: 88vh; }
+  .max-h-\[90dvh\] { max-height: 90vh; }
+  .max-h-\[92dvh\] { max-height: 92vh; }
+  .max-h-\[95dvh\] { max-height: 95vh; }
+}

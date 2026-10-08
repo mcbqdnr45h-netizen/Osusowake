@@ -169,6 +169,12 @@ if (STATIC_DIR && fs.existsSync(STATIC_DIR)) {
         if (filePath.endsWith("index.html")) {
           res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
         }
+        // ★ 2026-08-12: sw.js を 1 年キャッシュにしていた。Service Worker 自身が
+        //   更新されないと、古いキャッシュを配り続ける係が居座ったままになる。
+        //   （CACHE_NAME を上げても、その新しい sw.js が端末に届かなければ無意味）
+        if (filePath.endsWith("sw.js")) {
+          res.setHeader("Cache-Control", "no-cache");
+        }
       },
     })
   );
@@ -176,6 +182,22 @@ if (STATIC_DIR && fs.existsSync(STATIC_DIR)) {
   //   返す (dynamic rendering)。 実ユーザー・Capacitor WebView は bot UA でないため
   //   next() で下の catch-all (素の index.html) に必ずフォールスルーする。
   app.use(createCrawlerSeoMiddleware(indexPath));
+
+  // ★★ 2026-08-11 追加: 【存在しない静的ファイルは 404 で返す】
+  //   これが無いと、デプロイで消えた /assets/xxx.js や .css を古い端末が要求したとき
+  //   下の SPA フォールバックが index.html を 200 で返してしまい、
+  //     ・CSS → 「HTMLはCSSではない」とブラウザに拒否され【スタイルが全部消える】
+  //     ・JS  → HTMLをJSとして実行しようとして【白画面】
+  //   になる。しかも 200 なので <link>/<script> の error イベントが飛ばず、
+  //   index.html に仕込んだ自動リロードの保険も発動しない（=直らない）。
+  //   404 を返せばブラウザが error を出し、既存の復旧処理が正しく動く。
+  //   （実際に LINE/Android で「CSSが全部消える」「白画面」として繰り返し発生していた）
+  const STATIC_ASSET_RE = /^\/(assets\/|icons\/|fonts\/|.*\.(js|mjs|css|map|png|jpg|jpeg|webp|svg|ico|woff2?|ttf)$)/i;
+  app.get(STATIC_ASSET_RE, (req, res, next) => {
+    // ここに到達した = 上の express.static が実ファイルを見つけられなかった
+    if (req.path.startsWith("/api/")) return next();
+    res.status(404).type("text/plain").send("Not Found");
+  });
 
   // 2) SPA フォールバック: /api/* 以外の GET は全部 index.html を返す
   //   ★ res.sendFile は上の express.static の setHeaders を通らない (別ミドルウェア)。

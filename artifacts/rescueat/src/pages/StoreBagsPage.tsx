@@ -310,9 +310,17 @@ export default function StoreBagsPage() {
     if (diff !== 0) return diff;
     // 公開中の中は受取開始時間が早い順
     if (statusA === 'active') {
-      return (a.pickupStart || '').localeCompare(b.pickupStart || '');
+      const byTime = (a.pickupStart || '').localeCompare(b.pickupStart || '');
+      if (byTime !== 0) return byTime;
     }
-    return 0;
+    // ★ 2026-08-12: ここが return 0 のままだった＝同じ状態の中は【並び順が決まっていない】。
+    //   サーバーも ORDER BY 無しで返していたため、100件超ある店では 8月の次に5月が来るなど
+    //   バラバラに並び、目的の出品を探せなかった（マロ報告）。新しい順に固定する。
+    //   createdAt が同じ/欠けている場合は id（＝登録順）で最終決着させ、毎回同じ並びにする。
+    const ta = a.createdAt ?? '';
+    const tb = b.createdAt ?? '';
+    if (ta !== tb) return ta > tb ? -1 : 1;
+    return b.id - a.id;
   });
 
   // KYC（決済本人確認）が完了していない場合は出品をブロック
@@ -320,7 +328,7 @@ export default function StoreBagsPage() {
 
   return (
     <StoreLayout>
-      <div className="max-w-2xl mx-auto w-full px-4 py-5 space-y-5">
+      <div className="w-full max-w-2xl mx-auto w-full px-4 py-5 space-y-5">
 
         {/* ── 複数店舗セレクター ── */}
         {stores.length > 1 && <StoreSelector />}

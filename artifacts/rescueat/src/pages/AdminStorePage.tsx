@@ -381,7 +381,7 @@ export default function AdminStorePage() {
           >
             <motion.img
               initial={{ scale: 0.9 }} animate={{ scale: 1 }} exit={{ scale: 0.9 }}
-              src={lightboxImg} alt="画像" className="max-w-full max-h-full rounded-xl shadow-2xl object-contain"
+              src={lightboxImg} alt="画像" className="w-full max-w-full max-h-full rounded-xl shadow-2xl object-contain"
               onClick={e => e.stopPropagation()}
             />
           </motion.div>
@@ -539,7 +539,7 @@ export default function AdminStorePage() {
       </div>
 
       {/* コンテンツ */}
-      <div className="max-w-lg md:max-w-3xl mx-auto px-4 py-4 space-y-4">
+      <div className="w-full max-w-lg md:max-w-3xl mx-auto px-4 py-4 space-y-4">
         {loading && (
           <div className="flex items-center justify-center py-16">
             <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin" />

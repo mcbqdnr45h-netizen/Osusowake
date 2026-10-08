@@ -1,5 +1,6 @@
 import type { Plugin } from "vite";
-import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { join as joinPath } from "node:path";
 import postcss, { type Root } from "postcss";
 import cascadeLayers from "@csstools/postcss-cascade-layers";
 
@@ -124,9 +125,20 @@ export function flattenCascadeLayers(): Plugin {
     name: "flatten-cascade-layers",
     apply: "build",
     enforce: "post",
-    async generateBundle(_options, bundle) {
-      const renames: Record<string, string> = {};
 
+    // CSS を平坦化＋古いエンジン向けのフォールバックを足す。
+    //
+    // ★ 2026-08-12: 以前はここで「変換後の内容でCSSを改名」していたが廃止した。
+    //   理由: Vite 本体は【この後】に JS チャンクへ CSS 参照を書き込むため、
+    //   ここで参照を書き換えても間に合わず、JS だけが旧名を指したまま出荷される。
+    //   その CSS は 404 になり、Vite の読み込み処理は CSS が 1 本でも取れないと
+    //   【ページの読み込みごと失敗させる】ので、遅延ページが白画面になる。
+    //   さらに JS のファイル名は変換前の内容で決まるため、名前が同じまま中身だけ
+    //   変わり、1年キャッシュを持つ端末は永久に壊れたままになった。
+    //   改名しなければ、Vite が付けた名前と参照が常に一致する。この一致が命。
+    //   （CSS の中身が変わればソースも変わり、Vite 側のハッシュも変わる。
+    //     この変換処理だけを触った時は public/sw.js の CACHE_NAME を上げること）
+    async generateBundle(_options, bundle) {
       for (const file of Object.values(bundle)) {
         if (file.type !== "asset" || !file.fileName.endsWith(".css")) continue;
         const css =
@@ -134,50 +146,45 @@ export function flattenCascadeLayers(): Plugin {
             ? file.source
             : Buffer.from(file.source).toString("utf8");
         if (!css.includes("@layer")) continue;
-
-        const transformed = await transformCss(css, file.fileName);
-        file.source = transformed;
-
-        // Vite derives the asset hash from the pre-transform content, so a
-        // config-only change (like adding this plugin) reuses the old filename
-        // and lets clients keep a stale, broken copy cached under the immutable
-        // `Cache-Control: max-age=31536000`. Re-hash from the transformed content
-        // so the URL changes whenever the actually-served CSS changes.
-        const hash = createHash("sha256")
-          .update(transformed)
-          .digest("hex")
-          .slice(0, 8);
-        const newName = file.fileName.replace(/-[^-/]+\.css$/, `-${hash}.css`);
-        if (newName !== file.fileName) renames[file.fileName] = newName;
+        file.source = await transformCss(css, file.fileName);
       }
+    },
 
-      if (Object.keys(renames).length === 0) return;
-
-      for (const [oldName, newName] of Object.entries(renames)) {
-        const file = bundle[oldName];
-        delete bundle[oldName];
-        file.fileName = newName;
-        bundle[newName] = file;
+    // ★ 検算: 出力した JS / HTML が指しているアセットが実在するか確かめる。
+    //   1本でも欠けていれば白画面の原因になるので、出荷させずにビルドを失敗させる。
+    writeBundle(options) {
+      const dir = options.dir;
+      if (!dir) return;
+      const assetsDir = joinPath(dir, "assets");
+      let present: Set<string>;
+      try {
+        present = new Set(readdirSync(assetsDir));
+      } catch {
+        return; // assets が無い構成では何もしない
       }
-
-      // Rewrite references to the renamed CSS in HTML entries and JS chunks.
-      for (const file of Object.values(bundle)) {
-        if (file.type === "asset" && file.fileName.endsWith(".html")) {
-          let html =
-            typeof file.source === "string"
-              ? file.source
-              : Buffer.from(file.source).toString("utf8");
-          for (const [oldName, newName] of Object.entries(renames)) {
-            html = html.split(oldName).join(newName);
-          }
-          file.source = html;
-        } else if (file.type === "chunk") {
-          for (const [oldName, newName] of Object.entries(renames)) {
-            if (file.code.includes(oldName)) {
-              file.code = file.code.split(oldName).join(newName);
-            }
-          }
+      // 走査対象は「実際に参照を持つ」ビルド成果物だけに限る。
+      // （public/ に置いた手書きファイルはコメント内に例示URLを書いていることがあり、
+      //   全体を舐めると誤検知でビルドが止まる）
+      const targets = [
+        joinPath(dir, "index.html"),
+        ...readdirSync(assetsDir)
+          .filter((n) => /\.(js|mjs)$/.test(n))
+          .map((n) => joinPath(assetsDir, n)),
+      ];
+      const missing: string[] = [];
+      for (const f of targets) {
+        const txt = readFileSync(f, "utf8");
+        for (const m of txt.matchAll(/assets\/([A-Za-z0-9._-]+\.(?:css|js))/g)) {
+          const name = m[1]!;
+          if (!present.has(name)) missing.push(`${f.slice(dir.length + 1)} → assets/${name}`);
         }
+      }
+      if (missing.length > 0) {
+        const uniq = Array.from(new Set(missing));
+        throw new Error(
+          "[flatten-layers] 存在しないアセットを参照しています（このまま出すと白画面になります）:\n  " +
+            uniq.join("\n  ")
+        );
       }
     },
   };

@@ -127,3 +127,108 @@ export async function sendPickupReminders(): Promise<void> {
     console.error('[pickup-reminder] error:', err);
   }
 }
+
+/**
+ * 受取終了30分前、まだ受取が済んでいない(confirmed のままの)予約のユーザーへ
+ * 最終リマインダーを送る。受取済(picked_up)・キャンセル済は対象外。
+ * 5分ごとに呼び出すことを想定（index.ts の setInterval で実行）。
+ */
+export async function sendPickupDeadlineReminders(): Promise<void> {
+  const JST_OFFSET = 9 * 60 * 60 * 1000;
+  const nowJST     = new Date(Date.now() + JST_OFFSET); // JST 壁時計を UTC フィールドで保持
+
+  try {
+    const rows = await db
+      .select({
+        reservationId: reservationsTable.id,
+        userId:        reservationsTable.userId,
+        bagId:         reservationsTable.bagId,
+        bagTitle:      surpriseBagsTable.title,
+        storeName:     storesTable.name,
+        pickupStart:   surpriseBagsTable.pickupStart,
+        pickupEnd:     surpriseBagsTable.pickupEnd,
+        pickupEnd2:    surpriseBagsTable.pickupEnd2,
+        pickupNextDay: surpriseBagsTable.pickupNextDay,
+        createdAt:     reservationsTable.createdAt,
+      })
+      .from(reservationsTable)
+      .leftJoin(surpriseBagsTable, eq(reservationsTable.bagId,   surpriseBagsTable.id))
+      .leftJoin(storesTable,       eq(reservationsTable.storeId, storesTable.id))
+      .where(
+        and(
+          // confirmed のみ = 支払済かつ未受取。受取済(picked_up)は自動的に対象外。
+          eq(reservationsTable.status,        'confirmed'),
+          eq(reservationsTable.paymentStatus, 'paid'),
+        ),
+      );
+
+    for (const row of rows) {
+      if (!row.userId) continue;
+      // 受取窓の終わり = 最後の枠の終わり(2部制なら pickupEnd2)。不明なら判定不能で skip。
+      const effEnd = row.pickupEnd2 || row.pickupEnd;
+      if (!effEnd) continue;
+
+      // 受取日(JST): 予約作成日、前日出品(pickupNextDay)は翌日（開始前リマインダーと同じロジック）
+      const createdJST    = new Date(row.createdAt.getTime() + JST_OFFSET);
+      const pickupBase    = row.pickupNextDay
+        ? new Date(createdJST.getTime() + 24 * 60 * 60 * 1000)
+        : createdJST;
+      const pickupDateStr = pickupBase.toISOString().slice(0, 10);
+
+      const [eh, em] = effEnd.split(':').map(Number);
+      let overnight = false;
+      if (row.pickupStart) {
+        const [sh, sm] = row.pickupStart.split(':').map(Number);
+        overnight = (eh * 60 + em) <= (sh * 60 + sm); // 終了 <= 開始 → 日跨ぎ窓
+      }
+      let endMs = new Date(`${pickupDateStr}T${effEnd}:00Z`).getTime();
+      if (overnight) endMs += 24 * 60 * 60 * 1000;
+
+      // 終了30分前ウィンドウ: [end-30分, end-22分)。
+      // 実行間隔5分に対し幅8分なので必ず1回は入り、2回入っても下の重複チェックで1通に抑える。
+      const nowMs = nowJST.getTime();
+      if (nowMs < endMs - 30 * 60_000 || nowMs >= endMs - 22 * 60_000) continue;
+
+      // 同一予約にすでに送っていたらスキップ（開始前リマインダーと同じ body 末尾 #ID 方式）
+      const [existing] = await db
+        .select({ id: notificationsTable.id })
+        .from(notificationsTable)
+        .where(
+          and(
+            eq(notificationsTable.userId, row.userId),
+            eq(notificationsTable.type,   'pickup_deadline'),
+            or(
+              sql`body LIKE ${'%#' + row.reservationId}`,
+              sql`body LIKE ${'%#' + row.reservationId + ' %'}`,
+            ),
+          ),
+        )
+        .limit(1);
+
+      if (existing) continue;
+
+      const title = '🛍️ お受け取りはお済みですか？';
+      const body  = `${row.storeName ?? '店舗'}「${row.bagTitle ?? 'おすそわけ袋'}」の受取終了まで残り約30分です`;
+
+      // アプリ内通知（末尾 #ID は重複チェック用。受取直前はチケット画面が正なので bag トークンは付けない）
+      await db.insert(notificationsTable).values({
+        userId: row.userId,
+        type:   'pickup_deadline',
+        title,
+        body:   `${body} #${row.reservationId}`,
+      });
+
+      await sendPushToUser(row.userId, {
+        title,
+        body,
+        tag:  `pickup-deadline-${row.reservationId}`,
+        url:  '/my-reservations',
+        data: { reservationId: row.reservationId, bagId: row.bagId ?? null },
+      });
+
+      console.log(`[pickup-deadline] sent: user=${row.userId} reservation=${row.reservationId}`);
+    }
+  } catch (err) {
+    console.error('[pickup-deadline] error:', err);
+  }
+}

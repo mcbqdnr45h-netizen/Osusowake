@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { favoritesTable, storesTable } from "@workspace/db/schema";
-import { eq, and, inArray } from "drizzle-orm";
+import { eq, and, inArray, desc } from "drizzle-orm";
 import { supabaseAdmin } from "../lib/supabase";
 
 const router: IRouter = Router();
@@ -20,10 +20,14 @@ router.get("/favorites", async (req, res) => {
   if (!userId) { res.status(401).json({ error: "unauthorized" }); return; }
 
   try {
+    // ★ 2026-08-12: ORDER BY が無く、お気に入りの並びがDB任せ＝開くたびに変わり得た。
+    //   お気に入り画面はこの順をそのまま表示するため、ユーザーには「並びが勝手に入れ替わる」
+    //   ように見える。登録が新しい順に固定する（同時刻は id で最終決着＝毎回同じ並び）。
     const rows = await db
       .select({ storeId: favoritesTable.storeId })
       .from(favoritesTable)
-      .where(eq(favoritesTable.userId, userId));
+      .where(eq(favoritesTable.userId, userId))
+      .orderBy(desc(favoritesTable.createdAt), desc(favoritesTable.id));
 
     res.json({ storeIds: rows.map(r => r.storeId) });
   } catch (err) {

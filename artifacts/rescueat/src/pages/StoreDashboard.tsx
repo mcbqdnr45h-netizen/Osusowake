@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StoreLayout } from '@/components/StoreLayout';
+import { formatYmdWithWeekday } from '@/lib/jp-business-days';
 import { Layout } from '@/components/Layout';
 import { useMyStores } from '@/hooks/use-my-stores';
 import { StoreSelector } from '@/components/StoreSelector';
@@ -31,6 +32,7 @@ import { ImageUpload } from '@/components/ImageUpload';
 import { BagManageCard, getBagStatus, type Bag, type BagRealStatus } from '@/components/BagManageCard';
 import { CategoryPicker } from '@/components/CategoryPicker';
 import { TimePicker } from '@/components/TimePicker';
+import { useBackGuard } from '@/lib/back-guard';
 
 // ─── 型 ────────────────────────────────────────────────────────────────────
 type ReservationStatus = 'pending' | 'confirmed' | 'picked_up' | 'cancelled';
@@ -128,6 +130,9 @@ interface PastBag {
   category?: string | null;
   itemType?: string;
   hiddenFromQuickPublish?: boolean;
+  description?: string | null;
+  allergyInfo?: string | null;
+  pickupNote?: string | null;
 }
 
 
@@ -148,7 +153,10 @@ function defaultPickupEndHHMM(): string {
   const d = new Date();
   let h = d.getHours() + 2;
   if (d.getMinutes() > 0) h += 1; // 分が 1 以上なら次の時に切り上げ
-  h = h % 24;
+  // ★ 24時以降には巻き戻さない。旧実装の h % 24 は夜21時以降に開くと終了が
+  //   00:00/01:00 になり、開始 > 終了で「深夜またぎ=翌日受取」バッグとして
+  //   公開される事故を生んでいた（店主は当日のつもり）。当日 23:59 で頭打ちにする。
+  if (h >= 24) return '23:59';
   return `${String(h).padStart(2, '0')}:00`;
 }
 
@@ -168,6 +176,8 @@ function PostBagModal({
   onSuccess: () => void;
   onHidePastBag: (bagId: number) => Promise<void> | void;
 }) {
+  // Android の「戻る」で、ページ遷移せずこのモーダルだけ閉じる(入力の消失防止)
+  useBackGuard(true, onClose);
   const { toast } = useToast();
   const createBag = useCreateBag();
   const [mode, setMode] = useState<'quick' | 'manual'>('quick');
@@ -190,8 +200,14 @@ function PostBagModal({
   const [pickupEnd2, setPickupEnd2] = useState('19:00');
 
   // クイックモード追加情報
+  const [quickDescription, setQuickDescription] = useState('');
   const [quickAllergyInfo, setQuickAllergyInfo] = useState('');
   const [quickPickupNote, setQuickPickupNote] = useState('');
+  // ★ クイック出品でも値段を直せるようにする (2026-08-05・店舗様からの要望)
+  //   旧実装は過去の出品の価格をそのまま使うだけで、打ち間違いを直す手段が無かった。
+  const [quickPrice, setQuickPrice] = useState<number>(0);
+  // 価格の入力欄は「変更」を押したときだけ開く（普段は表示のみ＝手数を増やさない）
+  const [editQuickPrice, setEditQuickPrice] = useState(false);
 
   // 手動フォーム
   // pickupStart はマウント時の現在時刻、 pickupEnd は現在時刻+2h を時単位で切り上げ
@@ -238,12 +254,19 @@ function PostBagModal({
     }
   }, []);
 
-  // 過去の出品を選択したとき、画像・カテゴリを引き継ぐ
-  // pastBag が変わるたびに両方を更新（category がない場合はリセット）
+  // 過去の出品を選択したとき、画像・カテゴリ・文章(説明/アレルギー/受取メモ)を引き継ぐ
+  // pastBag が変わるたびに更新（無い場合はリセット）
+  // ★ 旧実装は画像とカテゴリだけ引き継ぎ、説明文は固定文言で上書きしていた
+  //   （店主が前回書いた文章が毎回消える不具合）。文章3点も必ず引き継ぐ。
   React.useEffect(() => {
     if (!pastBag) return;
     if (pastBag.imageUrl) setImageUrl(pastBag.imageUrl);
     setBagCategory(pastBag.category ?? '');
+    setQuickDescription(pastBag.description ?? '');
+    setQuickAllergyInfo(pastBag.allergyInfo ?? '');
+    setQuickPickupNote(pastBag.pickupNote ?? '');
+    setQuickPrice(Number(pastBag.discountedPrice) || 0);
+    setEditQuickPrice(false);
   }, [pastBag]);
 
   /**
@@ -273,6 +296,23 @@ function PostBagModal({
     return now.getTime() > endToday.getTime();
   }
 
+  /**
+   * 開始 >= 終了(深夜またぎ=翌日◯時まで受取)の設定なら、意図した設定か確認する。
+   * OK なら true(出品続行)、キャンセルなら false(中断して時刻を直してもらう)。
+   * 通常設定(開始 < 終了)は何も出さず true。
+   */
+  function confirmOvernightIfNeeded(pickupStart: string, pickupEnd: string): boolean {
+    if (!/^\d{1,2}:\d{2}$/.test(pickupStart) || !/^\d{1,2}:\d{2}$/.test(pickupEnd)) return true;
+    const [sh, sm] = pickupStart.split(':').map(Number);
+    const [eh, em] = pickupEnd.split(':').map(Number);
+    if (sh * 60 + sm < eh * 60 + em) return true;
+    return window.confirm(
+      `受取終了(${pickupEnd})が開始(${pickupStart})より前の時刻です。\n` +
+      `このまま出品すると「翌日${pickupEnd}まで受取できる商品」として公開されます。\n\n` +
+      `今日中の受取にしたい場合は「キャンセル」を押して、終了時刻を開始より後の時刻に直してください。`
+    );
+  }
+
   async function handleQuickSubmit() {
     if (!pastBag) {
       toast({ title: '商品を選択してください', variant: 'destructive' });
@@ -286,6 +326,10 @@ function PostBagModal({
       toast({ title: '写真を追加してください', variant: 'destructive' });
       return;
     }
+    if (!quickPrice || quickPrice < 50) {
+      toast({ title: '販売価格を50円以上で入力してください', variant: 'destructive' });
+      return;
+    }
     // ★ 時間切れチェック: 受取終了時間が現在時刻を過ぎていたら API を呼ばずに中断
     if (isPickupEndPassed(quickPickupStart, quickPickupEnd)) {
       toast({
@@ -295,6 +339,10 @@ function PostBagModal({
       });
       return;
     }
+    // ★ 深夜またぎ(開始 >= 終了)は「翌日◯時まで受取」の出品として公開される。
+    //   夜に時刻を触った際のうっかり設定(例: 21:00開始/09:00終了)で意図せず
+    //   翌日受取になる事故が実際に起きたため、明示確認を挟む。
+    if (!confirmOvernightIfNeeded(quickPickupStart, quickPickupEnd)) return;
     setIsSubmitting(true);
     try {
       // ★ ユーザーが過去に設定した商品名は文字数に関わらず必ず尊重する。
@@ -305,9 +353,12 @@ function PostBagModal({
         storeId,
         data: {
           title: cleanTitle,
-          description: `${storeName}の美味しいおすそわけです！`,
-          originalPrice: Number(pastBag.originalPrice),
-          discountedPrice: Number(pastBag.discountedPrice),
+          // ★ 前回の説明文を引き継ぐ(編集可)。空のときだけ従来の固定文言。
+          description: quickDescription.trim() || `${storeName}の美味しいおすそわけです！`,
+          // 販売価格は画面で編集できる。通常価格が販売価格を下回ると割引率が
+          // マイナスになるため、その場合は通常価格を販売価格に合わせる。
+          originalPrice: Math.max(Number(pastBag.originalPrice) || 0, quickPrice),
+          discountedPrice: quickPrice,
           stockCount: qty,
           pickupStart: quickPickupStart,
           pickupEnd: quickPickupEnd,
@@ -356,6 +407,11 @@ function PostBagModal({
       });
       return;
     }
+    // ★ 深夜またぎ(開始 >= 終了)のうっかり設定 → 翌日受取化の事故防止(クイックと同一ガード)
+    if (!confirmOvernightIfNeeded(
+      twoShift ? pickupStart2 : form.pickupStart,
+      twoShift ? pickupEnd2 : form.pickupEnd,
+    )) return;
     setIsSubmitting(true);
     try {
       await createBag.mutateAsync({
@@ -558,6 +614,52 @@ function PostBagModal({
                     exit={{ opacity: 0, y: 8 }}
                     className="space-y-4 border-t border-border pt-4"
                   >
+                    {/* ★ 販売価格（クイック出品 2026-08-06）
+                        クイック出品の価値は「速さ」なので、入力欄は常時出さない。
+                        普段は前回の価格を【表示するだけ】にして、「変更」を押した
+                        ときだけ入力欄を出す。触らなくて済む＝今までと同じ手数のまま、
+                        打ち間違いのときだけ直せる。前回いくらで出したかが目に入るので
+                        うっかり違う価格で出す事故も減らせる。 */}
+                    {!editQuickPrice ? (
+                      <button
+                        type="button"
+                        onClick={() => setEditQuickPrice(true)}
+                        className="w-full flex items-center justify-between bg-secondary/60 rounded-xl px-4 h-12"
+                      >
+                        <span className="text-xs font-bold text-muted-foreground">販売価格</span>
+                        <span className="flex items-center gap-2">
+                          <span className="text-lg font-black text-foreground">¥{quickPrice.toLocaleString()}</span>
+                          <span className="text-[11px] font-black text-primary underline">変更</span>
+                        </span>
+                      </button>
+                    ) : (
+                      <div>
+                        <p className="text-xs font-bold text-muted-foreground mb-2">販売価格（税込）</p>
+                        <div className="flex items-center bg-white border-2 border-primary rounded-xl overflow-hidden shadow-sm h-12 px-3">
+                          <span className="text-lg font-black text-muted-foreground mr-1">¥</span>
+                          <input
+                            type="number"
+                            inputMode="numeric"
+                            min={50}
+                            autoFocus
+                            value={quickPrice === 0 ? '' : quickPrice}
+                            onChange={e => {
+                              const raw = e.target.value.replace(/[^0-9]/g, '');
+                              setQuickPrice(raw === '' ? 0 : Math.max(0, parseInt(raw, 10) || 0));
+                            }}
+                            placeholder="500"
+                            className="flex-1 h-full bg-transparent text-xl font-black outline-none min-w-0"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setEditQuickPrice(false)}
+                            className="text-[11px] font-black text-primary px-2 shrink-0"
+                          >完了</button>
+                        </div>
+                        <p className="text-[10px] text-muted-foreground mt-1">50円以上で入力してください。</p>
+                      </div>
+                    )}
+
                     {/* 個数 + 受取時間 */}
                     <div className="grid grid-cols-2 gap-3">
                       {/* 個数 */}
@@ -599,6 +701,20 @@ function PostBagModal({
                       aiSuggested={aiSuggested}
                       required
                     />
+
+                    {/* 商品説明（前回の文章を引き継ぎ・編集可） */}
+                    <div>
+                      <label className="block text-xs font-bold text-muted-foreground mb-1.5">
+                        商品説明 <span className="font-normal text-muted-foreground/60">（前回の内容を引き継いでいます・編集可）</span>
+                      </label>
+                      <textarea
+                        value={quickDescription}
+                        onChange={e => setQuickDescription(e.target.value)}
+                        placeholder={`空欄の場合は「${storeName}の美味しいおすそわけです！」と表示されます`}
+                        rows={3}
+                        className="w-full bg-secondary/40 border-2 border-border rounded-xl px-3 py-2.5 text-sm focus:border-primary outline-none transition-all resize-none"
+                      />
+                    </div>
 
                     {/* アレルギー情報 */}
                     <div>
@@ -894,9 +1010,22 @@ function PostBagModal({
                       }`}>{label}</button>
                   ))}
                 </div>
+                {/* ★ 受取日を「日付」で明示する。
+                    当日/翌日のトグルだけだと、 押し間違えても気づけず
+                    「店は今日渡すつもり／お客様は翌日に来店」の行き違いが起きる
+                    (2026-07-30 サンドイッチピコリで発生)。 */}
+                <p className={`text-[12px] font-black rounded-lg px-2.5 py-1.5 mt-2 leading-snug ${
+                  pickupNextDay
+                    ? 'text-amber-900 bg-amber-100 border border-amber-300'
+                    : 'text-emerald-800 bg-emerald-50 border border-emerald-200'
+                }`}>
+                  お客様の受取日：{formatYmdWithWeekday(pickupNextDay ? addJstDay(todayJSTStr(), 1) : todayJSTStr())}
+                  {pickupNextDay ? '（明日）' : '（今日）'}
+                </p>
                 {pickupNextDay && (
-                  <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-lg px-2.5 py-1.5 mt-2 leading-snug">
+                  <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200/70 rounded-lg px-2.5 py-1.5 mt-1.5 leading-snug">
                     💡 今 出品して「明日」お客さんが受け取る設定です（例: 翌朝 7:00〜9:00）。 夜に翌朝分を出す時はこちら。
+                    <br />今日お渡しする場合は「当日に受け取り」を選んでください。
                   </p>
                 )}
               </div>
@@ -1033,7 +1162,7 @@ function PostBagModal({
         data={mode === 'quick'
           ? {
               title: pastBag?.title ?? '',
-              description: null,
+              description: quickDescription || null,
               originalPrice: pastBag?.originalPrice,
               discountedPrice: pastBag?.discountedPrice ?? 0,
               stockCount: qty,
@@ -1433,6 +1562,8 @@ function ReservationCard({
   const badge = statusLabel(res.status);
   const code = res.pickupCode ?? '------';
   const customerShort = res.userId.slice(-6).toUpperCase();
+  // 返金操作は既定で折りたたむ（受取操作の誤タップ防止）
+  const [showCancel, setShowCancel] = useState(false);
 
   return (
     <div className="bg-white rounded-2xl border border-orange-100 shadow-[0_2px_12px_rgba(255,140,0,0.06)] overflow-hidden">
@@ -1493,20 +1624,58 @@ function ReservationCard({
               <Clock className="w-4 h-4" />お客様の決済待ち
             </div>
           )}
-          {/* 店頭で売り切れた等で渡せない時の「キャンセル・返金」。 決済済みなら自動で全額返金される。 */}
-          <button
-            onClick={() => onCancel(res.id)}
-            disabled={loading}
-            className="w-full mt-2 flex items-center justify-center gap-1.5 py-2 rounded-xl border border-rose-200 text-rose-600 bg-rose-50/60 font-bold text-[12px] hover:bg-rose-100 active:scale-[0.98] transition-all disabled:opacity-60"
-          >
-            この予約をキャンセル{res.paymentStatus === 'paid' ? '・返金' : ''}
-          </button>
+          {/* ★ 返金は「受取済みにする」の真下に置かない。
+              受取操作の流れで赤ボタンに指が届き、 決済済み注文が誤って全額返金される
+              事故が実際に発生したため (2026-07-29 Bake House Nagomi)、
+              ①十分な余白と区切り線で離す ②既定は折りたたんで隠す の二重で防ぐ。 */}
+          <div className="mt-5 pt-3 border-t border-dashed border-muted-foreground/20">
+            {!showCancel ? (
+              <button
+                type="button"
+                onClick={() => setShowCancel(true)}
+                disabled={loading}
+                className="w-full flex items-center justify-center gap-1.5 py-1.5 text-[11px] font-bold text-muted-foreground/70 hover:text-muted-foreground transition-colors disabled:opacity-60"
+              >
+                お渡しできない場合はこちら
+              </button>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-[11px] text-rose-700 bg-rose-50 border border-rose-100 rounded-lg px-2.5 py-2 leading-relaxed">
+                  {res.paymentStatus === 'paid'
+                    ? <>売り切れ等で<strong>お渡しできない場合のみ</strong>お使いください。<br />お客様に <strong>¥{res.totalPrice.toLocaleString()}</strong> が全額返金されます。</>
+                    : <>この予約をキャンセルします（未決済のため返金は発生しません）。</>}
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowCancel(false)}
+                    disabled={loading}
+                    className="flex-1 py-2 rounded-xl border border-border text-muted-foreground font-bold text-[12px] hover:bg-secondary active:scale-[0.98] transition-all disabled:opacity-60"
+                  >
+                    やめる
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onCancel(res.id)}
+                    disabled={loading}
+                    className="flex-1 py-2 rounded-xl border border-rose-300 text-rose-700 bg-rose-50 font-bold text-[12px] hover:bg-rose-100 active:scale-[0.98] transition-all disabled:opacity-60"
+                  >
+                    {res.paymentStatus === 'paid' ? '返金する' : 'キャンセルする'}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
       {/* 受取済みの取り消し（誤タップ救済）。 受取から24h以内のみ。 返金には関与しない＝集計フラグを戻すだけ。 */}
       {res.status === 'picked_up' && onUndoPickup && (
         <div className="px-4 pb-4">
+          {/* お客様のスワイプでも受取済みになるため、 店側の操作漏れではないことを明示する */}
+          <p className="text-[11px] text-green-700 bg-green-50 border border-green-100 rounded-lg px-2.5 py-1.5 mb-2 leading-relaxed">
+            受取が完了しています（お客様がスワイプされた場合も自動で完了します）
+          </p>
           <button
             onClick={() => onUndoPickup(res.id)}
             disabled={loading}
@@ -1636,6 +1805,76 @@ export default function StoreDashboard() {
     refetchOnMount: 'always',
   });
 
+  // ★ Stripeが追加提出/修正を要求している状態か（ライブ判定・全ステータス共通）。
+  //   承認前(applied)の店でもStripeが「制限対象」になったら再入力フォームを
+  //   出す必要がある（旧実装は承認後の画面にしか再提出導線が無く、承認前の店は
+  //   「審査中です」一点張りで詰んでいた）。
+  const liveReq = stripeStatus?.requirements;
+  // ★ 判定は「対応が要る理由」を列挙するのではなく、「待つだけでよい理由」だけを
+  //   許可リストにして、それ以外の停止理由はすべて要対応として扱う (2026-08-04)。
+  //   旧実装は rejected*/past_due/listed の3種だけを見ており、Stripeが返す
+  //   platform_paused / other / action_required.* などで止まった店が永久に
+  //   「審査中」表示のまま詰む穴があった。判定漏れは「詰み」に直結するため
+  //   安全側 (迷ったら要対応を出す) に倒す。
+  const WAIT_ONLY_REASONS = ['requirements.pending_verification', 'under_review'];
+  const stripeNeedsAction = !!liveReq && (
+    (liveReq.currentlyDue?.length ?? 0) > 0 ||
+    (liveReq.errors?.length ?? 0) > 0 ||
+    (liveReq.disabledReason != null && !WAIT_ONLY_REASONS.includes(liveReq.disabledReason))
+  );
+
+  // ★ Stripeの要求項目(英語キー)を日本語の項目名に変換して店主に見せる。
+  //   「何を直せばいいのか分からない」状態が再提出を止める最大の壁になるため。
+  const stripeMissingLabels: string[] = React.useMemo(() => {
+    const keys = liveReq?.currentlyDue ?? [];
+    const labels = keys.map((k): string | null => {
+      if (/verification\.(additional_)?document/.test(k)) return '本人確認書類（免許証・マイナンバーカード等）';
+      if (/id_number/.test(k))                            return 'マイナンバー・法人番号';
+      if (/dob\./.test(k))                                return '生年月日';
+      if (/(first_name|last_name)/.test(k))               return '氏名';
+      if (/address/.test(k))                              return '住所';
+      if (/phone/.test(k))                                return '電話番号';
+      if (/email/.test(k))                                return 'メールアドレス';
+      if (/external_account|bank/.test(k))                return '振込先口座';
+      if (/tos_acceptance/.test(k))                       return '利用規約への同意';
+      if (/business_profile|mcc|product_description|url/.test(k)) return '事業内容の情報';
+      if (/company\./.test(k))                            return '法人情報';
+      if (/representative|owners|directors/.test(k))      return '代表者・役員の情報';
+      return null;
+    }).filter((v): v is string => v !== null);
+    // Stripeのエラー理由(書類が不鮮明・コピー不可など)も1行で伝える
+    const errLabels = (liveReq?.errors ?? []).map((e): string | null => {
+      const c = String(e?.code ?? '');
+      if (/type_not_supported|invalid_document/.test(c)) return '提出された書類は本人確認書類として使えません（運転免許証・マイナンバーカード・パスポートのいずれかを撮影してください）';
+      if (/failed_copy/.test(c))          return '書類がコピー/画面撮影のため不可（原本を撮影してください）';
+      if (/failed_greyscale/.test(c))     return '書類が白黒のため不可（カラーで撮影してください）';
+      if (/(not_readable|failed_other|corrupt)/.test(c)) return '書類が読み取れません（明るい場所で撮り直してください）';
+      if (/expired/.test(c))              return '書類の有効期限が切れています';
+      if (/name_mismatch/.test(c))        return '登録した氏名と書類の氏名が一致していません';
+      if (/dob_mismatch/.test(c))         return '登録した生年月日と書類が一致していません';
+      if (/address_mismatch/.test(c))     return '登録した住所と書類が一致していません';
+      return null;
+    }).filter((v): v is string => v !== null);
+    return Array.from(new Set([...errLabels, ...labels]));
+  }, [liveReq]);
+
+  // Stripeのフォームを開き直して不足・誤りをまとめて修正する共通ハンドラ
+  const openStripeFixForm = async () => {
+    try {
+      const currentUrl = window.location.href;
+      const res = await authedFetch(`${BASE}/api/stores/${storeId}/connect/account-link`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ returnUrl: currentUrl, refreshUrl: currentUrl }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.url) { window.location.href = data.url; return; }
+      toast({ title: '修正ページを開けませんでした', description: data?.message ?? '時間をおいて再度お試しください', variant: 'destructive' });
+    } catch {
+      toast({ title: '修正ページを開けませんでした', description: '通信環境をご確認のうえ再度お試しください', variant: 'destructive' });
+    }
+  };
+
   // ★ まちポケ高槻 掲載バナー用: 定期出品テンプレの有無・次回自動公開を親でも把握する。
   //   RecurringListingsSection は内部で独立 fetch しているため、バナー判定用に軽量取得する。
   //   これで「もう定期出品を組んでいる店」に『セットして』と誤ってナッジするのを防ぐ。
@@ -1760,6 +1999,9 @@ export default function StoreDashboard() {
             category: b.category ?? null,
             itemType: b.itemType ?? 'bag',
             hiddenFromQuickPublish: b.hiddenFromQuickPublish ?? false,
+            description: b.description ?? null,
+            allergyInfo: b.allergyInfo ?? null,
+            pickupNote: b.pickupNote ?? null,
           });
         }
       });
@@ -2109,9 +2351,17 @@ export default function StoreDashboard() {
 
   const today = format(new Date(), 'M月d日（E）', { locale: ja });
 
+  // ★ 完全稼働店(承認済み+口座あり+Stripeの決済/入金が両方有効)だけに
+  //   定期出品・まちポケ導線を見せる。承認前/入金停止中の店にセットさせても
+  //   サーバー側(4条件ガード)で公開されず混乱の元になるため、入口ごと塞ぐ。
+  const fullyOperational =
+    store.status === 'approved' &&
+    !!store.stripeAccountId &&
+    !(stripeStatus && (!stripeStatus.chargesEnabled || !stripeStatus.payoutsEnabled));
+
   return (
     <StoreLayout>
-      <div className="max-w-2xl mx-auto w-full space-y-5">
+      <div className="w-full max-w-2xl mx-auto w-full space-y-5">
 
         {/* ── 店舗セレクター（複数店舗の場合に表示） ── */}
         {stores.length > 1 && (
@@ -2324,7 +2574,7 @@ export default function StoreDashboard() {
         {/* ── 売上残高カードは「売上確認」 タブへ移動済み ── */}
 
         {/* ── まちポケ高槻 掲載ステータス（高槻の承認店のみ）── */}
-        {store.status === 'approved' && inTakatsuki && (
+        {fullyOperational && inTakatsuki && (
           isListedOnPortal ? (
             /* ① いま掲載中 */
             <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4">
@@ -2403,9 +2653,17 @@ export default function StoreDashboard() {
           )
         )}
 
-        {/* ── 定期出品（毎日自動公開）パイロット店のみ表示 ── */}
+        {/* ── 定期出品（毎日自動公開）完全稼働店のみ表示 ── */}
         <div ref={recurringRef}>
-          {storeId && <RecurringListingsSection storeId={storeId} storeName={store.name} />}
+          {storeId && fullyOperational ? (
+            <RecurringListingsSection storeId={storeId} storeName={store.name} />
+          ) : storeId ? (
+            <div className="bg-muted/50 border border-dashed border-border rounded-2xl px-4 py-3">
+              <p className="text-xs font-bold text-muted-foreground">
+                🔒 定期出品（毎日自動公開）は、店舗の承認とStripeの本人確認がすべて完了すると利用できます。
+              </p>
+            </div>
+          ) : null}
         </div>
 
         {/* ── 出品中の商品（active・soldout のみ）── */}

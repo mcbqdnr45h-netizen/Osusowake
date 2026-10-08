@@ -19,6 +19,19 @@ primary_region = "sin"
   # 本番(Web+API)配信のためコールドスタートを避ける。常時1台起動。
   min_machines_running = 1
 
+  # ★ 2026-08-12: ヘルスチェックが未設定だった。
+  #   これが無いと Fly は「新しいマシンがまだ起動しきってない」状態でも通信を流し、
+  #   デプロイのたびに数十秒、外から見て 5xx になる。
+  #   実際 Search Console から「サーバーエラー(5xx)でインデックス登録できない」の
+  #   通知が届いた（この日はデプロイを8回ほど繰り返していた）。
+  #   /api/healthz が 200 を返すまで通信を流さないようにする。
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/api/healthz"
+
 [[vm]]
   memory = "2gb"
   cpu_kind = "shared"

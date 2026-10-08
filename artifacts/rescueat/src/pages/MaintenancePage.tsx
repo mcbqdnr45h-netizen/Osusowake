@@ -26,7 +26,7 @@ export default function MaintenancePage({ settings }: Props) {
         initial={{ opacity: 0, y: 24 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.6, ease: 'easeOut' }}
-        className="max-w-sm md:max-w-2xl w-full"
+        className="w-full max-w-sm md:max-w-2xl w-full"
       >
         <motion.div
           animate={{ rotate: [0, -8, 8, -8, 0] }}

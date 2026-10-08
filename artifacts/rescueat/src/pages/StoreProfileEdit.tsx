@@ -473,7 +473,7 @@ export default function StoreProfileEdit() {
           - カバー写真をコンテンツの先頭・全幅で表示
       ══════════════════════════════════════════════════ */}
       <div
-        className="max-w-xl md:max-w-3xl mx-auto w-full pb-10"
+        className="w-full max-w-xl md:max-w-3xl mx-auto w-full pb-10"
         style={{ paddingTop: 'calc(56px + env(safe-area-inset-top))' }}
       >
 
@@ -534,7 +534,7 @@ export default function StoreProfileEdit() {
           </button>
         </div>
 
-        <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={handleImageChange} />
+        <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleImageChange} />
 
         {/* ── 地図ピン用アイコン (任意) ───────────────────────────────────── */}
         <div className="px-4 pt-5">
@@ -606,7 +606,7 @@ export default function StoreProfileEdit() {
               </div>
             </div>
           </motion.div>
-          <input ref={iconFileRef} type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={handleIconChange} />
+          <input ref={iconFileRef} type="file" accept="image/*" className="hidden" onChange={handleIconChange} />
         </div>
 
         {/* ── フォームカード群 ── */}

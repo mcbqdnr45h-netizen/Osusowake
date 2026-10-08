@@ -41,8 +41,16 @@ export class ErrorBoundary extends React.Component<Props, State> {
 
     try {
       const RELOAD_KEY = isStaleChunk ? '__staleChunkReloaded' : '__errorReloaded';
-      if (!sessionStorage.getItem(RELOAD_KEY)) {
-        sessionStorage.setItem(RELOAD_KEY, '1');
+      // ★ ステイルチャンクは「セッション1回」でなく「前回リロードから5分経過で再許可」。
+      //   iOS アプリの WKWebView はセッションが何日も生き続けるため、 1回制限だと
+      //   2回目以降のデプロイを跨いだ瞬間に自動回復できず壊れたままになる。
+      //   5分間隔ならデプロイ毎に1回だけ回復し、 高速ループも起こらない。
+      const prev = sessionStorage.getItem(RELOAD_KEY);
+      const canReload = isStaleChunk
+        ? (Date.now() - Number(prev || 0) > 5 * 60_000)
+        : !prev;
+      if (canReload) {
+        sessionStorage.setItem(RELOAD_KEY, String(Date.now()));
         if (isStaleChunk) {
           // ★ ステイルチャンクはキャッシュバスト付きで最新 index.html を強制取得する。
           //   Instagram/iOS の in-app WebView は plain reload だと旧 index.html を

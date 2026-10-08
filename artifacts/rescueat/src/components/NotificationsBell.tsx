@@ -52,7 +52,7 @@ function notificationLink(n: AppNotification): string | null {
   //   - pickup_reminder / purchase_confirmed (受取リマインダー / 予約確定):
   //     既に予約済みなので、 商品詳細ではなく 予約一覧 (受取コード/QR が見える) へ。
   const bagId = extractBagId(n.body);
-  if (bagId && n.type === 'new_bag') {
+  if (bagId && (n.type === 'new_bag' || n.type === 'recurring_fan')) {
     return `/bags/${bagId}`;
   }
   switch (n.type) {
@@ -63,7 +63,8 @@ function notificationLink(n: AppNotification): string | null {
     // ↓ 旧通知 (bag id トークン無し) のフォールバック
     case 'pickup_reminder':      return '/my-reservations';    // 受取リマインダー (購入者)
     case 'purchase_confirmed':   return '/my-reservations';    // 予約確定 (購入者)
-    case 'new_bag':              return n.storeId ? `/stores/${n.storeId}` : '/';
+    case 'new_bag':
+    case 'recurring_fan':        return n.storeId ? `/stores/${n.storeId}` : '/';
     case 'announcement':         return '/';
     case 'broadcast':            return '/';
     default:                     return null;
@@ -79,6 +80,7 @@ function notificationIcon(type: string) {
     pickup_reminder:      '⏰',
     purchase_confirmed:   '🛍️',
     new_bag:              '🆕',
+    recurring_fan:        '🛍️',
     announcement:         '📢',
     broadcast:            '📣',
   };

@@ -6,7 +6,7 @@ import { ChevronLeft } from 'lucide-react';
 export default function Terms() {
   return (
     <Layout>
-      <div className="max-w-2xl mx-auto px-5 py-8">
+      <div className="w-full max-w-2xl mx-auto px-5 py-8">
         <Link
           href="/"
           className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-primary transition-colors mb-6"
@@ -91,7 +91,7 @@ export function TermsBody() {
             <p>利用者が本サービスでおすそわけバッグを購入する際の料金体系は以下のとおりです。</p>
             <ul>
               <li><strong>商品代金</strong>：各出品者が設定する販売価格（税込）です。各商品ページおよび購入確認画面に表示されます。</li>
-              <li><strong>表示価格（利用者のお支払い額）</strong>：アプリ上に表示される販売価格は、<strong>サービス手数料 5%（消費税込）を含む税込・サービス料込みの総額</strong> です（10円単位で四捨五入）。利用者は表示された価格をそのままお支払いいただき、追加の料金は一切発生しません。</li>
+              <li><strong>表示価格（利用者のお支払い額）</strong>：アプリ上に表示される販売価格は、<strong>サービス手数料 5%（消費税込）を含む税込・サービス料込みの総額</strong> です（10円未満切り上げ）。利用者は表示された価格をそのままお支払いいただき、追加の料金は一切発生しません。</li>
               <li>上記料金体系は、運営者の判断により変更されることがあります。変更時は本規約の改定または本サービス上での通知をもって効力を生じるものとします。</li>
             </ul>
             <p className="text-xs text-muted-foreground">※ 出品者と運営者との間の料金体系（プラットフォーム手数料・月額利用料等）については、<Link href="/merchant-terms" className="text-primary font-bold underline">出店者規約</Link>に定めるところによります。</p>

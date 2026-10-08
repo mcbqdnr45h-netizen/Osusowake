@@ -119,7 +119,7 @@ export function Layout({ children, showBottomNav = true, hideFooter = false, hid
       >
         <div className="bg-white/85 backdrop-blur-xl border-b border-border/40"
           style={{ boxShadow: '0 1px 0 rgba(10,8,6,0.05), 0 2px 16px rgba(10,8,6,0.04)' }}>
-          <div className="max-w-7xl mx-auto px-5 h-16 flex items-center justify-between gap-4">
+          <div className="w-full max-w-7xl mx-auto px-5 h-16 flex items-center justify-between gap-4">
 
             {/* Logo */}
             <Link href="/" className="flex items-center gap-2.5 group shrink-0">

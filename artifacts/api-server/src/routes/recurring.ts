@@ -2,6 +2,7 @@ import { Router, type IRouter, type Request, type Response } from "express";
 import { db } from "@workspace/db";
 import { recurringListingsTable, storesTable, surpriseBagsTable, reservationsTable } from "@workspace/db/schema";
 import { eq, and, desc, sql, isNotNull, inArray } from "drizzle-orm";
+import { notifyFavoritesOfRecurring } from "../lib/recurring-fan-notify.js";
 
 /** この定期出品テンプレ由来で現在公開中のバッグを出品停止する（既存予約は壊さない）。 */
 async function deactivateBagsForListing(listingId: number): Promise<void> {
@@ -346,6 +347,205 @@ router.post("/recurring/:id/withdraw-now", requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── 今すぐ公開する ────────────────────────────────────────────────────────────
+// POST /api/recurring/:id/publish-now
+//
+// ★ 背景 (2026-08-12 あんぱん店より)
+//   「定期出品が売り切れた後、在庫を足したのに、すぐ客に出せず【次回の公開時刻まで待ち】になる」
+//   原因は在庫の持ち方ではなく【客に見えるのは "今日つくられたバッグ" だけ】という仕様。
+//   在庫を足すと最新バッグの在庫は増える(PATCH側)が、それが昨日つくられたバッグだと
+//   客の一覧には出てこない。結果、店には在庫3と見えているのに誰も買えない状態になる。
+//   → 押した瞬間に「今日の日付で」バッグを作り直す口をつくる。これで即座に並ぶ。
+//
+// 仕様
+//   ・自動公開と同じ店ガード（承認済み + Stripeで課金可 + 入金可）を通す。抜くな。
+//   ・すでに今日公開中の分があるなら、二重に並べず在庫だけ合わせる。
+//   ・新しく出す時は、古い分を出品停止してから出す（二重表示・二重計上の防止）。
+//   ・今日の自動公開マークも付ける＝この後の公開時刻に同じ物がもう1個増えない。
+//   ・通知は出さない（定期出品は通知しない方針。マロ指示 2026-07-08）。
+router.post("/recurring/:id/publish-now", requireAuth, async (req, res) => {
+  const listing = await getOwnedListing(req, res);
+  if (!listing) return;
+
+  if (!listing.isActive) {
+    res.status(400).json({ error: "inactive", message: "停止中の定期出品です。先に「再開する」を押してください" });
+    return;
+  }
+
+  const [store] = await db
+    .select({
+      status: storesTable.status,
+      stripeAccountId: storesTable.stripeAccountId,
+      stripeChargesEnabled: storesTable.stripeChargesEnabled,
+      stripePayoutsEnabled: storesTable.stripePayoutsEnabled,
+    })
+    .from(storesTable)
+    .where(eq(storesTable.id, listing.storeId))
+    .limit(1);
+  if (
+    !store ||
+    store.status !== "approved" ||
+    !store.stripeAccountId ||
+    !store.stripeChargesEnabled ||
+    !store.stripePayoutsEnabled
+  ) {
+    res.status(400).json({
+      error: "store_not_ready",
+      message: "お店の審査またはお振込口座の設定が完了していないため公開できません",
+    });
+    return;
+  }
+
+  const stock = Number(listing.stockCount);
+  if (!(stock >= 1)) {
+    res.status(400).json({ error: "stock_too_low", message: "在庫が0です。先に在庫数を入れてください" });
+    return;
+  }
+
+  // ★ 穴①: 受取時間が過ぎた後に押せてしまう。
+  //   客に見える条件は「今日つくられ、かつ最終受取時刻をまだ過ぎていない」。
+  //   夕方の受取が終わった後に押すと、バッグは作られるのに客の一覧には出ず、
+  //   店には「公開しました」とだけ出る＝一番タチが悪い（出したつもりで出ていない）。
+  //   出せない時は作らずにハッキリ理由を返す。
+  //   ※ 前日受け取り / 受取時間なし / 深夜またぎ は当日中ずっと見えるので対象外。
+  //   ※ 時刻は必ず jstNow() を使う。環境によっては深夜0時台が "24:05" と出る実装があり
+  //     （このファイルの jstNow() が既にその対策を持っている）、自前で書くと
+  //     深夜0時台だけ「まだ受取前なのに"過ぎている"と誤判定して公開できない」ことになる。
+  const { date: jstToday, time: nowHHMM } = jstNow();
+  const endTime = listing.pickupEnd2 ?? listing.pickupEnd;   // 2部制なら最後の枠の終わり
+  const startTime = listing.pickupStart;
+  const crossesMidnight = !!(endTime && startTime && endTime < startTime);
+  if (!listing.pickupNextDay && endTime && startTime && !crossesMidnight && endTime < nowHHMM) {
+    res.status(400).json({
+      error: "pickup_window_passed",
+      message: `本日の受取時間（〜${endTime}）が過ぎているため、今すぐの公開はできません。次回の自動公開をお待ちください`,
+    });
+    return;
+  }
+
+  // ★ 穴②: 「休み」に設定した日でも公開できてしまう。
+  //   店が休みと宣言した受取日に客が注文すると、来店しても店が閉まっている事故になる。
+  const targetPickupDate = listing.pickupNextDay ? addDays(jstToday, 1).date : jstToday;
+  const skipList = (listing.skipDates ? listing.skipDates.split(",").map((s) => s.trim()) : [])
+    .filter((s) => /^\d{4}-\d{2}-\d{2}$/.test(s));
+  if (skipList.includes(targetPickupDate)) {
+    res.status(400).json({
+      error: "pickup_date_is_holiday",
+      message: `${targetPickupDate} は「休み」に設定されています。休みを解除してから公開してください`,
+    });
+    return;
+  }
+
+  // すでに今日つくられた分が【客に見えている】なら、二重に並べず在庫だけ合わせる。
+  //   可視条件は全画面共通の bagVisibleSql を使う（ここで独自判定を書くとドリフトする）。
+  const [liveToday] = await db
+    .select({ id: surpriseBagsTable.id })
+    .from(surpriseBagsTable)
+    .where(and(
+      eq(surpriseBagsTable.recurringListingId, listing.id),
+      eq(surpriseBagsTable.isActive, true),
+      bagVisibleSql,
+    ))
+    .orderBy(desc(surpriseBagsTable.createdAt))
+    .limit(1);
+
+  if (liveToday) {
+    await db.update(surpriseBagsTable)
+      .set({ stockCount: stock })
+      .where(eq(surpriseBagsTable.id, liveToday.id));
+    console.log(`[recurring] publish-now(restock) bag=${liveToday.id} tpl=${listing.id} stock=${stock}`);
+    res.json({ ok: true, bagId: liveToday.id, mode: "restock", stock });
+    return;
+  }
+
+  // 古い分（昨日つくられて客には見えていない残骸など）を止めてから、今日の分を出す。
+  await deactivateBagsForListing(listing.id);
+
+  const [bag] = await db
+    .insert(surpriseBagsTable)
+    .values({
+      storeId: listing.storeId,
+      title: listing.title,
+      description: listing.description,
+      originalPrice: listing.originalPrice,
+      discountedPrice: listing.discountedPrice,
+      stockCount: stock,
+      pickupStart: listing.pickupStart,
+      pickupEnd: listing.pickupEnd,
+      pickupStart2: listing.pickupStart2,
+      pickupEnd2: listing.pickupEnd2,
+      imageUrl: listing.imageUrl,
+      category: listing.category,
+      allergyInfo: listing.allergyInfo,
+      pickupNote: listing.pickupNote,
+      itemType: listing.itemType ?? "bag",
+      pickupNextDay: listing.pickupNextDay,
+      recurringListingId: listing.id,
+      isActive: true,
+    })
+    .returning();
+
+  if (!bag) {
+    res.status(500).json({ error: "insert_failed", message: "公開に失敗しました。もう一度お試しください" });
+    return;
+  }
+
+  // ★ 最後の砦: 作ったバッグが【本当にお客様の一覧に出ているか】を、客と同じ条件で確かめる。
+  //   上のガードは「出せない状況」を先読みしているが、受取開始だけ未設定など想定外の
+  //   設定の組み合わせが残ると、また「公開しましたと出るのに客には見えない」に戻る。
+  //   予測ではなく結果を見る。見えていなければ作ったものを取り消して、正直に失敗を返す。
+  //   （lastPublishedDate はここまで触らない＝失敗しても自動公開の権利を奪わない）
+  const [visible] = await db
+    .select({ id: surpriseBagsTable.id })
+    .from(surpriseBagsTable)
+    .where(and(eq(surpriseBagsTable.id, bag.id), bagVisibleSql))
+    .limit(1);
+  if (!visible) {
+    await db.update(surpriseBagsTable)
+      .set({ isActive: false })
+      .where(eq(surpriseBagsTable.id, bag.id));
+    console.warn(`[recurring] publish-now ROLLBACK bag=${bag?.id} tpl=${listing.id} — 作成したが客に表示されない設定のため取り消し`);
+    res.status(400).json({
+      error: "would_not_be_visible",
+      message: "この設定では今すぐ公開してもお客様の画面に表示されません。受取時間の設定をご確認ください",
+    });
+    return;
+  }
+
+  // ここまで来て初めて「今日はもう出した」と印を付ける
+  // （この後の自動公開で同じ物がもう1個並ぶのを防ぐ）。
+  await db.update(recurringListingsTable)
+    .set({
+      lastPublishedDate: sql`TO_CHAR(NOW() AT TIME ZONE 'Asia/Tokyo', 'YYYY-MM-DD')`,
+      updatedAt: new Date(),
+    })
+    .where(eq(recurringListingsTable.id, listing.id));
+
+  console.log(`[recurring] publish-now(new) bag=${bag?.id} store=${listing.storeId} tpl=${listing.id} stock=${stock}`);
+
+  try {
+    const [store] = await db
+      .select({ name: storesTable.name })
+      .from(storesTable)
+      .where(eq(storesTable.id, listing.storeId))
+      .limit(1);
+    if (store) {
+      await notifyFavoritesOfRecurring({
+        storeId: listing.storeId,
+        storeName: store.name,
+        bagId: bag.id,
+        bagTitle: listing.title,
+        discountedPrice: listing.discountedPrice,
+        stockCount: stock,
+      });
+    }
+  } catch (notifyErr) {
+    console.error(`[recurring] publish-now fan notify error (non-fatal) tpl=${listing.id}:`, notifyErr);
+  }
+
+  res.json({ ok: true, bagId: bag?.id, mode: "new", stock });
+});
+
 // 削除
 router.delete("/recurring/:id", requireAuth, async (req, res) => {
   const listing = await getOwnedListing(req, res);
@@ -354,6 +554,50 @@ router.delete("/recurring/:id", requireAuth, async (req, res) => {
   await deactivateBagsForListing(listing.id);
   await db.delete(recurringListingsTable).where(eq(recurringListingsTable.id, listing.id));
   res.json({ ok: true });
+});
+
+// ─── 公開: 次回の出品予定（お客様向け・認証不要）────────────────────────────
+// GET /api/stores/:storeId/next-drop
+//   定期出品はしているが今は出品が無い店を「もうやっていない店」に見せないための最小情報。
+//   返すのは受取日と受取時間帯だけ（店主の個人情報・在庫・価格は一切返さない）。
+//   定期出品が無い / 停止中 / 未承認の店は { next: null }。
+router.get("/stores/:storeId/next-drop", async (req, res) => {
+  try {
+    const storeId = parseInt(String(req.params.storeId ?? ""), 10);
+    if (Number.isNaN(storeId)) { res.json({ next: null }); return; }
+
+    // 承認済み・営業中の店のみ（未承認店の予定を客に見せない）
+    const [store] = await db
+      .select({ status: storesTable.status, isActive: storesTable.isActive })
+      .from(storesTable)
+      .where(eq(storesTable.id, storeId))
+      .limit(1);
+    if (!store || store.status !== "approved" || store.isActive === false) {
+      res.json({ next: null });
+      return;
+    }
+
+    const listings = await db
+      .select()
+      .from(recurringListingsTable)
+      .where(and(eq(recurringListingsTable.storeId, storeId), eq(recurringListingsTable.isActive, true)));
+    if (listings.length === 0) { res.json({ next: null }); return; }
+
+    // 各テンプレの「次の受取日」を出し、最も近いものを返す。
+    let best: { pickupDate: string; pickupStart: string | null; pickupEnd: string | null } | null = null;
+    for (const l of listings) {
+      const np = nextPublishDate(l);
+      const pickupDate = l.pickupNextDay ? addDays(np, 1).date : np;
+      if (!best || pickupDate < best.pickupDate) {
+        best = { pickupDate, pickupStart: l.pickupStart ?? null, pickupEnd: l.pickupEnd ?? null };
+      }
+    }
+    res.json({ next: best });
+  } catch (err) {
+    console.error("[next-drop] error:", err);
+    // 失敗しても客の画面を壊さない（単に非表示になるだけ）
+    res.json({ next: null });
+  }
 });
 
 export default router;

@@ -321,14 +321,15 @@ export default function MyPage() {
                     n.type === 'store_approved'       ? '/store/bank-setup' :
                     n.type === 'store_rejected'       ? '/store/reapply' :
                     n.type === 'store_action_required'? '/store/dashboard' :
-                    n.type === 'new_bag'              ? (bagId ? `/bags/${bagId}` : n.storeId ? `/stores/${n.storeId}` : null) :
+                    (n.type === 'new_bag' || n.type === 'recurring_fan') ? (bagId ? `/bags/${bagId}` : n.storeId ? `/stores/${n.storeId}` : null) :
                     null;
                   return (
                   <div key={n.id} className={`px-4 py-3 border-b border-border/30 last:border-0 ${!n.read ? 'bg-primary/[0.03]' : ''} ${isRejected ? 'bg-red-50/50' : isApproved ? 'bg-green-50/50' : ''}`}>
                     <div className="flex items-start gap-2.5">
                       {(() => {
                         switch (n.type) {
-                          case 'new_bag':         return <ShoppingBag className="w-3.5 h-3.5 text-primary shrink-0 mt-0.5" />;
+                          case 'new_bag':
+                          case 'recurring_fan':   return <ShoppingBag className="w-3.5 h-3.5 text-primary shrink-0 mt-0.5" />;
                           case 'bag_sold':        return <Receipt className="w-3.5 h-3.5 text-green-600 shrink-0 mt-0.5" />;
                           case 'pickup_reminder': return <Clock className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />;
                           case 'store_approved':  return <CheckCircle className="w-3.5 h-3.5 text-green-500 shrink-0 mt-0.5" />;
@@ -915,7 +916,14 @@ export default function MyPage() {
           if (chargesOk && !payoutsOk) {
             // pending_verification に書類が含まれていれば審査中 → ボタン不要
             const pending = stripeStatus?.requirements?.pendingVerification ?? [];
-            const docUnderReview = pending.some(k =>
+            // ★ Stripeがエラー(却下)や「今すぐ必要な項目」を返している間は、
+            //   pending_verification に古い項目が残っていても【審査中と表示しない】。
+            //   ここが出品管理画面(要対応)とマイページ(審査中)で表示が食い違い、
+            //   却下された店が再提出できず詰む原因だった (高槻駅 / 2026-08-05)。
+            const req         = stripeStatus?.requirements;
+            const hasErrors   = (req?.errors?.length ?? 0) > 0;
+            const hasDueNow   = (req?.currentlyDue?.length ?? 0) > 0;
+            const docUnderReview = !hasErrors && !hasDueNow && pending.some(k =>
               k.includes('verification') || k.includes('document') || k.includes('individual')
             );
             return (

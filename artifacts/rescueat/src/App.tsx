@@ -36,6 +36,7 @@ import MyPage from "./pages/MyPage";
 import MyReservations from "./pages/MyReservations";
 import FavoritesPage from "./pages/FavoritesPage";
 import BagDetail from "./pages/BagDetail";
+import { consumeBackGuard } from '@/lib/back-guard';
 
 // ── 残りのページはすべて lazy import（コード分割でバンドルを小型化）──
 // ★ 高頻度ページは import 関数を抽出 → PrefetchOnAuth で事前ロードに利用
@@ -73,6 +74,7 @@ const StripeBankSetup    = React.lazy(() => import("./pages/StripeBankSetup"));
 const StripeKYCPage      = React.lazy(() => import("./pages/StripeKYCPage"));
 const AdminDashboard     = React.lazy(() => import("./pages/AdminDashboard"));
 const AdminStorePage     = React.lazy(() => import("./pages/AdminStorePage"));
+const AdminInsightsReport = React.lazy(() => import("./pages/AdminInsightsReport"));
 const CheckoutSuccess    = React.lazy(() => import("./pages/CheckoutSuccess"));
 const CheckoutCancel     = React.lazy(() => import("./pages/CheckoutCancel"));
 const OrderTicket        = React.lazy(() => import("./pages/OrderTicket"));
@@ -198,12 +200,23 @@ const __idle = (cb: () => void) => {
   if (typeof w.requestIdleCallback === 'function') w.requestIdleCallback(cb);
   else setTimeout(cb, 200);
 };
+// 店舗オーナー系チャンクは店主しか開かない。 一般ユーザ / 未ログインには 240KB (gzip)
+// まるごと無駄なので、 過去に store_owner と確認できたブラウザにだけ prefetch する。
+// 判定ソースは AuthContext と同じキャッシュ (キーを変えるときは両方直すこと)。
+const __isStoreOwnerBrowser = (): boolean => {
+  try {
+    if (sessionStorage.getItem('osusowake_pending_store_owner_v1') === '1') return true;
+    const raw = localStorage.getItem('osusowake_profile_cache_v1');
+    return !!raw && (JSON.parse(raw) as { role?: string })?.role === 'store_owner';
+  } catch { return false; }
+};
 __idle(() => {
   // bottom-nav タブ系 / BagDetail はメインバンドル同梱に変更済み (eager import)
   // 残りはサブページ群のみ prefetch
   importOrders().catch(() => {});
-  // 店舗オーナー系 (低優先 — さらに遅延)
+  // 店舗オーナー系 (低優先 — さらに遅延 / 店主のブラウザのみ)
   setTimeout(() => {
+    if (!__isStoreOwnerBrowser()) return;
     importStoreDashboard().catch(() => {});
     importStoreOwnerDashboard().catch(() => {});
     importStoreBagsPage().catch(() => {});
@@ -378,6 +391,7 @@ function AnimatedRoutes() {
               {/* ── 管理者 ── */}
               <Route path="/admin" component={AdminDashboard} />
               <Route path="/admin/store/:id" component={AdminStorePage} />
+              <Route path="/admin/insights" component={AdminInsightsReport} />
 
               <Route component={NotFound} />
             </Switch>
@@ -509,6 +523,32 @@ function MaintenanceGate({ children }: { children: React.ReactNode }) {
   return <MaintenancePage settings={settings} />;
 }
 
+
+// ★ Android の「戻る」を受ける (2026-08-12)
+//   モーダル/シートが開いていれば【それだけを閉じる】。開いていなければ従来どおり
+//   ページを戻り、戻り先が無ければアプリを閉じる（Capacitor の既定と同じ）。
+//   iOS では backButton イベント自体が発火しないので影響なし。
+function AndroidBackHandler() {
+  useEffect(() => {
+    let handle: { remove: () => void } | null = null;
+    import('@capacitor/app').then(({ App: CapApp }) => {
+      CapApp.addListener('backButton', ({ canGoBack }) => {
+        // 1) 手前に開いている画面があるなら、それを閉じるだけ
+        if (consumeBackGuard()) return;
+        // 2) 戻れるならページを戻る
+        if (canGoBack || window.history.length > 1) {
+          window.history.back();
+          return;
+        }
+        // 3) 戻り先が無い＝最初の画面 → アプリを閉じる
+        CapApp.exitApp().catch(() => {});
+      }).then(h => { handle = h; }).catch(() => {});
+    }).catch(() => {});
+    return () => { handle?.remove(); };
+  }, []);
+  return null;
+}
+
 function App() {
   // 左端スワイプで戻る（iOS標準ジェスチャの再現）。SPA だとネイティブの
   // エッジスワイプが効かないので全画面で有効化する。
@@ -526,6 +566,7 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
         <SplashHider />
+        <AndroidBackHandler />
         <MyStoresProvider>
           <FavoritesProvider>
             <TooltipProvider>

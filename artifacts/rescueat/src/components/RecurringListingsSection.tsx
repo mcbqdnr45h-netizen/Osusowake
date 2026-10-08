@@ -6,7 +6,7 @@ import { useToast } from '@/hooks/use-toast';
 import { TimePicker } from '@/components/TimePicker';
 import { ImageUpload } from '@/components/ImageUpload';
 import { CategoryPicker } from '@/components/CategoryPicker';
-import { Repeat, Plus, Trash2, Moon, Power, EyeOff, Pencil, Eye } from 'lucide-react';
+import { Repeat, Plus, Trash2, Moon, Power, EyeOff, Pencil, Eye, Zap } from 'lucide-react';
 import { BagPreviewSheet } from '@/components/BagPreviewSheet';
 import { pickupWindowsLabel } from '@/lib/utils';
 
@@ -162,6 +162,7 @@ export function RecurringListingsSection({ storeId, storeName = '' }: { storeId:
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null); // 編集中の定期出品ID（null=新規）
+  const [publishingId, setPublishingId] = useState<number | null>(null); // 「今すぐ公開」送信中のID（連打防止）
 
   // ── フォーム ──
   const [title, setTitle] = useState('');
@@ -362,6 +363,35 @@ export function RecurringListingsSection({ storeId, storeName = '' }: { storeId:
       invalidateBags();
     } catch (e) {
       toast({ title: (e as Error).message || '取り下げに失敗しました', variant: 'destructive' });
+    }
+  }
+
+  // 次回の公開時刻を待たずに、今すぐお客様に出す。
+  //   ★ 完売後に在庫を入れ直しても、客に見えるのは「今日つくられた分」だけなので、
+  //     在庫を足すだけでは並ばない（あんぱん店の指摘）。これを押すと今日の分として作り直す。
+  async function publishNow(l: Listing) {
+    if (publishingId !== null) return;   // 連打で2回送るのを防ぐ
+    const when = l.pickupNextDay ? '明日' : '今日';
+    if (!window.confirm(`在庫${l.stockCount}個を今すぐお客様に公開しますか？（受け取りは${when}）`)) return;
+    setPublishingId(l.id);
+    try {
+      const res = await authedFetch(`${BASE}/api/recurring/${l.id}/publish-now`, { method: 'POST' });
+      const data = await res.json().catch(() => ({})) as { message?: string; mode?: string; stock?: number };
+      if (!res.ok) throw new Error(data.message || '公開に失敗しました');
+      // 在庫数はサーバーが実際に出した値を使う（別端末で変更されていた場合に嘘を表示しないため）
+      const shown = data.stock ?? l.stockCount;
+      toast({
+        title: '今すぐ公開しました',
+        description: data.mode === 'restock'
+          ? `すでに公開中の分の在庫を${shown}個に更新しました`
+          : `お客様の画面に並びました（在庫${shown}個）`,
+      });
+      await load();
+      invalidateBags();
+    } catch (e) {
+      toast({ title: (e as Error).message || '公開に失敗しました', variant: 'destructive' });
+    } finally {
+      setPublishingId(null);
     }
   }
 
@@ -718,6 +748,14 @@ export function RecurringListingsSection({ storeId, storeName = '' }: { storeId:
                   </button>
                 )}
               </div>
+              {/* 次回の公開時刻を待たずに出す。いま出品中の時は出さない（二重に並べる操作を見せない）。 */}
+              {l.isActive && !l.hasLiveBag && (
+                <button type="button" onClick={() => publishNow(l)} disabled={publishingId !== null}
+                  className="w-full mt-2 py-2 rounded-xl border border-primary/30 text-primary bg-primary/5 font-bold text-[12px] flex items-center justify-center gap-1 disabled:opacity-50">
+                  <Zap className="w-3.5 h-3.5" />
+                  {publishingId === l.id ? '公開しています…' : '今すぐ公開する（次回を待たない）'}
+                </button>
+              )}
               {l.isActive && l.hasLiveBag && (
                 <button type="button" onClick={() => withdrawNow(l)}
                   className="w-full mt-2 py-2 rounded-xl border border-rose-200 text-rose-700 bg-rose-50 font-bold text-[12px] flex items-center justify-center gap-1">

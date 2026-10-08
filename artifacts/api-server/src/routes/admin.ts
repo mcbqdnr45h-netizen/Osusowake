@@ -20,9 +20,9 @@ import { Resend } from "resend";
 import crypto from "node:crypto";
 import { rateLimit } from "express-rate-limit";
 import { bagVisibleSql } from "../lib/bag-visibility.js";
-import { sendPushToUsers } from "../lib/push.js";
+import { sendPushToUsers, getPushConfigStatus, getStoreOrAdminUserIds } from "../lib/push.js";
 import { buildGrowthData, buildDailyChecklistAI, buildSalesForecast, buildStoreOutreach, type AppStoreMetrics } from "../lib/growth.js";
-import { getNotificationReach } from "../lib/daily-engagement.js";
+import { getNotificationReach, getAllSubscribedUserIds } from "../lib/daily-engagement.js";
 import OpenAI from "openai";
 
 const router: IRouter = Router();
@@ -267,8 +267,11 @@ router.get("/admin/metrics", requireAdmin, async (req, res) => {
     // ── 5. 時間帯ヒートマップ（24h × 7曜日） ──
     const heatmapResult = await db.execute(sql`
       SELECT
-        EXTRACT(DOW FROM r.created_at)::int  AS dow,
-        EXTRACT(HOUR FROM r.created_at)::int AS hour,
+        -- ★ created_at は timestamp(タイムゾーン無し)でUTCを保持しているため、
+        --   そのまま EXTRACT すると【UTCの時刻】になる(例: 17時JSTが8時と出る)。
+        --   日本時間に直してから曜日・時刻を取る (2026-08-05 修正)。
+        EXTRACT(DOW  FROM (r.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo'))::int AS dow,
+        EXTRACT(HOUR FROM (r.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Tokyo'))::int AS hour,
         COUNT(*)::int AS count
       FROM reservations r
       JOIN stores s ON s.id = r.store_id
@@ -454,6 +457,65 @@ async function runReengage(
 }
 
 const REENGAGE_SEGMENTS = ["fav_no_purchase", "registered_no_purchase_7d"];
+
+// ── GET /admin/push-status ──
+// 「通知はちゃんと生きているか」を管理画面から1タップで確認するための診断。
+// 鍵などの機微情報は返さない。設定の有無と、端末登録数だけを返す。
+router.get("/admin/push-status", requireAdmin, async (_req, res) => {
+  try {
+    const cfg = getPushConfigStatus();
+    const counts = await db.execute(sql`
+      SELECT
+        (SELECT COUNT(*) FROM apns_registrations)::int      AS apns_devices,
+        (SELECT COUNT(DISTINCT user_id) FROM apns_registrations)::int AS apns_users,
+        (SELECT COUNT(*) FROM fcm_registrations)::int       AS fcm_devices,
+        (SELECT COUNT(DISTINCT user_id) FROM fcm_registrations)::int  AS fcm_users,
+        (SELECT COUNT(*) FROM web_push_subscriptions)::int  AS web_devices
+    `);
+    const r = (counts.rows[0] ?? {}) as Record<string, number>;
+
+    // ── 監査: 客向けプッシュの宛先に店舗オーナー/管理者が混ざっていないか ──
+    //   「除外コードがあるはず」ではなく、実データで宛先計算を再現して検査する。
+    //   日次通知・全体配信・お気に入り新着はすべて同じ除外集合(getStoreOrAdminUserIds)を
+    //   通るため、この検査が0件なら3経路とも漏れていない。
+    const [recipients, storeOrAdmin, ownerRows, reach] = await Promise.all([
+      getAllSubscribedUserIds(),
+      getStoreOrAdminUserIds(),
+      db.execute(sql`
+        SELECT s.name,
+          (SELECT COUNT(*) FROM apns_registrations a WHERE a.user_id = s.owner_id)::int AS iphone,
+          (SELECT COUNT(*) FROM fcm_registrations f WHERE f.user_id = s.owner_id)::int  AS android,
+          (SELECT COUNT(*) FROM web_push_subscriptions w WHERE w.user_id = s.owner_id)::int AS browser
+        FROM stores s
+        WHERE s.owner_id IS NOT NULL AND s.status = 'approved'
+        ORDER BY s.name
+      `),
+      getNotificationReach(),
+    ]);
+    const leaked = recipients.filter((id) => storeOrAdmin.has(id));
+
+    res.json({
+      ok: true,
+      configured: cfg,
+      devices: {
+        iphone:  { devices: Number(r["apns_devices"] ?? 0), users: Number(r["apns_users"] ?? 0) },
+        android: { devices: Number(r["fcm_devices"] ?? 0),  users: Number(r["fcm_users"] ?? 0) },
+        browser: { devices: Number(r["web_devices"] ?? 0) },
+      },
+      audit: {
+        consumerRecipients: recipients.length,   // 客向けプッシュの会員宛先数（検査対象）
+        leakedCount: leaked.length,              // ここが0でなければ店舗/管理者に漏れている
+        owners: (ownerRows.rows as any[]).map((o) => ({
+          name: o.name, iphone: Number(o.iphone), android: Number(o.android), browser: Number(o.browser),
+        })),
+        anonymous: { ios: reach.anonIos, web: reach.anonWeb },
+      },
+    });
+  } catch (err: any) {
+    console.error("[admin/push-status]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
 
 // ── GET /admin/growth ──
 // 成長コックピットのデータ一式（共有ライブラリ buildGrowthData で構築）。
@@ -1176,6 +1238,48 @@ router.get("/admin/stores/:storeId/detail", requireAdmin, async (req, res) => {
           }
 
           console.log(`[admin/stores/detail] Stripe live fetch: storeId=${storeId} acct=${store.stripe_account_id} charges=${account.charges_enabled} payouts=${account.payouts_enabled} due=${stripeRequirements.currently_due.length}`);
+          // ── 診断ログ: KYC がどこまで Stripe に届いているか (PII は boolean のみ) ──
+          //   全項目 currently_due の店舗 (mokopan 等) の原因特定用。値そのものは出力しない。
+          {
+            const ind: any = (account as any).individual ?? null;
+            // 法人アカウントは individual が無い → 代表者 Person の書類状態を取得
+            //   (2026-09-27 JANZENEST「身分証明書を提出してください」の原因切り分け用:
+            //    doc_front=false なら添付漏れ=アプリ側 / doc_front=true+verif却下なら提出書類側)
+            let rep: any = null;
+            if (account.business_type === "company") {
+              try {
+                const persons = await stripe.accounts.listPersons(store.stripe_account_id as string, { limit: 10 });
+                rep = persons.data.find((p: any) => (p.relationship as any)?.representative) ?? persons.data[0] ?? null;
+              } catch (pe: any) {
+                console.warn(`[admin/stores/detail] persons.list failed: ${pe?.message}`);
+              }
+            }
+            const personDiag = (p: any) => p ? {
+              last_kanji: !!p.last_name_kanji, first_kanji: !!p.first_name_kanji,
+              last_kana: !!p.last_name_kana, first_kana: !!p.first_name_kana,
+              dob: !!(p.dob?.year), addr_kanji: !!(p.address_kanji?.postal_code),
+              addr_kana: !!(p.address_kana?.postal_code),
+              phone: !!p.phone, email: !!p.email,
+              doc_front: !!p.verification?.document?.front,
+              doc_back: !!p.verification?.document?.back,
+              verif_status: p.verification?.status ?? null,
+              verif_details: p.verification?.details ?? null,
+              verif_details_code: p.verification?.details_code ?? null,
+              requirements_due: p.requirements?.currently_due ?? [],
+              requirements_errors: p.requirements?.errors ?? [],
+            } : null;
+            const diag = {
+              biz: account.business_type,
+              tos: !!(account.tos_acceptance as any)?.date,
+              bank: (account.external_accounts as any)?.total_count ?? 0,
+              disabled: account.requirements?.disabled_reason ?? null,
+              errors: account.requirements?.errors ?? [],
+              past_due_n: (account.requirements?.past_due ?? []).length,
+              indiv: personDiag(ind),
+              rep: rep ? { id: rep.id, ...personDiag(rep) } : null,
+            };
+            console.log(`[admin/stores/detail] 🔬 KYC診断 storeId=${storeId}: ${JSON.stringify(diag)}`);
+          }
         } catch (stripeErr: any) {
           console.warn(`[admin/stores/detail] Stripe fetch failed: ${stripeErr?.message}`);
           stripeRequirements = { error: stripeErr?.code ?? "stripe_error", message: stripeErr?.message };
@@ -1202,7 +1306,7 @@ router.post("/admin/stores/:storeId/stripe-sync", requireAdmin, async (req, res)
   if (isNaN(storeId)) { res.status(400).json({ error: "bad_request" }); return; }
   try {
     const [store] = await db
-      .select({ id: storesTable.id, stripeAccountId: storesTable.stripeAccountId })
+      .select({ id: storesTable.id, stripeAccountId: storesTable.stripeAccountId, status: storesTable.status })
       .from(storesTable)
       .where(eq(storesTable.id, storeId));
     if (!store) { res.status(404).json({ error: "not_found" }); return; }
@@ -1254,10 +1358,30 @@ router.post("/admin/stores/:storeId/stripe-sync", requireAdmin, async (req, res)
       dbPatch.licenseUploadFailed = false;
       dbPatch.licenseUploadError  = null;
     }
+    // ★ 2026-08-05 Stripeが再提出を求めている(書類却下 / past_due)のに status が
+    //   'applied'(審査中)のまま残っている店を 'pending' に差し戻す。
+    //   stripe-webhook.ts が account.updated 受信時にやっている処理と同一。
+    //   webhook を取りこぼした店を、管理画面の「Stripe再同期」1タップで
+    //   従来の再入力フォーム(bank-setup)に戻せるようにする。
+    let revertedToPending = false;
+    if (!stripeError && store.status === "applied") {
+      const pastDue: string[] = (requirements?.["currently_due"] as string[]) ?? [];
+      const errs: any[]       = (requirements?.["errors"] as any[]) ?? [];
+      if (pastDue.length > 0 || errs.length > 0) {
+        dbPatch["status"] = "pending";
+        dbPatch["stripeNeedsBankReregister"] = pastDue.some(
+          (f) => f === "external_account" || f.startsWith("external_account"),
+        );
+        revertedToPending = true;
+        console.log(`[admin/stripe-sync] ⚠️ storeId=${storeId} applied → pending (再入力フォームへ差し戻し)`);
+      }
+    }
+
     await db.update(storesTable).set(dbPatch as any).where(eq(storesTable.id, storeId));
 
     res.json({
       synced: true,
+      revertedToPending,
       stripeAccountId:  store.stripeAccountId,
       chargesEnabled:   stripeError ? false : chargesEnabled,
       payoutsEnabled:   stripeError ? false : payoutsEnabled,
@@ -1311,9 +1435,10 @@ router.post("/admin/stores/batch-refresh-stripe", requireAdmin, async (req, res)
   if (!stripeKey) { res.status(503).json({ error: "stripe_not_configured" }); return; }
   try {
     const rows = await db
-      .select({ id: storesTable.id, stripeAccountId: storesTable.stripeAccountId })
+      .select({ id: storesTable.id, name: storesTable.name, stripeAccountId: storesTable.stripeAccountId })
       .from(storesTable)
       .where(isNotNull(storesTable.stripeAccountId));
+    const storeNameById = new Map(rows.map((r) => [r.id, r.name] as const));
 
     // accountId → [storeId, ...] にグルーピング（同一オーナー多店舗を1コールにまとめる）
     const accountIdToStoreIds = new Map<string, number[]>();
@@ -1330,6 +1455,7 @@ router.post("/admin/stores/batch-refresh-stripe", requireAdmin, async (req, res)
     // 並列数制限ヘルパー（外部依存追加なし）
     const CONCURRENCY = 8;
     const updated: Record<number, boolean> = {};
+    const failures: { account: string; storeIds: number[]; stores: string; message: string }[] = [];
     let cursor = 0;
     const workers = Array.from({ length: Math.min(CONCURRENCY, accountIds.length) }, async () => {
       while (cursor < accountIds.length) {
@@ -1354,15 +1480,127 @@ router.post("/admin/stores/batch-refresh-stripe", requireAdmin, async (req, res)
 
           for (const sid of storeIds) updated[sid] = !!account.charges_enabled;
         } catch (innerErr: any) {
-          console.warn(`[admin/batch-refresh-stripe] account ${acct} 失敗: ${innerErr?.message}`);
+          // ★ どの店か分からないと対応できないので、店名を必ず添える
+          const names = storeIds.map((sid) => storeNameById.get(sid) ?? `#${sid}`).join(", ");
+          console.warn(`[admin/batch-refresh-stripe] account ${acct}（${names}）失敗: ${innerErr?.message}`);
+          failures.push({ account: acct, storeIds, stores: names, message: String(innerErr?.message ?? innerErr) });
         }
       }
     });
     await Promise.all(workers);
 
-    res.json({ updated, accounts: accountIds.length, stores: rows.length });
+    res.json({ updated, failures, accounts: accountIds.length, stores: rows.length });
   } catch (err: any) {
     console.error("[admin/batch-refresh-stripe]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── POST /admin/notify-user ───────────────────────────────────────────────────
+// 特定のお客様ひとりに、ベル通知+プッシュを送る。
+//   ★ 2026-08-25 ビーチアイランド高槻の件より。お詫びをメールで送ったところ
+//     Stripe登録アドレスが実在せずバウンス（お客様がメールを打ち間違えて登録）。
+//     メールが死んでいるお客様への唯一の連絡経路がアプリ内通知のため、
+//     支払いID(pi_...)から購入者を特定して送れる管理者専用の口を用意する。
+router.post("/admin/notify-user", requireAdmin, async (req, res) => {
+  const { paymentIntentId, userId, title, body } = (req.body ?? {}) as {
+    paymentIntentId?: string; userId?: string; title?: string; body?: string;
+  };
+  if (!title?.trim() || !body?.trim()) {
+    res.status(400).json({ error: "bad_request", message: "title と body は必須です" }); return;
+  }
+  try {
+    let targetUserId = userId?.trim() || "";
+    let matched: { bagTitle?: string | null } = {};
+    if (!targetUserId && paymentIntentId?.trim()) {
+      const [r] = await db
+        .select({ userId: reservationsTable.userId, bagId: reservationsTable.bagId })
+        .from(reservationsTable)
+        .where(eq(reservationsTable.paymentIntentId, paymentIntentId.trim()))
+        .limit(1);
+      if (!r) { res.status(404).json({ error: "not_found", message: "この支払いIDの予約が見つかりません" }); return; }
+      targetUserId = r.userId;
+      const [bag] = await db.select({ title: surpriseBagsTable.title })
+        .from(surpriseBagsTable).where(eq(surpriseBagsTable.id, r.bagId)).limit(1);
+      matched = { bagTitle: bag?.title ?? null };
+    }
+    if (!targetUserId) { res.status(400).json({ error: "bad_request", message: "paymentIntentId か userId を指定してください" }); return; }
+
+    await db.insert(notificationsTable).values({
+      userId: targetUserId, type: "announcement",
+      title: title.trim(), body: body.trim(), read: false,
+    });
+    let pushed = false;
+    try {
+      await sendPushToUsers([targetUserId], { title: title.trim(), body: body.trim(), tag: `admin-direct-${Date.now()}`, url: "/my-reservations" });
+      pushed = true;
+    } catch { /* ベルは届いているので握り潰す */ }
+    console.log(`[admin/notify-user] user=${targetUserId.slice(0,8)} pushed=${pushed} 件名="${title.trim().slice(0,30)}"`);
+    res.json({ ok: true, pushed, bagTitle: matched.bagTitle ?? null });
+  } catch (err: any) {
+    console.error("[admin/notify-user]", err);
+    res.status(500).json({ error: "internal_error", message: err?.message });
+  }
+});
+
+// ── POST /admin/stores/:storeId/request-kyc ──────────────────────────────────
+// 書類差し戻し中の店舗へ「本人確認書類の再提出のお願い」をベル通知+プッシュで送る。
+//   Stripeの差し戻しは店側の画面を開かないと気づけないため、管理者から能動的に
+//   知らせる導線。文言は固定（誤操作でも失礼にならない内容のみ送れる）。
+router.post("/admin/stores/:storeId/request-kyc", requireAdmin, async (req, res) => {
+  const storeId = Number(req.params.storeId);
+  if (isNaN(storeId)) { res.status(400).json({ error: "bad_request" }); return; }
+  try {
+    const [store] = await db
+      .select({ id: storesTable.id, name: storesTable.name, ownerId: storesTable.ownerId, stripeAccountId: storesTable.stripeAccountId })
+      .from(storesTable)
+      .where(eq(storesTable.id, storeId))
+      .limit(1);
+    if (!store?.ownerId) { res.status(404).json({ error: "not_found", message: "店舗またはオーナーが見つかりません" }); return; }
+
+    // ── 不足しているのが「書類」か「本人情報の入力」かを Stripe ライブ値で判定 ──
+    //   mokopan (2026-09-01): 書類は届いているのに氏名・住所等の基本項目が全滅 → /store/kyc に
+    //   誘導すると「書類だけ再提出→直らない」の無限ループになる。基本項目が不足している店は
+    //   bank-setup の再入力フォームへ誘導しなければならない。
+    let needsBasicInfo = false;
+    if (store.stripeAccountId) {
+      try {
+        const stripeKey = process.env["STRIPE_SECRET_KEY"];
+        if (stripeKey) {
+          const stripe = await import("stripe").then((m) => new m.default(stripeKey));
+          const acc = await stripe.accounts.retrieve(store.stripeAccountId);
+          const due: string[] = acc.requirements?.currently_due ?? [];
+          needsBasicInfo = due.some((f) =>
+            (f.startsWith("individual.") || f.startsWith("company.")) &&
+            !f.includes("verification") && !f.includes("document")
+          );
+        }
+      } catch (e: any) {
+        console.warn(`[admin/request-kyc] Stripe live判定失敗 (書類扱いで続行): ${e?.message}`);
+      }
+    }
+
+    const title = needsBasicInfo ? "登録情報のご入力のお願い" : "本人確認書類の再提出のお願い";
+    const body = needsBasicInfo
+      ? `${store.name} さまの決済・入金の開始には、代表者さまの情報（お名前・ご住所・生年月日・お電話番号）のご入力が必要です。書類はすでに受領済みですので、店舗ダッシュボードの口座登録フォームからご入力だけお願いいたします（3分ほどで完了します）。`
+      : `${store.name} さまの入金再開には、本人確認書類の再提出が必要です。店舗ダッシュボードの案内から3分ほどで完了します。`;
+    const redoUrl = needsBasicInfo ? "/store/bank-setup" : "/store/kyc";
+    await db.insert(notificationsTable).values({
+      userId: store.ownerId,
+      type: "announcement",
+      title,
+      body,
+      read: false,
+    });
+    let pushed = false;
+    try {
+      await sendPushToUsers([store.ownerId], { title, body, tag: `kyc-redo-${storeId}`, url: redoUrl });
+      pushed = true;
+    } catch { /* プッシュ失敗でもベル通知は届いているので握り潰す */ }
+    console.log(`[admin/request-kyc] store=${storeId}(${store.name}) 再提出依頼を送信 push=${pushed} needsBasicInfo=${needsBasicInfo} url=${redoUrl}`);
+    res.json({ ok: true, pushed });
+  } catch (err: any) {
+    console.error("[admin/request-kyc]", err);
     res.status(500).json({ error: "internal_error", message: err?.message });
   }
 });
@@ -1700,7 +1938,7 @@ router.post("/admin/stores/:storeId/reject", requireAdmin, async (req, res) => {
       引き続きよろしくお願いいたします 🧡
     </p>
     <div style="text-align:center;">
-      <a href="${appUrl}/bank-setup" style="display:inline-block;background:linear-gradient(135deg,#F26419,#F6AE2D);color:#fff;font-size:15px;font-weight:900;padding:16px 48px;border-radius:16px;text-decoration:none;">
+      <a href="${appUrl}/store/bank-setup" style="display:inline-block;background:linear-gradient(135deg,#F26419,#F6AE2D);color:#fff;font-size:15px;font-weight:900;padding:16px 48px;border-radius:16px;text-decoration:none;">
         再申請する →
       </a>
     </div>

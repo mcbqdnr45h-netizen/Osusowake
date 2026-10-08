@@ -95,6 +95,14 @@ export default defineConfig({
       },
     },
   },
+  // ★ 本番ビルドでのみ console.log / console.debug を除去する。
+  //    認証状態などの内部情報がユーザのコンソールに出続けるのを止める。
+  //    console.error / console.warn は障害調査に必要なので残す。
+  //    dev サーバー (isServeMode) では開発の邪魔になるため何も落とさない。
+  //    ※ NODE_ENV は Docker のビルド段階では未設定のため isServeMode で判定する。
+  esbuild: {
+    pure: isServeMode ? [] : ["console.log", "console.debug"],
+  },
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,

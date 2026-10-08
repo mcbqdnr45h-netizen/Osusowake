@@ -55,7 +55,7 @@ export default function SupabaseTest() {
 
   return (
     <Layout>
-      <div className="max-w-lg md:max-w-3xl mx-auto p-4 md:p-8 space-y-6">
+      <div className="w-full max-w-lg md:max-w-3xl mx-auto p-4 md:p-8 space-y-6">
         {/* Header */}
         <div className="flex items-center gap-3">
           <div className="w-12 h-12 rounded-2xl bg-primary/10 flex items-center justify-center">

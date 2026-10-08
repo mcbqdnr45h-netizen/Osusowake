@@ -170,6 +170,11 @@ function stripeReasonLabel(reason: string): string {
   if (r.includes('document') && (r.includes('upload') || r.includes('verification'))) {
     return '本人確認書類の再アップロードが必要です。';
   }
+  if (r.includes('multiple options matching the provided town') || (r.includes('cho-me') && r.includes('town'))) {
+    // mokopan (2026-09-02): 高槻の「日吉台」は正式町名が「日吉台一〜七番町」に分かれており、
+    // 町名だけでは特定できず住所1項目のせいで更新がまるごと拒否されていた
+    return '町名だけでは住所を特定できませんでした。「町名」の欄に丁目・番町まで含めて入力してください（例：「日吉台」→「日吉台五番町」）。「番地・建物名」の欄には丁目・番町を入れず、番地から書いてください。';
+  }
   if (r.includes('address')) {
     return '住所情報に問題があります。 入力内容をご確認ください。';
   }
@@ -180,11 +185,52 @@ function stripeReasonLabel(reason: string): string {
   return '入力情報に問題があるため再送信が必要です。 詳細はLINEサポートにお問い合わせください。';
 }
 
+// ── 法人番号ヘルパー (2026-09-28 ConteCafe) ─────────────────────────────────
+//   登記簿の「会社法人等番号」は12桁、国税庁の「法人番号」は先頭に検査用数字を
+//   足した13桁で別物。12桁しか手元にない店主が0埋めして無効な番号を作ってしまう
+//   事故が実際に起きたため、12桁入力は国税庁告示の計算式で正しい13桁に自動変換する。
+function corporateCheckDigit(base12: string): number {
+  let sum = 0;
+  for (let n = 1; n <= 12; n++) sum += Number(base12[12 - n]) * (n % 2 === 1 ? 1 : 2);
+  return 9 - (sum % 9);
+}
+/** 12桁→13桁に変換 / 13桁は検査用数字を照合。value=確定13桁, error=不正の理由 */
+function normalizeCorporateNumber(raw: string): { value?: string; error?: string } {
+  const d = (raw ?? '').replace(/[^0-9]/g, '');
+  if (d.length === 12) return { value: String(corporateCheckDigit(d)) + d };
+  if (d.length === 13) {
+    if (Number(d[0]) === corporateCheckDigit(d.slice(1))) return { value: d };
+    return { error: '法人番号が正しくないようです。登記簿の12桁（会社法人等番号）をお持ちの場合は、0を足さず12桁のまま入力してください（自動で13桁に変換されます）' };
+  }
+  return { error: `法人番号（13桁、または登記の12桁 — 現在${d.length}桁）` };
+}
+
 const DRAFT_KEY_PREFIX = 'bank-setup-draft-v2-';
 const BUSINESS_TYPE_KEY = 'store-business-type';
 function loadSavedBusinessType(): 'individual' | 'company' {
   try { const v = localStorage.getItem(BUSINESS_TYPE_KEY); return v === 'company' ? 'company' : 'individual'; } catch (_) { return 'individual'; }
 }
+// ★ 生年月日の月/日のゼロ埋めを外す (2026-08-05)
+//   Stripe API は月/日を2桁ゼロ埋め('08')で返すが、フォームの月・日は<select>で
+//   option の value はゼロ埋めなし('8')。文字列が一致しないと select は空欄になり、
+//   「他の項目は引き継がれるのに生年月日だけ入らない」状態になる
+//   (1〜9月・1〜9日が全滅。年は<input type=number>なので影響なし)。
+//   Stripeからの取り込みと、端末に残った旧ドラフトの復元の【両方】で通すこと。
+// ★ 郵便番号は必ず「半角数字7桁」に正規化してから state に入れる (2026-08-05)。
+//   全角数字やハイフン付き("569-1123")のまま入ると、送信ボタンが押せない/
+//   サーバーが空文字を Stripe に送って更新まるごと失敗する、のどちらかになる。
+function normalizeZip(v: string): string {
+  return (v ?? '')
+    .replace(/[\uff10-\uff19]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    .replace(/\D/g, '')
+    .slice(0, 7);
+}
+
+function stripDobPad(v: string): string {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? String(n) : '';
+}
+
 type DraftState = {
   lastNameKanji: string; firstNameKanji: string;
   lastNameKana: string;  firstNameKana: string;
@@ -463,9 +509,13 @@ export default function StripeBankSetup() {
     if (d.phone)              setPhone(d.phone);
     if (d.email)              setEmail(d.email);
     if (d.dobYear)            setDobYear(d.dobYear);
-    if (d.dobMonth)           setDobMonth(d.dobMonth);
-    if (d.dobDay)             setDobDay(d.dobDay);
-    if (d.postalCode)         setPostalCode(d.postalCode);
+    // ★ 端末に保存された下書きに、旧バグ時代のゼロ埋め値('08')が残っている場合がある。
+    //   そのまま入れると<select>のoption値('8')と一致せず空欄のままになり、しかも
+    //   下書きが「値あり」扱いになるためStripeからの再取得もスキップされ、
+    //   【アプリを入れ直すまで永久に生年月日が入らない】状態になる(高槻駅 2026-08-05)。
+    if (d.dobMonth)           setDobMonth(stripDobPad(d.dobMonth));
+    if (d.dobDay)             setDobDay(stripDobPad(d.dobDay));
+    if (d.postalCode)         setPostalCode(normalizeZip(d.postalCode));
     if (d.stateKanji)         setStateKanji(d.stateKanji);
     if (d.cityKanji)          setCityKanji(d.cityKanji);
     if (d.townKanji)          setTownKanji(d.townKanji);
@@ -559,9 +609,9 @@ export default function StripeBankSetup() {
         if (ind.phone && ok(['individual.phone'])) setPhone(ind.phone);
         if (!draft.email           && ind.email           && ok(['individual.email']))             setEmail(ind.email);
         if (!draft.dobYear         && ind.dobYear         && ok(['individual.dob.year']))          setDobYear(ind.dobYear);
-        if (!draft.dobMonth        && ind.dobMonth        && ok(['individual.dob.month']))         setDobMonth(ind.dobMonth);
-        if (!draft.dobDay          && ind.dobDay          && ok(['individual.dob.day']))           setDobDay(ind.dobDay);
-        if (!draft.postalCode      && ind.postalCode      && ok(['individual.address_kanji.postal_code'])) setPostalCode(ind.postalCode);
+        if (!draft.dobMonth        && ind.dobMonth        && ok(['individual.dob.month']))         setDobMonth(stripDobPad(ind.dobMonth));
+        if (!draft.dobDay          && ind.dobDay          && ok(['individual.dob.day']))           setDobDay(stripDobPad(ind.dobDay));
+        if (!draft.postalCode      && ind.postalCode      && ok(['individual.address_kanji.postal_code'])) setPostalCode(normalizeZip(ind.postalCode));
         if (!draft.stateKanji      && ind.stateKanji      && ok(['individual.address_kanji.state']))       setStateKanji(ind.stateKanji);
         if (!draft.cityKanji       && ind.cityKanji       && ok(['individual.address_kanji.city']))        setCityKanji(ind.cityKanji);
         if (!draft.townKanji       && ind.townKanji       && ok(['individual.address_kanji.town']))        setTownKanji(ind.townKanji);
@@ -664,7 +714,13 @@ export default function StripeBankSetup() {
   }, []);
 
   const handlePostalCodeChange = (v: string) => {
-    const clean = v.replace(/\D/g, '').slice(0, 7);
+    // ★ 日本語入力のままだと全角数字(５６９...)が入る。旧実装はこれを丸ごと捨てて
+    //   いたため郵便番号が空になり、サーバー側でStripeへ空文字が送られて
+    //   再提出が丸ごと失敗していた(2026-08-05)。半角に直してから数字だけ残す。
+    const clean = v
+      .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+      .replace(/\D/g, '')
+      .slice(0, 7);
     setPostalCode(clean);
     if (clean.length === 7) lookupZip(clean);
   };
@@ -727,7 +783,8 @@ export default function StripeBankSetup() {
   if (businessType === 'company' && !companyNameKanji.trim()) missingFields.push('法人名（漢字）');
   if (businessType === 'company' && !companyNameKana.trim())  missingFields.push('法人名（カナ）');
   if (businessType === 'company' && !companyNameLatin.trim()) missingFields.push('法人名（ローマ字）— 必須');
-  if (businessType === 'company' && companyTaxId.replace(/-/g, '').length !== 13) missingFields.push(`法人番号（13桁で入力 — 現在${companyTaxId.replace(/-/g, '').length}桁）`);
+  const taxIdNorm = businessType === 'company' ? normalizeCorporateNumber(companyTaxId) : null;
+  if (businessType === 'company' && !taxIdNorm?.value) missingFields.push(taxIdNorm?.error ?? '法人番号');
   if (!lastNameKanji.trim() || !firstNameKanji.trim()) missingFields.push('代表者氏名（漢字）');
   if (!lastNameKana.trim()   || !firstNameKana.trim())  missingFields.push('代表者氏名（カタカナ）');
   if (phone.trim().length < 10)  missingFields.push(`電話番号（現在${phone.trim().length}桁 / 10桁以上）`);
@@ -842,7 +899,8 @@ export default function StripeBankSetup() {
               companyNameKanji:     companyNameKanji.trim()              || undefined,
               companyNameKana:      companyNameKana.trim()               || undefined,
               companyNameLatin:     companyNameLatin.trim()              || undefined,
-              companyTaxId:         companyTaxId.replace(/-/g, '').trim() || undefined,
+              // 12桁(登記番号)は検査用数字を付けた正式な13桁に変換して送信 (2026-09-28)
+              companyTaxId:         taxIdNorm?.value ?? (companyTaxId.replace(/-/g, '').trim() || undefined),
               companyStructure:     companyStructure                     || undefined,
               representativeTitle:  representativeTitle.trim()           || '代表取締役',
             } : {}),
@@ -869,7 +927,43 @@ export default function StripeBankSetup() {
 
       // kycWarning: 個人情報フィールドが不足している場合のみ（書類未送信は対象外）
       if (data.kycWarning) {
-        setError('⚠️ 代表者の個人情報（氏名・住所・生年月日など）の一部が正しく送信されませんでした。\n\nお手数ですが、入力内容をご確認のうえ再度送信してください。');
+        // ★ 2026-08-05 実態どおりに書き分ける。
+        //   旧実装は常に「個人情報の一部が正しく送信されませんでした」だけを出していたが、
+        //   本人確認書類は別経路で送信済みなので、店主が「全部失敗した」と誤解して
+        //   同じ書類を何度も送り直す原因になっていた(高槻駅)。
+        const missing: string[] = Array.isArray(data.kycMissingFields) ? data.kycMissingFields : [];
+        const labels = Array.from(new Set(missing.map((f: string): string | null => {
+          if (/dob/.test(f))                        return '生年月日';
+          if (/(first_name|last_name)/.test(f))     return 'お名前（漢字・カナ）';
+          if (/postal_code/.test(f))                return '郵便番号';
+          if (/address/.test(f))                    return 'ご住所';
+          if (/phone/.test(f))                      return '電話番号';
+          if (/email/.test(f))                      return 'メールアドレス';
+          if (/id_number/.test(f))                  return 'マイナンバー・法人番号';
+          if (/tos_acceptance/.test(f))             return '利用規約への同意';
+          if (/external_account|bank/.test(f))      return '振込先口座';
+          if (/business_profile|product_description|url|mcc/.test(f)) return '事業内容の情報';
+          return null;
+        }).filter((v): v is string => v !== null)));
+
+        const head = data.docsReceived
+          ? '✅ 本人確認書類は受け付けました。\n\n⚠️ ただし、お客様情報の更新だけが完了しませんでした。'
+          : '⚠️ お客様情報の更新が完了しませんでした。';
+        // ★ 2026-09-02 サーバーが返す Stripe の具体的なエラー文 (kycErrorMessage) を表示する。
+        //   旧実装はこれを無視して汎用文だけを出しており、mokopan は「住所の町名が
+        //   特定できない」という明確な原因を知らされないまま何度も再提出していた。
+        const stripeMsg = typeof data.kycErrorMessage === 'string' && data.kycErrorMessage.trim()
+          ? (stripeReasonLabel(data.kycErrorMessage) || data.kycErrorMessage)
+          : '';
+        const body = labels.length > 0
+          ? `\n\n【ご確認いただきたい項目】\n${labels.map(l => `・${l}`).join('\n')}\n\n上記を身分証の記載どおりに直して、もう一度送信してください。`
+          : stripeMsg
+            ? `\n\n【エラー内容】\n${stripeMsg}\n\n修正のうえ、もう一度送信してください。`
+            : '\n\n入力内容をご確認のうえ、もう一度送信してください。';
+        const tail = data.docsReceived
+          ? '\n\n※書類は届いていますので、同じ書類を何度も送り直す必要はありません。'
+          : '';
+        setError(head + body + tail);
         try { await refetch(); } catch (_) {}
         return;
       }
@@ -974,7 +1068,11 @@ export default function StripeBankSetup() {
               <p className="text-xs font-black text-orange-900 flex items-center gap-1.5">⏱️ 審査期間：通常 1〜3営業日</p>
               <p className="text-xs text-orange-700 leading-relaxed">審査結果（承認・修正依頼ともに）は<strong>おすそわけ事務局</strong>よりメールでご連絡します。</p>
               <div className="border-t border-orange-200 pt-2">
-                <p className="text-xs font-black text-orange-900 flex items-center gap-1.5">💰 振込：毎月25日（初回は約7営業日後）</p>
+                {/* ★ 振込スケジュールは Stripe 側で monthly / anchor=25 に固定しており、
+                    「初回だけ7営業日後」という仕組みは存在しない(旧表記は誤り 2026-08-05)。
+                    7日は「決済→振込可能になるまでの保留期間」であって振込日ではない。 */}
+                <p className="text-xs font-black text-orange-900 flex items-center gap-1.5">💰 振込：毎月25日（初回も同じ）</p>
+                <p className="text-[11px] text-orange-700 leading-relaxed">売上は決済から約7日後に「振込可能」になり、その後最初に来る25日にまとめて振り込まれます。</p>
               </div>
             </div>
           )}
@@ -1093,8 +1191,7 @@ export default function StripeBankSetup() {
               <div>
                 <p className="text-sm font-black text-orange-900">売上の振込スケジュール</p>
                 <p className="text-xs text-orange-700 leading-relaxed mt-0.5">
-                  審査通過後、<strong>初回振込は最初の売上から約7営業日後</strong>となります。
-                  2回目以降は<strong>毎月25日</strong>に、振込可能になっている残高がまとめて口座へ振り込まれます。
+                  振込は<strong>毎月25日</strong>です（初回も同じ）。その日までに「振込可能」になっている残高が、まとめて口座へ振り込まれます。
                   ※売上は決済から約7日後に「振込可能」へ移動し、その後最初に到来する25日に振込されます（例：5月22日の売上 → 5月29日に振込可能 → 6月25日に振込）。
                 </p>
               </div>
@@ -1114,7 +1211,7 @@ export default function StripeBankSetup() {
   // ────────── メインフォーム ──────────
   return (
     <div className="min-h-screen bg-gradient-to-br from-orange-50 to-amber-50">
-      <div className="max-w-lg md:max-w-3xl mx-auto px-4 pt-safe-or-4 pb-12">
+      <div className="w-full max-w-lg md:max-w-3xl mx-auto px-4 pt-safe-or-4 pb-12">
 
         {/* ヘッダー */}
         <div className="flex items-center gap-3 py-5">
@@ -1216,7 +1313,7 @@ export default function StripeBankSetup() {
                 <span className="text-orange-500 text-sm mt-0.5">⏱️</span>
                 <div>
                   <p className="text-[11px] font-black text-orange-800">審査期間：通常 1〜3営業日</p>
-                  <p className="text-[11px] text-orange-600 leading-relaxed mt-0.5">振込：初回は約7営業日後 / 2回目以降は毎月25日</p>
+                  <p className="text-[11px] text-orange-600 leading-relaxed mt-0.5">振込：毎月25日（初回も同じ。売上は決済の約7日後に振込可能になります）</p>
                 </div>
               </div>
               <div className="flex items-start gap-2">
@@ -1306,10 +1403,20 @@ export default function StripeBankSetup() {
                 <input type="text" value={companyNameLatin} onChange={e => setCompanyNameLatin(e.target.value)}
                   placeholder="Kabushiki Gaisha XX Food" required={businessType === 'company'} className={inputClass} />
               </Field>
-              <Field label="法人番号（13桁）" required hint="国税庁の法人番号。ハイフンなしで入力">
+              <Field label="法人番号（13桁 または 登記の12桁）" required hint="国税庁の法人番号（13桁）。登記簿の12桁（会社法人等番号）しかお手元にない場合は、そのまま12桁で入力してください（自動で13桁に変換されます）">
                 <input type="text" value={companyTaxId} onChange={e => setCompanyTaxId(e.target.value.replace(/[^\d-]/g, ''))}
                   placeholder="0000000000000" maxLength={13} inputMode="numeric" className={inputClass} />
-                <p className="text-xs text-gray-400 mt-1">{companyTaxId.replace(/-/g, '').length} / 13 桁</p>
+                {(() => {
+                  const d = companyTaxId.replace(/[^0-9]/g, '');
+                  if (d.length === 12) {
+                    const v = normalizeCorporateNumber(d);
+                    return <p className="text-xs text-emerald-600 font-bold mt-1">✓ 登記の12桁ですね。法人番号 {v.value} として送信します</p>;
+                  }
+                  if (d.length === 13 && normalizeCorporateNumber(d).error) {
+                    return <p className="text-xs text-red-500 font-bold mt-1">⚠️ この13桁は法人番号として正しくないようです。12桁の登記番号に0を足していませんか？その場合は0を消して12桁のまま入力してください</p>;
+                  }
+                  return <p className="text-xs text-gray-400 mt-1">{d.length} / 13 桁</p>;
+                })()}
               </Field>
             </FormSection>
           )}
