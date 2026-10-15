@@ -80,7 +80,7 @@ export default function StoreBagsPage() {
     try {
       setClassifying(true);
       const apiBase = import.meta.env.VITE_API_URL ?? '';
-      const res = await fetch(`${apiBase}/api/suggest-category`, {
+      const res = await authedFetch(`${apiBase}/api/suggest-category`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ imageBase64: url }),

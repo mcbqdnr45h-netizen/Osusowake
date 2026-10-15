@@ -1,7 +1,22 @@
 import { Router, type IRouter } from "express";
 import OpenAI from "openai";
+import { rateLimit } from "express-rate-limit";
+import { requireAuth } from "../middlewares/auth.js";
 
 const router: IRouter = Router();
+
+// 1回ごとに有料のAIを呼ぶので、 ログイン必須＋1人1分10回まで。
+//   以前はログイン無しで誰でも呼べた（IPあたり1分600回の全体制限だけ）。
+const classifyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: (req) => req.authUser?.id ?? "anonymous",
+  message: { error: "rate_limited", message: "AIの自動判定は少し時間をおいてからお試しください。" },
+});
+
+const MAX_IMAGE_BASE64_LENGTH = 8 * 1024 * 1024;
 
 // 本番Flyは OPENAI_API_KEY、 ローカル開発は AI_INTEGRATIONS_* を使う。
 const openai = new OpenAI({
@@ -20,11 +35,15 @@ const VALID_CATEGORIES = [
  * body: { imageBase64: string }   (data URL or raw base64)
  * res:  { category: string | null }
  */
-router.post("/suggest-category", async (req, res) => {
+router.post("/suggest-category", requireAuth, classifyLimiter, async (req, res) => {
   try {
     const { imageBase64 } = req.body as { imageBase64?: string };
     if (!imageBase64) {
       res.status(400).json({ error: "bad_request", message: "imageBase64 is required" });
+      return;
+    }
+    if (typeof imageBase64 !== "string" || imageBase64.length > MAX_IMAGE_BASE64_LENGTH) {
+      res.status(413).json({ error: "too_large", message: "画像が大きすぎます" });
       return;
     }
 
