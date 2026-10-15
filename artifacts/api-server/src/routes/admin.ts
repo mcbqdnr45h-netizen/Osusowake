@@ -21,7 +21,7 @@ import crypto from "node:crypto";
 import { rateLimit } from "express-rate-limit";
 import { bagVisibleSql } from "../lib/bag-visibility.js";
 import { sendPushToUsers, getPushConfigStatus, getStoreOrAdminUserIds } from "../lib/push.js";
-import { buildGrowthData, buildDailyChecklistAI, buildSalesForecast, buildStoreOutreach, type AppStoreMetrics } from "../lib/growth.js";
+import { buildGrowthData, buildSalesForecast, buildStoreOutreach, type AppStoreMetrics } from "../lib/growth.js";
 import { getNotificationReach, getAllSubscribedUserIds } from "../lib/daily-engagement.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { askClaude, hasClaudeKey, imageFromDataUrl } from "../lib/claude.js";
@@ -595,58 +595,14 @@ async function getAppStoreMetrics(): Promise<AppStoreMetrics> {
   };
 }
 
-// 今日消化したチェックリスト項目の状態を app_settings に保存する（board_checklist_YYYY-MM-DD）。
-async function getBoardCheckState(isoDate: string): Promise<Record<string, boolean>> {
-  const key = `board_checklist_${isoDate}`;
-  const r = await db.execute(sql`SELECT value FROM app_settings WHERE key = ${key}`);
-  if (r.rows.length === 0) return {};
-  try {
-    return JSON.parse((r.rows[0] as any).value) || {};
-  } catch {
-    return {};
-  }
-}
-
-// その日のAIチェックリストを app_settings に1日キャッシュする（board_checklist_items_YYYY-MM-DD）。
-//   ★ 1日1回だけ生成する理由:
-//     (1) 生成は数秒かかる → 毎回のboard表示で待たせない。
-//     (2) AIは生成の度に item.id が変わる → 毎回作り直すと checkState(id管理のチェック) が全部外れる。
-//   よって「その日 初回生成分」を凍結して同じ日は再利用する。 翌日(JST)は自動で新規生成。
-async function getOrBuildDailyChecklist(
-  isoDate: string,
-  growth: Awaited<ReturnType<typeof buildGrowthData>>,
-  appstore: AppStoreMetrics,
-  sales: Awaited<ReturnType<typeof buildSalesForecast>>,
-): Promise<{ items: any[]; source: "ai" | "template" }> {
-  const key = `board_checklist_items_${isoDate}`;
-  const r = await db.execute(sql`SELECT value FROM app_settings WHERE key = ${key}`);
-  if (r.rows.length > 0) {
-    try {
-      const cached = JSON.parse((r.rows[0] as any).value);
-      if (cached && Array.isArray(cached.items) && cached.items.length > 0) return cached;
-    } catch { /* 壊れてたら作り直す */ }
-  }
-  const built = await buildDailyChecklistAI(growth, appstore, sales);
-  // AI成功時のみ凍結保存（テンプレ・フォールバックはキャッシュせず、次回AI生成を再挑戦させる）。
-  if (built.source === "ai") {
-    await db.execute(sql`
-      INSERT INTO app_settings (key, value, updated_at)
-      VALUES (${key}, ${JSON.stringify(built)}, NOW())
-      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`).catch(() => {});
-  }
-  return built;
-}
-
 // ── POST /board/data ──
-// 成長データ + App Store 数字 + 今日のチェックリスト + 消化状態を一括返却。
+// 成長データ + App Store 数字 + 販売実績 + 店舗サポートを一括返却。
+//   （「今日のチェックリスト」は 2026-10-16 に廃止。 ほぼ使われていなかったため）
 router.post("/board/data", requireBoardCode, async (_req, res) => {
   try {
     const [growth, appstore, reach, sales, outreach] = await Promise.all([buildGrowthData(), getAppStoreMetrics(), getNotificationReach(), buildSalesForecast(), buildStoreOutreach()]);
     const jst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
-    // ★ その日のデータをAIが分析して組む動的チェックリスト(毎日中身が変わる)。 1日キャッシュ。 失敗時は固定テンプレにフォールバック。
-    const { items: checklist, source: checklistSource } = await getOrBuildDailyChecklist(jst, growth, appstore, sales);
-    const checkState = await getBoardCheckState(jst);
-    res.json({ ok: true, growth, appstore, reach, sales, outreach, checklist, checklistSource, checkState, today: jst });
+    res.json({ ok: true, growth, appstore, reach, sales, outreach, today: jst });
   } catch (err: any) {
     console.error("[board/data]", err);
     res.status(500).json({ error: "internal_error", message: err?.message });
@@ -745,29 +701,6 @@ router.post("/board/chat", requireBoardCode, async (req: any, res) => {
     res.json({ ok: true, reply });
   } catch (err: any) {
     console.error("[board/chat]", err);
-    res.status(500).json({ error: "internal_error", message: err?.message });
-  }
-});
-
-// ── POST /board/check ──
-// チェックリスト項目の完了状態をトグルして今日分に永続化。
-router.post("/board/check", requireBoardCode, async (req: any, res) => {
-  const { itemId, done } = req.body ?? {};
-  if (typeof itemId !== "string" || !itemId) {
-    res.status(400).json({ error: "bad_request", message: "itemId required" }); return;
-  }
-  try {
-    const jst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
-    const key = `board_checklist_${jst}`;
-    const state = await getBoardCheckState(jst);
-    state[itemId] = !!done;
-    await db.execute(sql`
-      INSERT INTO app_settings (key, value, updated_at)
-      VALUES (${key}, ${JSON.stringify(state)}, NOW())
-      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`);
-    res.json({ ok: true, checkState: state });
-  } catch (err: any) {
-    console.error("[board/check]", err);
     res.status(500).json({ error: "internal_error", message: err?.message });
   }
 });

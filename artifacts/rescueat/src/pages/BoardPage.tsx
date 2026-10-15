@@ -51,23 +51,6 @@ interface StoreOutreachItem {
   message: string;
 }
 interface StoreOutreach { generatedAt: string; items: StoreOutreachItem[]; note: string }
-type TimeSlot = 'morning' | 'midday' | 'afternoon' | 'evening' | 'night';
-interface ChecklistTarget { label: string; sub?: string }
-interface ChecklistItem {
-  id: string;
-  category: 'supply' | 'reengage' | 'instagram' | 'threads' | 'community' | 'ops';
-  timeSlot: TimeSlot;
-  title: string;
-  priority: 'must' | 'high' | 'normal';
-  estMinutes: number;
-  reason: string;
-  kpi?: string;
-  steps: string[];
-  targets?: ChecklistTarget[];
-  template?: string;
-  bestTime?: string;
-  action?: { type: 'reengage'; segment: 'fav_no_purchase' | 'registered_no_purchase_7d'; label: string };
-}
 interface BoardResponse {
   ok: boolean;
   growth: GrowthData;
@@ -75,33 +58,8 @@ interface BoardResponse {
   reach?: NotificationReach;
   sales?: SalesForecast;
   outreach?: StoreOutreach;
-  checklist: ChecklistItem[];
-  checklistSource?: 'ai' | 'template';
-  checkState: Record<string, boolean>;
   today: string;
 }
-
-const CAT_META: Record<ChecklistItem['category'], { label: string; emoji: string; color: string }> = {
-  supply:    { label: '供給',       emoji: '📦', color: '#f97316' },
-  reengage:  { label: '再エンゲージ', emoji: '🔔', color: '#e11d48' },
-  instagram: { label: 'Instagram',  emoji: '📸', color: '#c026d3' },
-  threads:   { label: 'Threads',    emoji: '🧵', color: '#0f172a' },
-  community: { label: 'コミュニティ', emoji: '🤝', color: '#0891b2' },
-  ops:       { label: '運営',       emoji: '⚙️', color: '#475569' },
-};
-const PRIORITY_META: Record<ChecklistItem['priority'], { label: string; color: string }> = {
-  must:   { label: '必須',  color: '#dc2626' },
-  high:   { label: '重要',  color: '#ea580c' },
-  normal: { label: '通常',  color: '#64748b' },
-};
-const SLOT_ORDER: TimeSlot[] = ['morning', 'midday', 'afternoon', 'evening', 'night'];
-const SLOT_META: Record<TimeSlot, { label: string; emoji: string; hint: string }> = {
-  morning:   { label: '朝イチ', emoji: '🌅', hint: '07:30〜10:00' },
-  midday:    { label: '昼',     emoji: '☀️', hint: '11:00〜14:00' },
-  afternoon: { label: '午後',   emoji: '🏪', hint: '14:00〜17:00' },
-  evening:   { label: '夕方',   emoji: '🌆', hint: '17:00〜19:00' },
-  night:     { label: '夜',     emoji: '🌙', hint: '21:00〜23:00' },
-};
 
 const OUTREACH_META: Record<OutreachSituation, { label: string; bg: string; fg: string }> = {
   convert_to_recurring: { label: '定期化を案内', bg: '#ede9fe', fg: '#6d28d9' },
@@ -162,19 +120,6 @@ export default function BoardPage() {
     }, 60 * 1000);
     return () => clearInterval(id);
   }, [authed, data, code, load]);
-
-  const toggleCheck = useCallback(async (item: ChecklistItem) => {
-    if (!data) return;
-    const next = !data.checkState[item.id];
-    setData({ ...data, checkState: { ...data.checkState, [item.id]: next } });
-    try {
-      await fetch(`${BASE}/api/board/check`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Board-Code': code },
-        body: JSON.stringify({ code, itemId: item.id, done: next }),
-      });
-    } catch { /* 楽観更新のまま */ }
-  }, [data, code]);
 
   // 画像を長辺1280pxに縮小して data URL(JPEG)化。 巨大な生写真をそのまま投げない。
   const addChatImages = useCallback(async (files: FileList | File[]) => {
@@ -288,16 +233,8 @@ export default function BoardPage() {
     return <div style={{ minHeight: '100dvh', display: 'grid', placeItems: 'center', color: '#64748b' }}>{loading ? '読み込み中…' : (err || '—')}</div>;
   }
 
-  const { growth, appstore, reach, sales, outreach, checklist, checklistSource, checkState } = data;
+  const { growth, appstore, reach, sales, outreach } = data;
   const f = growth.funnel;
-  const doneCount = checklist.filter((i) => checkState[i.id]).length;
-  const progress = checklist.length ? Math.round((doneCount / checklist.length) * 100) : 0;
-  const totalMin = checklist.reduce((a, i) => a + (i.estMinutes || 0), 0);
-  const bySlot = checklist.reduce((acc, i) => {
-    (acc[i.timeSlot] ||= []).push(i);
-    return acc;
-  }, {} as Record<TimeSlot, ChecklistItem[]>);
-
   // ファネル各段（DL数を頭に足した完全版）
   const dl = appstore.downloads || 0;
   const imp = appstore.impressions || 0;
@@ -326,19 +263,6 @@ export default function BoardPage() {
             {loading ? '…' : '↻ 更新'}
           </button>
         </header>
-
-        {/* 今日の進捗バー */}
-        <Card>
-          <Row>
-            <b style={{ fontSize: 15 }}>今日のチェックリスト
-              {checklistSource === 'ai' && <span style={{ fontSize: 10, fontWeight: 700, color: '#7c3aed', background: '#f3e8ff', borderRadius: 999, padding: '2px 8px', marginLeft: 8, verticalAlign: 'middle' }}>🤖 AI分析</span>}
-            </b>
-            <span style={{ fontSize: 13, color: '#64748b' }}>{doneCount}/{checklist.length} 完了</span>
-          </Row>
-          <div style={{ height: 10, borderRadius: 6, background: '#eef1f4', overflow: 'hidden', marginTop: 8 }}>
-            <div style={{ height: '100%', width: `${progress}%`, background: progress === 100 ? '#16a34a' : '#22c55e', transition: 'width .3s' }} />
-          </div>
-        </Card>
 
         {/* 供給の脈拍 */}
         <Card>
@@ -640,116 +564,6 @@ export default function BoardPage() {
             </div>
           </Card>
         )}
-
-        {/* ── 今日の完璧なチェックリスト（時間帯タイムライン式）── */}
-        <h2 style={{ fontSize: 18, fontWeight: 800, margin: '24px 4px 6px' }}>✅ 今日のタイムライン</h2>
-        <p style={{ fontSize: 12, color: '#64748b', margin: '0 4px 14px' }}>
-          {checklistSource === 'ai'
-            ? 'AIが今日の実データを分析して、今日一番効く順に組んだ実行リスト。毎日中身が変わる。'
-            : 'データから自動生成。上から順にやれば完璧に回る。'} 合計 約{totalMin}分・{checklist.length}タスク。
-        </p>
-
-        {SLOT_ORDER.filter((slot) => bySlot[slot]?.length).map((slot) => {
-          const sm = SLOT_META[slot];
-          const list = bySlot[slot];
-          const slotDone = list.filter((i) => checkState[i.id]).length;
-          const slotMin = list.reduce((a, i) => a + (i.estMinutes || 0), 0);
-          return (
-            <div key={slot} style={{ marginBottom: 18 }}>
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, margin: '0 4px 8px' }}>
-                <span style={{ fontSize: 17, fontWeight: 800 }}>{sm.emoji} {sm.label}</span>
-                <span style={{ fontSize: 11, color: '#94a3b8' }}>{sm.hint}</span>
-                <span style={{ marginLeft: 'auto', fontSize: 12, color: slotDone === list.length ? '#16a34a' : '#64748b', fontWeight: 600 }}>{slotDone}/{list.length} · 約{slotMin}分</span>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {list.map((item) => {
-                  const cat = CAT_META[item.category];
-                  const pri = PRIORITY_META[item.priority];
-                  const done = !!checkState[item.id];
-                  const isOpen = !!open[item.id];
-                  return (
-                    <div key={item.id} style={{ background: '#fff', borderRadius: 14, boxShadow: '0 2px 10px rgba(0,0,0,.05)', overflow: 'hidden', opacity: done ? .6 : 1, border: `1px solid ${done ? '#dcfce7' : item.priority === 'must' ? '#fecaca' : '#f1f5f9'}` }}>
-                      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, padding: 14 }}>
-                        <button onClick={() => toggleCheck(item)} aria-label="完了切替"
-                          style={{ flexShrink: 0, width: 26, height: 26, borderRadius: 8, border: `2px solid ${done ? '#16a34a' : '#cbd5e1'}`, background: done ? '#16a34a' : '#fff', color: '#fff', fontSize: 15, lineHeight: '22px', cursor: 'pointer', marginTop: 1 }}>
-                          {done ? '✓' : ''}
-                        </button>
-                        <div style={{ flex: 1, minWidth: 0, cursor: 'pointer' }} onClick={() => setOpen((o) => ({ ...o, [item.id]: !o[item.id] }))}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                            <span style={{ fontSize: 10, fontWeight: 700, color: '#fff', background: pri.color, borderRadius: 5, padding: '2px 6px' }}>{pri.label}</span>
-                            <span style={{ fontSize: 10, fontWeight: 700, color: cat.color, background: cat.color + '18', borderRadius: 5, padding: '2px 6px' }}>{cat.emoji} {cat.label}</span>
-                            <span style={{ fontSize: 11, color: '#94a3b8' }}>⏱ {item.estMinutes}分</span>
-                          </div>
-                          <div style={{ fontSize: 15, fontWeight: 700, marginTop: 5, textDecoration: done ? 'line-through' : 'none' }}>{item.title}</div>
-                          <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>{item.reason}</div>
-                        </div>
-                        <button onClick={() => setOpen((o) => ({ ...o, [item.id]: !o[item.id] }))}
-                          style={{ flexShrink: 0, border: 'none', background: 'transparent', fontSize: 16, color: '#94a3b8', transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform .2s' }}>▾</button>
-                      </div>
-
-                      {isOpen && (
-                        <div style={{ padding: '0 14px 16px 50px' }}>
-                          {item.kpi && (
-                            <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start', background: '#f0fdf4', border: '1px solid #dcfce7', borderRadius: 10, padding: '8px 10px', marginTop: 4 }}>
-                              <span style={{ fontSize: 12 }}>🎯</span>
-                              <span style={{ fontSize: 12.5, color: '#166534', fontWeight: 600 }}>今日の合格ライン：{item.kpi}</span>
-                            </div>
-                          )}
-
-                          {item.targets && item.targets.length > 0 && (
-                            <div style={{ marginTop: 12 }}>
-                              <div style={{ fontSize: 12, fontWeight: 700, color: '#475569', marginBottom: 6 }}>
-                                {item.category === 'supply' ? '今日連絡する店' : '対象'}
-                              </div>
-                              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                                {item.targets.map((t, i) => (
-                                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 10, padding: '8px 10px' }}>
-                                    <span style={{ flexShrink: 0, width: 20, height: 20, borderRadius: 6, background: '#f97316', color: '#fff', fontSize: 11, fontWeight: 700, textAlign: 'center', lineHeight: '20px' }}>{i + 1}</span>
-                                    <div style={{ minWidth: 0 }}>
-                                      <div style={{ fontSize: 13, fontWeight: 700, color: '#9a3412' }}>{t.label}</div>
-                                      {t.sub && <div style={{ fontSize: 11, color: '#c2743a' }}>{t.sub}</div>}
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-
-                          <div style={{ fontSize: 12, fontWeight: 700, color: '#475569', margin: '12px 0 6px' }}>手順</div>
-                          <ol style={{ margin: 0, paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 5 }}>
-                            {item.steps.map((s, i) => (
-                              <li key={i} style={{ fontSize: 13, color: '#334155', lineHeight: 1.5 }}>{s}</li>
-                            ))}
-                          </ol>
-
-                          {item.template && (
-                            <div style={{ marginTop: 12 }}>
-                              <Row><span style={{ fontSize: 12, fontWeight: 700, color: '#475569' }}>コピペ用テンプレ（実データ入り）</span>
-                                <button onClick={() => doCopy(item.id, item.template!)}
-                                  style={{ fontSize: 11, padding: '3px 10px', borderRadius: 8, border: '1px solid #e2e8f0', background: copied === item.id ? '#dcfce7' : '#fff', fontWeight: 600 }}>
-                                  {copied === item.id ? '✓ コピー済' : '📋 コピー'}
-                                </button>
-                              </Row>
-                              <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12.5, color: '#0f172a', background: '#f8fafc', border: '1px solid #eef1f4', borderRadius: 10, padding: 12, margin: '6px 0 0', fontFamily: 'inherit', lineHeight: 1.55 }}>{item.template}</pre>
-                            </div>
-                          )}
-
-                          {item.bestTime && <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 10 }}>🕐 推奨: {item.bestTime}</div>}
-
-                          {item.action?.type === 'reengage' && (
-                            <div style={{ marginTop: 12, padding: '10px 12px', borderRadius: 12, background: '#fef2f2', border: '1px solid #fecaca', fontSize: 12.5, color: '#9f1239', lineHeight: 1.5 }}>
-                              🔒 このPush配信（{item.action.label}）は<b>神モード専用</b>。実行は管理画面（/admin）からやってな。
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
 
         {/* 何でも聞けるAI相談 */}
         <Card style={{ marginTop: 16 }}>
