@@ -4,7 +4,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 import { db } from "@workspace/db";
 import { sql } from "drizzle-orm";
-import OpenAI from "openai";
+import { askClaude, hasClaudeKey } from "./claude.js";
 import { computeUserTotal } from "./pricing.js";
 
 const BOUGHT = sql`('confirmed','picked_up')`;
@@ -993,10 +993,44 @@ const CHECKLIST_SLOTS = ["morning", "midday", "afternoon", "evening", "night"] a
 const CHECKLIST_PRIORITIES = ["must", "high", "normal"] as const;
 const SLOT_RANK: Record<TimeSlot, number> = { morning: 0, midday: 1, afternoon: 2, evening: 3, night: 4 };
 
-const checklistOpenai = new OpenAI({
-  baseURL: process.env.OPENAI_BASE_URL || process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || undefined,
-  apiKey: process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY || "dummy",
-});
+// AI に返させる JSON の形（structured outputs）。 最終チェックは coerceChecklistItems が行う。
+const CHECKLIST_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          category: { type: "string", enum: [...CHECKLIST_CATEGORIES] },
+          timeSlot: { type: "string", enum: [...CHECKLIST_SLOTS] },
+          title: { type: "string" },
+          priority: { type: "string", enum: [...CHECKLIST_PRIORITIES] },
+          estMinutes: { type: "integer" },
+          reason: { type: "string" },
+          kpi: { type: "string" },
+          steps: { type: "array", items: { type: "string" } },
+          targets: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { label: { type: "string" }, sub: { type: "string" } },
+              required: ["label"],
+              additionalProperties: false,
+            },
+          },
+          template: { type: "string" },
+          bestTime: { type: "string" },
+        },
+        required: ["id", "category", "timeSlot", "title", "priority", "estMinutes", "reason", "kpi", "steps"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["items"],
+  additionalProperties: false,
+};
 
 // AI に渡す「今日の全実データ」を、そのまま根拠にできる密度のテキストにまとめる。
 function checklistDataDump(growth: GrowthData, appstore: AppStoreMetrics, sales: SalesForecast | null): string {
@@ -1103,20 +1137,18 @@ export async function buildDailyChecklistAI(
   appstore: AppStoreMetrics,
   sales: SalesForecast | null,
 ): Promise<{ items: ChecklistItem[]; source: "ai" | "template" }> {
-  const hasKey = !!(process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY);
-  if (!hasKey) return { items: buildDailyChecklist(growth, appstore), source: "template" };
+  if (!hasClaudeKey()) return { items: buildDailyChecklist(growth, appstore), source: "template" };
   try {
     const dump = checklistDataDump(growth, appstore, sales);
-    const completion = await checklistOpenai.chat.completions.create({
-      model: "gpt-5-mini",
-      max_completion_tokens: 6000,
-      response_format: { type: "json_object" },
+    const content = await askClaude({
+      system: CHECKLIST_SYSTEM,
+      maxTokens: 16000,
+      effort: "medium",
       messages: [
-        { role: "system", content: CHECKLIST_SYSTEM },
         { role: "user", content: `＝＝＝ 今日の実データ ＝＝＝\n${dump}\n＝＝＝\n上のデータだけを根拠に、今日の実行チェックリストをJSONで返して。` },
       ],
+      jsonSchema: CHECKLIST_SCHEMA,
     });
-    const content = completion.choices[0]?.message?.content ?? "";
     const parsed = coerceChecklistItems(JSON.parse(content));
     if (parsed) return { items: parsed, source: "ai" };
     console.warn("[checklist-ai] JSON検証に失敗→テンプレにフォールバック");

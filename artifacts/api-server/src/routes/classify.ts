@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
-import OpenAI from "openai";
 import { rateLimit } from "express-rate-limit";
 import { requireAuth } from "../middlewares/auth.js";
+import { askClaude, hasClaudeKey, imageFromDataUrl } from "../lib/claude.js";
 
 const router: IRouter = Router();
 
@@ -17,12 +17,6 @@ const classifyLimiter = rateLimit({
 });
 
 const MAX_IMAGE_BASE64_LENGTH = 8 * 1024 * 1024;
-
-// 本番Flyは OPENAI_API_KEY、 ローカル開発は AI_INTEGRATIONS_* を使う。
-const openai = new OpenAI({
-  baseURL: process.env.OPENAI_BASE_URL || process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || undefined,
-  apiKey:  process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY || "dummy",
-});
 
 const VALID_CATEGORIES = [
   { value: "meals",         label: "料理・お惣菜（飲食店・居酒屋・弁当・惣菜・麺類・肉・魚など）" },
@@ -47,35 +41,39 @@ router.post("/suggest-category", requireAuth, classifyLimiter, async (req, res) 
       return;
     }
 
-    // data URL → raw base64 に変換
-    const base64 = imageBase64.includes(",") ? imageBase64.split(",")[1] : imageBase64;
-    const mimeMatch = imageBase64.match(/^data:([^;]+);/);
-    const mimeType  = (mimeMatch?.[1] ?? "image/jpeg") as "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+    if (!hasClaudeKey()) {
+      res.json({ category: null });
+      return;
+    }
+    // raw base64 だけ来た時は JPEG とみなす（従来どおり）
+    const image = imageFromDataUrl(imageBase64.startsWith("data:") ? imageBase64 : `data:image/jpeg;base64,${imageBase64}`);
+    if (!image) {
+      res.json({ category: null });
+      return;
+    }
 
     const validList = VALID_CATEGORIES.map(c => `"${c.value}" = ${c.label}`).join("\n");
-
-    const response = await openai.chat.completions.create({
-      model: "gpt-5-mini",
-      max_completion_tokens: 20,
+    const raw = await askClaude({
+      maxTokens: 2000,
+      effort: "low",
       messages: [
         {
           role: "user",
           content: [
-            {
-              type: "image_url",
-              image_url: { url: `data:${mimeType};base64,${base64}`, detail: "low" },
-            },
-            {
-              type: "text",
-              text: `この食べ物の画像を見て、以下の3つのカテゴリから最も適切なものを1つだけ英語のキーで答えてください。余計な説明は不要です。\n\n${validList}\n\n答え（キーのみ）:`,
-            },
+            image,
+            { type: "text", text: `この食べ物の画像を見て、次の3つのカテゴリから最も合うものを1つ選んでください。\n\n${validList}` },
           ],
         },
       ],
+      jsonSchema: {
+        type: "object",
+        properties: { category: { type: "string", enum: VALID_CATEGORIES.map(c => c.value) } },
+        required: ["category"],
+        additionalProperties: false,
+      },
     });
-
-    const raw = (response.choices[0]?.message?.content ?? "").trim().toLowerCase().replace(/[^a-z_]/g, "");
-    const matched = VALID_CATEGORIES.find(c => raw.includes(c.value));
+    const picked = (JSON.parse(raw) as { category?: unknown }).category;
+    const matched = VALID_CATEGORIES.find(c => c.value === picked);
 
     console.log(`[suggest-category] raw="${raw}" → category=${matched?.value ?? null}`);
     res.json({ category: matched?.value ?? null });

@@ -23,7 +23,8 @@ import { bagVisibleSql } from "../lib/bag-visibility.js";
 import { sendPushToUsers, getPushConfigStatus, getStoreOrAdminUserIds } from "../lib/push.js";
 import { buildGrowthData, buildDailyChecklistAI, buildSalesForecast, buildStoreOutreach, type AppStoreMetrics } from "../lib/growth.js";
 import { getNotificationReach, getAllSubscribedUserIds } from "../lib/daily-engagement.js";
-import OpenAI from "openai";
+import type Anthropic from "@anthropic-ai/sdk";
+import { askClaude, hasClaudeKey, imageFromDataUrl } from "../lib/claude.js";
 
 const router: IRouter = Router();
 
@@ -656,12 +657,7 @@ router.post("/board/data", requireBoardCode, async (_req, res) => {
 // board の「何でも聞けるAI」。 従業員も見るので危険な操作(Push配信/DB書込)は一切させない。
 //   その日の成長データ・販売実績を丸ごとコンテキストに渡して、経営の相談相手にする。
 //   ※ Push を撃つ等の"実行"は神モード(/admin)だけ。 ここは読み取り+助言のみ。
-// 本番Flyには OPENAI_API_KEY が設定済み。 ローカル開発は AI_INTEGRATIONS_* を使う。
-//   ★ 以前は AI_INTEGRATIONS_* しか見ておらず本番で "dummy" に落ちて 401 になっていた。
-const boardOpenai = new OpenAI({
-  baseURL: process.env.OPENAI_BASE_URL || process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || undefined,
-  apiKey: process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY || "dummy",
-});
+// AI は Claude（lib/claude.ts）。 鍵は Fly secret の ANTHROPIC_API_KEY。
 
 // board データをAIが読める簡潔なテキストに要約する（トークン節約）。
 function summarizeBoardContext(growth: any, appstore: AppStoreMetrics, reach: any, sales: any): string {
@@ -722,25 +718,30 @@ router.post("/board/chat", requireBoardCode, async (req: any, res) => {
       .slice(-6)
       .map((h: any) => ({ role: h.role as "user" | "assistant", content: String(h.content).slice(0, 2000) }));
 
-    // 画像がある時はマルチモーダル content 配列で組む(classify.ts と同じ image_url 方式)。
-    const userContent: any = imgList.length > 0
-      ? [
-          ...imgList.map((url) => ({ type: "image_url", image_url: { url, detail: "auto" } })),
-          { type: "text", text: (text || "この画像について、おすそわけの経営視点でコメントして。").slice(0, 2000) },
-        ]
-      : text.slice(0, 2000);
+    if (!hasClaudeKey()) {
+      res.json({ ok: true, reply: "AIの鍵がまだ設定されてへんから答えられへん。管理者に伝えて。" });
+      return;
+    }
 
-    const completion = await boardOpenai.chat.completions.create({
-      model: "gpt-5-mini",
-      max_completion_tokens: 2000,
-      messages: [
-        { role: "system", content: BOARD_AI_SYSTEM },
-        { role: "system", content: `＝＝＝ 今日の実データ ＝＝＝\n${context}` },
-        ...priorTurns,
-        { role: "user", content: userContent },
-      ],
+    // 画像がある時は画像ブロック＋テキストで組む。
+    const imageBlocks = imgList
+      .map(imageFromDataUrl)
+      .filter((b): b is Anthropic.Beta.BetaImageBlockParam => b !== null);
+    const question = (text || "この画像について、おすそわけの経営視点でコメントして。").slice(0, 2000);
+    const userContent: Anthropic.Beta.BetaMessageParam["content"] = imageBlocks.length > 0
+      ? [...imageBlocks, { type: "text", text: question }]
+      : question;
+
+    // 会話は user から始める決まりなので、 先頭の assistant 発言は落とす。
+    while (priorTurns.length > 0 && priorTurns[0].role !== "user") priorTurns.shift();
+
+    const answer = await askClaude({
+      system: `${BOARD_AI_SYSTEM}\n\n＝＝＝ 今日の実データ ＝＝＝\n${context}`,
+      maxTokens: 8000,
+      effort: "medium",
+      messages: [...priorTurns, { role: "user", content: userContent }],
     });
-    const reply = completion.choices[0]?.message?.content?.trim() || "うまく答えられへんかった。もう一回聞いて。";
+    const reply = answer || "うまく答えられへんかった。もう一回聞いて。";
     res.json({ ok: true, reply });
   } catch (err: any) {
     console.error("[board/chat]", err);
