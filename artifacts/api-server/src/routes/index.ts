@@ -1,6 +1,7 @@
 import { Router, type IRouter } from "express";
 import healthRouter from "./health";
 import storesRouter from "./stores";
+import { signStoreDocumentLinks } from "../lib/store-documents.js";
 import bagsRouter from "./bags";
 import reservationsRouter from "./reservations";
 import paymentRouter from "./payment";
@@ -23,6 +24,8 @@ import { Resend } from "resend";
 
 const router: IRouter = Router();
 
+// 書類画像のリンクは、 どのAPIから返す時も1時間だけ有効なものに差し替える（先に掛ける）
+router.use(signStoreDocumentLinks);
 router.use(adminRouter);
 router.use(authRouter);
 router.use(stripeWebhookRouter);

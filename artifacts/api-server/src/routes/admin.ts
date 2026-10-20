@@ -25,6 +25,7 @@ import { buildGrowthData, buildSalesForecast, buildStoreOutreach, type AppStoreM
 import { getNotificationReach, getAllSubscribedUserIds } from "../lib/daily-engagement.js";
 import type Anthropic from "@anthropic-ai/sdk";
 import { askClaude, hasClaudeKey, imageFromDataUrl } from "../lib/claude.js";
+import { documentViewUrl } from "../lib/store-documents.js";
 
 const router: IRouter = Router();
 
@@ -2387,7 +2388,7 @@ router.post("/admin/stores/batch-patch-stripe-license", requireAdmin, async (_re
     for (const store of targets) {
       try {
         const stripe = new Stripe(stripeKey);
-        const imgResp = await fetch(store.licenseImageUrl!);
+        const imgResp = await fetch((await documentViewUrl(store.licenseImageUrl))!);
         if (!imgResp.ok) {
           results.push({ storeId: store.id, name: store.name, result: `fetch失敗: HTTP ${imgResp.status}` });
           continue;

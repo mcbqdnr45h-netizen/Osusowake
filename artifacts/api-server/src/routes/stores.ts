@@ -3,6 +3,7 @@ import { db } from "@workspace/db";
 import { storesTable, surpriseBagsTable, reportsTable, reviewsTable, reservationsTable, notificationsTable } from "@workspace/db/schema";
 import { eq, sql, and, ne, gte, lt, inArray, count, desc } from "drizzle-orm";
 import { supabaseAdmin } from "../lib/supabase";
+import { documentViewUrl } from "../lib/store-documents.js";
 import { escapeHtml } from "../lib/escape.js";
 import { requireAuth, requireStoreOwner } from "../middlewares/auth.js";
 import { requireAdmin } from "./admin.js";
@@ -747,10 +748,8 @@ router.post("/stores/apply", requireAuth, async (req, res) => {
             .from("store-documents")
             .upload(filePath, buffer, { contentType, upsert: false, cacheControl: "31536000, immutable" });
           if (!uploadError) {
-            const { data: signedData } = await supabaseAdmin.storage
-              .from("store-documents")
-              .createSignedUrl(filePath, 60 * 60 * 24 * 365 * 10);
-            licenseImageUrl = signedData?.signedUrl ?? null;
+            // DB には保管場所だけ入れる（表示用リンクはレスポンス時に1時間だけ有効で作る）
+            licenseImageUrl = filePath;
             console.log("[/stores/apply] ✅ 営業許可証アップロード完了:", filePath);
           } else {
             console.warn("[/stores/apply] 営業許可証アップロード失敗:", uploadError.message);
@@ -1044,17 +1043,11 @@ router.post("/stores/upload-document", requireAuth, async (req, res) => {
       return res.status(500).json({ error: "upload_failed", message: uploadError.message });
     }
 
-    // Generate a long-lived signed URL (10 years) for admin review
-    const { data: signedData, error: signedError } = await supabaseAdmin.storage
-      .from("store-documents")
-      .createSignedUrl(filePath, 60 * 60 * 24 * 365 * 10);
-
-    if (signedError) {
-      console.warn("[upload-document] Failed to create signed URL:", signedError.message);
-    }
+    // 返すリンクは1時間だけ有効。 保存に使うのは path の方。
+    const viewUrl = await documentViewUrl(filePath);
 
     console.log("[upload-document] ✅ Uploaded:", filePath);
-    res.json({ path: filePath, url: signedData?.signedUrl ?? `storage://${filePath}` });
+    res.json({ path: filePath, url: viewUrl ?? `storage://${filePath}` });
   } catch (err) {
     console.error("[upload-document] Error:", err);
     res.status(500).json({ error: "internal_error", message: "アップロードに失敗しました" });
@@ -1512,13 +1505,8 @@ router.post("/stores/:storeId/reapply", requireAuth, requireStoreOwner, async (r
           .from("store-documents")
           .upload(filePath, buffer, { contentType, upsert: false, cacheControl: "31536000, immutable" });
         if (!uploadError) {
-          const { data: signedData } = await supabaseAdmin.storage
-            .from("store-documents")
-            .createSignedUrl(filePath, 60 * 60 * 24 * 365 * 10);
-          if (signedData?.signedUrl) {
-            updateData.licenseImageUrl = signedData.signedUrl;
-            console.log(`[/reapply] ✅ 営業許可証 再アップロード完了: storeId=${storeId} path=${filePath}`);
-          }
+          updateData.licenseImageUrl = filePath;
+          console.log(`[/reapply] ✅ 営業許可証 再アップロード完了: storeId=${storeId} path=${filePath}`);
         } else {
           console.warn(`[/reapply] 営業許可証 Supabase アップロード失敗: ${uploadError.message}`);
         }
@@ -4134,17 +4122,8 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
               licenseUploadError = `storage_upload: ${licUpErr.message}`;
               console.error(`❌ [bank-setup] BG License doc upload FAILED (storeId=${storeId}): ${licUpErr.message}`);
             } else {
-              const { data: licSigned, error: licSignErr } = await supabaseAdmin.storage
-                .from("store-documents")
-                .createSignedUrl(licPath, 60 * 60 * 24 * 365 * 10);
-              if (licSignErr || !licSigned?.signedUrl) {
-                licenseUploadFailed = true;
-                licenseUploadError = `signed_url: ${licSignErr?.message ?? "no_url"}`;
-                console.error(`❌ [bank-setup] BG License signed URL FAILED (storeId=${storeId}): ${licSignErr?.message}`);
-              } else {
-                licenseImageUrl = licSigned.signedUrl;
-                console.log(`✅ [bank-setup] BG License doc saved: ${licPath}`);
-              }
+              licenseImageUrl = licPath;
+              console.log(`✅ [bank-setup] BG License doc saved: ${licPath}`);
             }
           }
         } catch (licEx: any) {

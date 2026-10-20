@@ -5,6 +5,7 @@ import { sendPickupReminders, sendPickupDeadlineReminders } from "./lib/pickup-r
 import { runDailyEngagementNotifications } from "./lib/daily-engagement.js";
 import { publishDueRecurringListings } from "./lib/recurring-publisher.js";
 import { remindUnlistedStores } from "./lib/unlisted-store-reminder.js";
+import { migrateStoreDocumentLinks } from "./lib/store-documents.js";
 
 // ── 起動時マイグレーション（冪等・全て Supabase PostgreSQL 対象）──────────────
 async function runMigrations() {
@@ -876,9 +877,11 @@ app.listen(port, "0.0.0.0", () => {
 // マイグレーションはバックグラウンドで実行（listen をブロックしない）。
 // DB が一時的に不達でもサーバーは public/SPA/healthz を配信し続ける。
 // スキーマ追加は冪等なので、DB 回復後の次回ブート or この非同期完了時に反映される。
-runMigrations().catch((err) => {
-  console.error("[migration] background run failed (server still serving):", err);
-});
+runMigrations()
+  .then(() => migrateStoreDocumentLinks())
+  .catch((err) => {
+    console.error("[migration] background run failed (server still serving):", err);
+  });
 
 // 期限切れ仮押さえを1分ごとに自動解放（在庫復元）
 setInterval(() => {
