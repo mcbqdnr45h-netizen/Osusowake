@@ -63,10 +63,12 @@ app.use(cors((req, cb) => {
 
 // Stripe webhook は署名検証のため raw body が必要 — JSON ミドルウェアより前に登録
 // レート制限の対象外（Stripe からの正規再送をブロックしないため）
-app.use('/api/stripe-webhook', express.raw({ type: 'application/json' }));
+app.use('/api/stripe-webhook', express.raw({ type: 'application/json', inflate: false }));
 
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+// 圧縮されたリクエスト本文は受け付けない（アプリもStripeも圧縮して送らない）。
+//   2026-10 の Node.js Brotli 解凍の脆弱性(CVE-2026-111497)は、ログイン前の解凍で突けた。
+app.use(express.json({ limit: '20mb', inflate: false }));
+app.use(express.urlencoded({ extended: true, limit: '20mb', inflate: false }));
 
 // ── レート制限 ────────────────────────────────────────────────────────────────
 // 一般 API: IP あたり 1分 600 リクエスト（NAT 配下の複数ユーザーを考慮して緩め）

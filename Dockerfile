@@ -7,7 +7,7 @@
 # /api 以外の GET は index.html へフォールバックする（SPA ルーティング）。
 
 # ── builder ───────────────────────────────────────────────────────────────────
-FROM node:24-slim AS builder
+FROM node:24.22.1-slim AS builder
 # native モジュール(sharp 等)の install script 用ビルドツール
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates openssl python3 make g++ \
@@ -44,7 +44,7 @@ RUN pnpm --filter @workspace/api-server build
 RUN pnpm --filter=@workspace/api-server deploy --prod --legacy /prod
 
 # ── runtime ───────────────────────────────────────────────────────────────────
-FROM node:24-slim AS runtime
+FROM node:24.22.1-slim AS runtime
 # 外向き TLS(Supabase/Stripe/APNs) 用の証明書
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates openssl \
