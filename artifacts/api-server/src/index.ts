@@ -117,6 +117,8 @@ async function runMigrations() {
     //     冪等: 制約が無ければ何もしない。 起動毎に実行されても安全。
     try {
       await client.query(`ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_phone_number_key;`);
+      // 本番の実際の制約名は users_phone_unique だった（2026-10-24 判明）。 両方外す。
+      await client.query(`ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_phone_unique;`);
       console.log('[migration] users.phone_number UNIQUE dropped ✅');
     } catch (e: any) {
       console.warn('[migration] users.phone_number drop skipped:', e.message?.split('\n')[0]);
