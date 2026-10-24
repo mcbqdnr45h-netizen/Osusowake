@@ -902,7 +902,7 @@ export default function StripeKYCPage() {
           )}
 
           {/* ③ 代表者氏名 */}
-          <Section title="代表者氏名" icon={<User className="w-5 h-5 text-orange-500" />}>
+          <Section title={businessType === 'company' ? '手続きをする方（担当者）の氏名' : '代表者氏名'} icon={<User className="w-5 h-5 text-orange-500" />}>
             <div className="grid grid-cols-2 gap-3">
               <FieldWrap label="姓（漢字）" required error={fieldErrors.lastNameKanji}>
                 <input type="text" value={lastNameKanji} onChange={e => setLastNameKanji(e.target.value)}
@@ -936,7 +936,7 @@ export default function StripeKYCPage() {
           </Section>
 
           {/* ③ 生年月日 */}
-          <Section title="生年月日" icon={<User className="w-5 h-5 text-orange-500" />}>
+          <Section title={businessType === 'company' ? '手続きをする方（担当者）の生年月日' : '生年月日'} icon={<User className="w-5 h-5 text-orange-500" />}>
             <div className="grid grid-cols-3 gap-3">
               <FieldWrap label="年" required error={fieldErrors.dobYear}>
                 <input type="number" value={dobYear} onChange={e => setDobYear(e.target.value)}
@@ -963,7 +963,7 @@ export default function StripeKYCPage() {
           </Section>
 
           {/* ④ 住所 */}
-          <Section title="代表者（本人）の住所" icon={<MapPin className="w-5 h-5 text-orange-500" />}>
+          <Section title={businessType === 'company' ? '手続きをする方（担当者）の住所' : '代表者（本人）の住所'} icon={<MapPin className="w-5 h-5 text-orange-500" />}>
             <FieldWrap label="郵便番号（ハイフンなし7桁）" required error={fieldErrors.postalCode}>
               <div className="relative">
                 <input type="text" value={postalCode} onChange={e => handlePostalCodeChange(e.target.value)}
@@ -1037,9 +1037,11 @@ export default function StripeKYCPage() {
           </Section>
 
           {/* ⑥ 本人確認書類 */}
-          <Section title="本人確認書類" icon={<Camera className="w-5 h-5 text-orange-500" />}>
+          <Section title={businessType === 'company' ? '担当者の本人確認書類' : '本人確認書類'} icon={<Camera className="w-5 h-5 text-orange-500" />}>
             <p className="text-xs text-gray-500 leading-relaxed">
-              運転免許証・マイナンバーカード・パスポートなどをアップロードしてください。<br />
+              {businessType === 'company'
+                ? '口座登録のときに手続きをした方（担当者）ご本人の運転免許証・マイナンバーカード・パスポートなどをアップロードしてください（上の氏名と完全に一致させてください）。'
+                : '運転免許証・マイナンバーカード・パスポートなどをアップロードしてください。'}<br />
               表面は必須。裏面は運転免許証など書類の種類に応じて追加してください。
             </p>
 

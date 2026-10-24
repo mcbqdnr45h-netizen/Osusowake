@@ -3131,8 +3131,10 @@ router.put("/stores/:storeId/connect/kyc", requireAuth, requireStoreOwner, async
     }
 
     // ── Stripe 送信直前のペイロードをフルログ（null/空がないか確認）──
-    console.log(`📤 [KYC] Stripe accounts.update payload for account ${store.stripeAccountId}:`);
-    console.log(JSON.stringify(updateParams, null, 2));
+    // ★ 個人情報(氏名/生年月日/住所/電話)はログに出さない。送る項目名だけ (2026-10-03 方針)
+    const kycKeys = Object.entries(updateParams).map(([k, v]) =>
+      (v && typeof v === 'object' && !Array.isArray(v)) ? `${k}{${Object.keys(v).join(',')}}` : k).join(' ');
+    console.log(`📤 [KYC] Stripe accounts.update fields for account ${store.stripeAccountId}: ${kycKeys}`);
 
     const account = await stripe.accounts.update(store.stripeAccountId, updateParams as any);
 
@@ -3144,10 +3146,11 @@ router.put("/stores/:storeId/connect/kyc", requireAuth, requireStoreOwner, async
         // 口座登録で「担当者は取締役ではない」として取締役を別に登録したお店は、
         //   再提出で担当者を取締役・オーナーに戻さない（役職だけ更新する）。
         const hasSeparateDirector = kyc_existingPersons.data.some(p => p.relationship?.director && !p.relationship?.representative);
+        //   この画面(/store/kyc)は役職を送らないので、 役職は口座登録で入れたもの(店長など)をそのまま残す。
         if (hasSeparateDirector && repPersonPayload.relationship) {
           repPersonPayload.relationship = {
             representative: true,
-            title: (repPersonPayload.relationship as any).title,
+            title: (representative as any).title?.trim() || kyc_existing?.relationship?.title || "担当者",
           };
         }
         if (kyc_existing) {

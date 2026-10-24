@@ -1530,6 +1530,11 @@ export default function StripeBankSetup() {
                   <input type="text" value={representativeTitle} onChange={e => setRepresentativeTitle(e.target.value)}
                     placeholder={repIsDirector === false ? '店長' : '代表取締役'} className={inputClass} />
                 </Field>
+                {repIsDirector === false && (
+                  <p className="text-xs text-orange-700 bg-orange-50 rounded-xl px-3 py-2 leading-relaxed">
+                    社長など取締役の方の氏名と生年月日は、このあと住所の下にある「取締役（社長など）の氏名と生年月日」の欄に入力してください。
+                  </p>
+                )}
               </>
             )}
           </FormSection>
