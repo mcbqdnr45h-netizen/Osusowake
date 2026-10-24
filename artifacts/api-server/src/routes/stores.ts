@@ -3922,11 +3922,13 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
             title:             k.representativeTitle?.trim() || "代表取締役",
           }
         : {
-            representative: true,
-            director:       false,
-            executive:      false,
-            owner:          false,
-            title:          k.representativeTitle?.trim() || "担当者",
+            representative:    true,
+            director:          false,
+            executive:         false,
+            owner:             false,
+            // 以前「はい」で送った店が「いいえ」に直したとき、 持ち株100%が残らないよう消す（"" = 未設定に戻す）
+            percent_ownership: "",
+            title:             k.representativeTitle?.trim() || "担当者",
           };
       // Stripe JP: 代表者の政治的関与を明示（未設定だと KYC pending になる場合がある）
       repPayload.political_exposure = "none";

@@ -246,7 +246,7 @@ type DraftState = {
   companyNameLatin?: string; companyTaxId?: string;
   companyStructure?: string;
   representativeTitle?: string;
-  repIsDirector?: boolean;
+  repIsDirector?: boolean | null;
   directorLastNameKanji?: string; directorFirstNameKanji?: string;
   directorLastNameKana?: string;  directorFirstNameKana?: string;
   directorDobYear?: string; directorDobMonth?: string; directorDobDay?: string;
@@ -462,7 +462,8 @@ export default function StripeBankSetup() {
   const [companyStructure, setCompanyStructure]         = useState('');
   const [representativeTitle, setRepresentativeTitle]   = useState('代表取締役');
   // 法人: 手続きをする担当者が取締役（社長・役員）か。 いいえなら本物の取締役の氏名と生年月日を別に入れる
-  const [repIsDirector, setRepIsDirector]               = useState(true);
+  //   最初はどちらも選ばれていない状態にして、必ず本人に選んでもらう（店長が「はい」のまま送るのを防ぐ）
+  const [repIsDirector, setRepIsDirector]               = useState<boolean | null>(null);
   const [directorLastNameKanji, setDirectorLastNameKanji]   = useState('');
   const [directorFirstNameKanji, setDirectorFirstNameKanji] = useState('');
   const [directorLastNameKana, setDirectorLastNameKana]     = useState('');
@@ -515,7 +516,7 @@ export default function StripeBankSetup() {
     if (d.companyNameLatin)   setCompanyNameLatin(d.companyNameLatin);
     if (d.companyTaxId)       setCompanyTaxId(d.companyTaxId);
     if (d.representativeTitle) setRepresentativeTitle(d.representativeTitle);
-    if (d.repIsDirector === false) setRepIsDirector(false);
+    if (typeof d.repIsDirector === 'boolean') setRepIsDirector(d.repIsDirector);
     if (d.directorLastNameKanji)  setDirectorLastNameKanji(d.directorLastNameKanji);
     if (d.directorFirstNameKanji) setDirectorFirstNameKanji(d.directorFirstNameKanji);
     if (d.directorLastNameKana)   setDirectorLastNameKana(d.directorLastNameKana);
@@ -816,10 +817,17 @@ export default function StripeBankSetup() {
   if (!lastNameKanji.trim() || !firstNameKanji.trim()) missingFields.push(`${personLabel}氏名（漢字）`);
   if (!lastNameKana.trim()   || !firstNameKana.trim())  missingFields.push(`${personLabel}氏名（カタカナ）`);
   if (businessType === 'company' && !representativeTitle.trim()) missingFields.push('担当者の役職');
-  const needDirector = businessType === 'company' && !repIsDirector;
+  if (businessType === 'company' && repIsDirector === null) missingFields.push('担当者が取締役かどうか（はい／いいえ）');
+  const needDirector = businessType === 'company' && repIsDirector === false;
   if (needDirector && (!directorLastNameKanji.trim() || !directorFirstNameKanji.trim())) missingFields.push('取締役の氏名（漢字）');
   if (needDirector && (!directorLastNameKana.trim()  || !directorFirstNameKana.trim()))  missingFields.push('取締役の氏名（カタカナ）');
-  if (needDirector && (!directorDobYear || !directorDobMonth || !directorDobDay))        missingFields.push('取締役の生年月日');
+  const directorYearNum = parseInt(directorDobYear);
+  if (needDirector && (!directorDobMonth || !directorDobDay || !(directorYearNum >= 1900 && directorYearNum <= new Date().getFullYear() - 18)))
+    missingFields.push('取締役の生年月日（西暦4桁）');
+  // 担当者が取締役でないなら、取締役は別の人のはず。 自分の名前をもう一度入れてしまうミスを止める
+  if (needDirector && directorLastNameKanji.trim() && directorFirstNameKanji.trim()
+      && directorLastNameKanji.trim() === lastNameKanji.trim() && directorFirstNameKanji.trim() === firstNameKanji.trim())
+    missingFields.push('取締役の氏名が担当者と同じです（社長など、取締役の方の名前を入れてください）');
   if (phone.trim().length < 10)  missingFields.push(`電話番号（現在${phone.trim().length}桁 / 10桁以上）`);
   if (!email.trim().includes('@')) missingFields.push('メールアドレス（正しい形式で入力）');
   if (!dobYear || !dobMonth || !dobDay)                 missingFields.push('生年月日');
@@ -936,8 +944,8 @@ export default function StripeBankSetup() {
               companyTaxId:         taxIdNorm?.value ?? (companyTaxId.replace(/-/g, '').trim() || undefined),
               companyStructure:     companyStructure                     || undefined,
               representativeTitle:  representativeTitle.trim()           || '代表取締役',
-              representativeIsDirector: repIsDirector,
-              ...(!repIsDirector ? {
+              representativeIsDirector: repIsDirector !== false,
+              ...(repIsDirector === false ? {
                 director: {
                   lastNameKanji:  directorLastNameKanji.trim(),
                   firstNameKanji: directorFirstNameKanji.trim(),
@@ -1505,7 +1513,7 @@ export default function StripeBankSetup() {
                 </p>
                 <Field label="この方は会社の取締役（社長・役員）ですか？" required>
                   <div className="grid grid-cols-2 gap-2">
-                    {([[true, 'はい（取締役）'], [false, 'いいえ（店長・社員など）']] as const).map(([v, label]) => (
+                    {([[true, 'はい（取締役）'], [false, 'いいえ（店長など）']] as const).map(([v, label]) => (
                       <button key={String(v)} type="button"
                         onClick={() => {
                           setRepIsDirector(v);
@@ -1518,68 +1526,16 @@ export default function StripeBankSetup() {
                     ))}
                   </div>
                 </Field>
-                <Field label="この方の役職" required hint={repIsDirector ? '例：代表取締役、取締役' : '例：店長、マネージャー'}>
+                <Field label="この方の役職" required hint={repIsDirector === false ? '例：店長、マネージャー' : '例：代表取締役、取締役'}>
                   <input type="text" value={representativeTitle} onChange={e => setRepresentativeTitle(e.target.value)}
-                    placeholder={repIsDirector ? '代表取締役' : '店長'} className={inputClass} />
+                    placeholder={repIsDirector === false ? '店長' : '代表取締役'} className={inputClass} />
                 </Field>
               </>
             )}
           </FormSection>
 
-          {/* ── ②-b 取締役（担当者が取締役ではない法人のみ）── */}
-          {businessType === 'company' && !repIsDirector && (
-            <FormSection title="取締役（社長など）の氏名と生年月日" icon={<User className="w-5 h-5 text-orange-500" />}>
-              <p className="text-xs text-gray-500 leading-relaxed">
-                登記されている取締役のうち1名（社長など）の氏名と生年月日を入力してください。免許証などの書類は不要です。
-              </p>
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="姓（漢字）" required>
-                  <input type="text" value={directorLastNameKanji} onChange={e => setDirectorLastNameKanji(e.target.value)}
-                    placeholder="山田" className={inputClass} />
-                </Field>
-                <Field label="名（漢字）" required>
-                  <input type="text" value={directorFirstNameKanji} onChange={e => setDirectorFirstNameKanji(e.target.value)}
-                    placeholder="花子" className={inputClass} />
-                </Field>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="姓（カナ）" required hint="全角カタカナ">
-                  <input type="text" value={directorLastNameKana} onChange={e => setDirectorLastNameKana(e.target.value)}
-                    placeholder="ヤマダ" className={inputClass} />
-                </Field>
-                <Field label="名（カナ）" required hint="全角カタカナ">
-                  <input type="text" value={directorFirstNameKana} onChange={e => setDirectorFirstNameKana(e.target.value)}
-                    placeholder="ハナコ" className={inputClass} />
-                </Field>
-              </div>
-              <div className="grid grid-cols-3 gap-3">
-                <Field label="生年（西暦）" required>
-                  <input type="number" value={directorDobYear}
-                    onChange={e => setDirectorDobYear(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                    placeholder="1970" min={1900} max={new Date().getFullYear() - 18} inputMode="numeric" className={inputClass} />
-                </Field>
-                <Field label="月" required>
-                  <select value={directorDobMonth} onChange={e => setDirectorDobMonth(e.target.value)} className={selectClass}>
-                    <option value="">月</option>
-                    {Array.from({ length: 12 }, (_, i) => i + 1).map(m => (
-                      <option key={m} value={m}>{m}月</option>
-                    ))}
-                  </select>
-                </Field>
-                <Field label="日" required>
-                  <select value={directorDobDay} onChange={e => setDirectorDobDay(e.target.value)} className={selectClass}>
-                    <option value="">日</option>
-                    {Array.from({ length: 31 }, (_, i) => i + 1).map(d => (
-                      <option key={d} value={d}>{d}日</option>
-                    ))}
-                  </select>
-                </Field>
-              </div>
-            </FormSection>
-          )}
-
           {/* ── ③ 生年月日 ── */}
-          <FormSection title="生年月日" icon={<User className="w-5 h-5 text-orange-500" />}
+          <FormSection title={businessType === 'company' ? '手続きをする方（担当者）の生年月日' : '生年月日'} icon={<User className="w-5 h-5 text-orange-500" />}
             stripeStatus={getGroupStatus('dob')}>
             <div className="grid grid-cols-3 gap-3">
               <Field label="年" required>
@@ -1674,6 +1630,58 @@ export default function StripeBankSetup() {
               </Field>
             </div>
           </FormSection>
+
+          {/* ── ④-b 取締役（担当者が取締役ではない法人のみ）── */}
+          {businessType === 'company' && repIsDirector === false && (
+            <FormSection title="取締役（社長など）の氏名と生年月日" icon={<User className="w-5 h-5 text-orange-500" />}>
+              <p className="text-xs text-gray-500 leading-relaxed">
+                手続きをする方ご本人ではなく、登記されている取締役のうち1名（社長など）の氏名と生年月日を入力してください。免許証などの書類は不要です。
+              </p>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="姓（漢字）" required>
+                  <input type="text" value={directorLastNameKanji} autoComplete="off" onChange={e => setDirectorLastNameKanji(e.target.value)}
+                    placeholder="山田" className={inputClass} />
+                </Field>
+                <Field label="名（漢字）" required>
+                  <input type="text" value={directorFirstNameKanji} autoComplete="off" onChange={e => setDirectorFirstNameKanji(e.target.value)}
+                    placeholder="花子" className={inputClass} />
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="姓（カナ）" required hint="全角カタカナ">
+                  <input type="text" value={directorLastNameKana} autoComplete="off" onChange={e => setDirectorLastNameKana(e.target.value)}
+                    placeholder="ヤマダ" className={inputClass} />
+                </Field>
+                <Field label="名（カナ）" required hint="全角カタカナ">
+                  <input type="text" value={directorFirstNameKana} autoComplete="off" onChange={e => setDirectorFirstNameKana(e.target.value)}
+                    placeholder="ハナコ" className={inputClass} />
+                </Field>
+              </div>
+              <div className="grid grid-cols-3 gap-3">
+                <Field label="生年（西暦）" required>
+                  <input type="number" value={directorDobYear} autoComplete="off"
+                    onChange={e => setDirectorDobYear(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    placeholder="1970" min={1900} max={new Date().getFullYear() - 18} inputMode="numeric" className={inputClass} />
+                </Field>
+                <Field label="月" required>
+                  <select value={directorDobMonth} autoComplete="off" onChange={e => setDirectorDobMonth(e.target.value)} className={selectClass}>
+                    <option value="">月</option>
+                    {Array.from({ length: 12 }, (_, i) => i + 1).map(m => (
+                      <option key={m} value={m}>{m}月</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="日" required>
+                  <select value={directorDobDay} autoComplete="off" onChange={e => setDirectorDobDay(e.target.value)} className={selectClass}>
+                    <option value="">日</option>
+                    {Array.from({ length: 31 }, (_, i) => i + 1).map(d => (
+                      <option key={d} value={d}>{d}日</option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+            </FormSection>
+          )}
 
           {/* ── ⑤ 事業内容 ── */}
           <FormSection title="事業内容" icon={<FileText className="w-5 h-5 text-orange-500" />}
