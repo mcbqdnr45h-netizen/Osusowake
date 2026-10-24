@@ -246,6 +246,10 @@ type DraftState = {
   companyNameLatin?: string; companyTaxId?: string;
   companyStructure?: string;
   representativeTitle?: string;
+  repIsDirector?: boolean;
+  directorLastNameKanji?: string; directorFirstNameKanji?: string;
+  directorLastNameKana?: string;  directorFirstNameKana?: string;
+  directorDobYear?: string; directorDobMonth?: string; directorDobDay?: string;
 };
 function draftKey(storeId: number) { return `${DRAFT_KEY_PREFIX}${storeId}`; }
 function saveDraft(storeId: number, d: DraftState) {
@@ -457,6 +461,15 @@ export default function StripeBankSetup() {
   const [companyTaxId, setCompanyTaxId]                 = useState('');
   const [companyStructure, setCompanyStructure]         = useState('');
   const [representativeTitle, setRepresentativeTitle]   = useState('代表取締役');
+  // 法人: 手続きをする担当者が取締役（社長・役員）か。 いいえなら本物の取締役の氏名と生年月日を別に入れる
+  const [repIsDirector, setRepIsDirector]               = useState(true);
+  const [directorLastNameKanji, setDirectorLastNameKanji]   = useState('');
+  const [directorFirstNameKanji, setDirectorFirstNameKanji] = useState('');
+  const [directorLastNameKana, setDirectorLastNameKana]     = useState('');
+  const [directorFirstNameKana, setDirectorFirstNameKana]   = useState('');
+  const [directorDobYear, setDirectorDobYear]   = useState('');
+  const [directorDobMonth, setDirectorDobMonth] = useState('');
+  const [directorDobDay, setDirectorDobDay]     = useState('');
 
   // ── KYC: 代表者氏名 ──
   const [lastNameKanji, setLastNameKanji]   = useState('');
@@ -502,6 +515,14 @@ export default function StripeBankSetup() {
     if (d.companyNameLatin)   setCompanyNameLatin(d.companyNameLatin);
     if (d.companyTaxId)       setCompanyTaxId(d.companyTaxId);
     if (d.representativeTitle) setRepresentativeTitle(d.representativeTitle);
+    if (d.repIsDirector === false) setRepIsDirector(false);
+    if (d.directorLastNameKanji)  setDirectorLastNameKanji(d.directorLastNameKanji);
+    if (d.directorFirstNameKanji) setDirectorFirstNameKanji(d.directorFirstNameKanji);
+    if (d.directorLastNameKana)   setDirectorLastNameKana(d.directorLastNameKana);
+    if (d.directorFirstNameKana)  setDirectorFirstNameKana(d.directorFirstNameKana);
+    if (d.directorDobYear)  setDirectorDobYear(d.directorDobYear);
+    if (d.directorDobMonth) setDirectorDobMonth(d.directorDobMonth);
+    if (d.directorDobDay)   setDirectorDobDay(d.directorDobDay);
     if (d.lastNameKanji)      setLastNameKanji(d.lastNameKanji);
     if (d.firstNameKanji)     setFirstNameKanji(d.firstNameKanji);
     if (d.lastNameKana)       setLastNameKana(d.lastNameKana);
@@ -657,6 +678,8 @@ export default function StripeBankSetup() {
     productDescription, businessUrl,
     bankName, bankCode, branchCode, accountNumber, holderName,
     companyNameKanji, companyNameKana, companyNameLatin, companyTaxId, representativeTitle,
+    repIsDirector, directorLastNameKanji, directorFirstNameKanji, directorLastNameKana, directorFirstNameKana,
+    directorDobYear, directorDobMonth, directorDobDay,
   });
   useEffect(() => {
     draftStateRef.current = {
@@ -667,6 +690,8 @@ export default function StripeBankSetup() {
       productDescription, businessUrl,
       bankName, bankCode, branchCode, accountNumber, holderName,
       companyNameKanji, companyNameKana, companyNameLatin, companyTaxId, representativeTitle,
+      repIsDirector, directorLastNameKanji, directorFirstNameKanji, directorLastNameKana, directorFirstNameKana,
+      directorDobYear, directorDobMonth, directorDobDay,
     };
     if (store?.id) {
       const t = setTimeout(() => saveDraft(store.id, draftStateRef.current), 2000);
@@ -679,7 +704,9 @@ export default function StripeBankSetup() {
       stateKana, cityKana, townKana, line1Kana,
       productDescription, businessUrl,
       bankName, bankCode, branchCode, accountNumber, holderName,
-      companyNameKanji, companyNameKana, companyNameLatin, companyTaxId, representativeTitle]);
+      companyNameKanji, companyNameKana, companyNameLatin, companyTaxId, representativeTitle,
+      repIsDirector, directorLastNameKanji, directorFirstNameKanji, directorLastNameKana, directorFirstNameKana,
+      directorDobYear, directorDobMonth, directorDobDay]);
 
   // 30秒おきにも保存
   useEffect(() => {
@@ -785,8 +812,14 @@ export default function StripeBankSetup() {
   if (businessType === 'company' && !companyNameLatin.trim()) missingFields.push('法人名（ローマ字）— 必須');
   const taxIdNorm = businessType === 'company' ? normalizeCorporateNumber(companyTaxId) : null;
   if (businessType === 'company' && !taxIdNorm?.value) missingFields.push(taxIdNorm?.error ?? '法人番号');
-  if (!lastNameKanji.trim() || !firstNameKanji.trim()) missingFields.push('代表者氏名（漢字）');
-  if (!lastNameKana.trim()   || !firstNameKana.trim())  missingFields.push('代表者氏名（カタカナ）');
+  const personLabel = businessType === 'company' ? '担当者' : '代表者';
+  if (!lastNameKanji.trim() || !firstNameKanji.trim()) missingFields.push(`${personLabel}氏名（漢字）`);
+  if (!lastNameKana.trim()   || !firstNameKana.trim())  missingFields.push(`${personLabel}氏名（カタカナ）`);
+  if (businessType === 'company' && !representativeTitle.trim()) missingFields.push('担当者の役職');
+  const needDirector = businessType === 'company' && !repIsDirector;
+  if (needDirector && (!directorLastNameKanji.trim() || !directorFirstNameKanji.trim())) missingFields.push('取締役の氏名（漢字）');
+  if (needDirector && (!directorLastNameKana.trim()  || !directorFirstNameKana.trim()))  missingFields.push('取締役の氏名（カタカナ）');
+  if (needDirector && (!directorDobYear || !directorDobMonth || !directorDobDay))        missingFields.push('取締役の生年月日');
   if (phone.trim().length < 10)  missingFields.push(`電話番号（現在${phone.trim().length}桁 / 10桁以上）`);
   if (!email.trim().includes('@')) missingFields.push('メールアドレス（正しい形式で入力）');
   if (!dobYear || !dobMonth || !dobDay)                 missingFields.push('生年月日');
@@ -903,6 +936,18 @@ export default function StripeBankSetup() {
               companyTaxId:         taxIdNorm?.value ?? (companyTaxId.replace(/-/g, '').trim() || undefined),
               companyStructure:     companyStructure                     || undefined,
               representativeTitle:  representativeTitle.trim()           || '代表取締役',
+              representativeIsDirector: repIsDirector,
+              ...(!repIsDirector ? {
+                director: {
+                  lastNameKanji:  directorLastNameKanji.trim(),
+                  firstNameKanji: directorFirstNameKanji.trim(),
+                  lastNameKana:   directorLastNameKana.trim(),
+                  firstNameKana:  directorFirstNameKana.trim(),
+                  dobYear:  parseInt(directorDobYear),
+                  dobMonth: parseInt(directorDobMonth),
+                  dobDay:   parseInt(directorDobDay),
+                },
+              } : {}),
             } : {}),
           },
           // 本人確認書類（base64 data URL のまま送信）
@@ -1383,7 +1428,7 @@ export default function StripeBankSetup() {
             <p className="text-xs text-gray-400 mt-2">
               {businessType === 'individual'
                 ? '個人事業主として登録されます。マイナンバー等の個人情報が必要です。'
-                : '法人として登録されます。法人名（登記簿上の名称）と代表者情報が必要です。'}
+                : '法人として登録されます。法人名（登記簿上の名称）と、手続きをする方（社長でなくても可）の情報が必要です。'}
             </p>
           </FormSection>
 
@@ -1422,7 +1467,7 @@ export default function StripeBankSetup() {
           )}
 
           {/* ── ② 代表者氏名 ── */}
-          <FormSection title={businessType === 'company' ? '代表者（法人代表）の氏名' : '代表者氏名'} icon={<User className="w-5 h-5 text-orange-500" />}
+          <FormSection title={businessType === 'company' ? '手続きをする方（担当者）の氏名' : '代表者氏名'} icon={<User className="w-5 h-5 text-orange-500" />}
             stripeStatus={getGroupStatus('name')}>
             <div className="grid grid-cols-2 gap-3">
               <Field label="姓（漢字）" required>
@@ -1454,12 +1499,84 @@ export default function StripeBankSetup() {
                 placeholder="owner@example.com" required className={inputClass} />
             </Field>
             {businessType === 'company' && (
-              <Field label="代表者の役職" required hint="例：代表取締役、CEO">
-                <input type="text" value={representativeTitle} onChange={e => setRepresentativeTitle(e.target.value)}
-                  placeholder="代表取締役" className={inputClass} />
-              </Field>
+              <>
+                <p className="text-xs text-gray-500 leading-relaxed">
+                  社長でなくても、会社の従業員の方（店長など）が手続きできます。本人確認書類は、ここに入力した方のものを使います。
+                </p>
+                <Field label="この方は会社の取締役（社長・役員）ですか？" required>
+                  <div className="grid grid-cols-2 gap-2">
+                    {([[true, 'はい（取締役）'], [false, 'いいえ（店長・社員など）']] as const).map(([v, label]) => (
+                      <button key={String(v)} type="button"
+                        onClick={() => {
+                          setRepIsDirector(v);
+                          if (!v && representativeTitle.trim() === '代表取締役') setRepresentativeTitle('');
+                          if (v && !representativeTitle.trim()) setRepresentativeTitle('代表取締役');
+                        }}
+                        className={`py-2.5 rounded-xl border text-sm font-bold transition ${repIsDirector === v ? 'border-orange-500 bg-orange-50 text-orange-700' : 'border-gray-200 bg-white text-gray-600'}`}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </Field>
+                <Field label="この方の役職" required hint={repIsDirector ? '例：代表取締役、取締役' : '例：店長、マネージャー'}>
+                  <input type="text" value={representativeTitle} onChange={e => setRepresentativeTitle(e.target.value)}
+                    placeholder={repIsDirector ? '代表取締役' : '店長'} className={inputClass} />
+                </Field>
+              </>
             )}
           </FormSection>
+
+          {/* ── ②-b 取締役（担当者が取締役ではない法人のみ）── */}
+          {businessType === 'company' && !repIsDirector && (
+            <FormSection title="取締役（社長など）の氏名と生年月日" icon={<User className="w-5 h-5 text-orange-500" />}>
+              <p className="text-xs text-gray-500 leading-relaxed">
+                登記されている取締役のうち1名（社長など）の氏名と生年月日を入力してください。免許証などの書類は不要です。
+              </p>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="姓（漢字）" required>
+                  <input type="text" value={directorLastNameKanji} onChange={e => setDirectorLastNameKanji(e.target.value)}
+                    placeholder="山田" className={inputClass} />
+                </Field>
+                <Field label="名（漢字）" required>
+                  <input type="text" value={directorFirstNameKanji} onChange={e => setDirectorFirstNameKanji(e.target.value)}
+                    placeholder="花子" className={inputClass} />
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="姓（カナ）" required hint="全角カタカナ">
+                  <input type="text" value={directorLastNameKana} onChange={e => setDirectorLastNameKana(e.target.value)}
+                    placeholder="ヤマダ" className={inputClass} />
+                </Field>
+                <Field label="名（カナ）" required hint="全角カタカナ">
+                  <input type="text" value={directorFirstNameKana} onChange={e => setDirectorFirstNameKana(e.target.value)}
+                    placeholder="ハナコ" className={inputClass} />
+                </Field>
+              </div>
+              <div className="grid grid-cols-3 gap-3">
+                <Field label="生年（西暦）" required>
+                  <input type="number" value={directorDobYear}
+                    onChange={e => setDirectorDobYear(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    placeholder="1970" min={1900} max={new Date().getFullYear() - 18} inputMode="numeric" className={inputClass} />
+                </Field>
+                <Field label="月" required>
+                  <select value={directorDobMonth} onChange={e => setDirectorDobMonth(e.target.value)} className={selectClass}>
+                    <option value="">月</option>
+                    {Array.from({ length: 12 }, (_, i) => i + 1).map(m => (
+                      <option key={m} value={m}>{m}月</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="日" required>
+                  <select value={directorDobDay} onChange={e => setDirectorDobDay(e.target.value)} className={selectClass}>
+                    <option value="">日</option>
+                    {Array.from({ length: 31 }, (_, i) => i + 1).map(d => (
+                      <option key={d} value={d}>{d}日</option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+            </FormSection>
+          )}
 
           {/* ── ③ 生年月日 ── */}
           <FormSection title="生年月日" icon={<User className="w-5 h-5 text-orange-500" />}
@@ -1503,7 +1620,7 @@ export default function StripeBankSetup() {
           </FormSection>
 
           {/* ── ④ 住所 ── */}
-          <FormSection title={businessType === 'company' ? '代表者（法人代表）の住所' : '代表者（本人）の住所'} icon={<MapPin className="w-5 h-5 text-orange-500" />}
+          <FormSection title={businessType === 'company' ? '手続きをする方（担当者）の住所' : '代表者（本人）の住所'} icon={<MapPin className="w-5 h-5 text-orange-500" />}
             stripeStatus={getGroupStatus('address')}>
             <Field label="郵便番号（ハイフンなし7桁）" required>
               <div className="relative">
@@ -1623,11 +1740,11 @@ export default function StripeBankSetup() {
           )}
 
           {/* ── ⑧ 本人確認書類 ── */}
-          <FormSection title={businessType === 'company' ? '代表者の本人確認書類' : '本人確認書類'} icon={<BadgeCheck className="w-5 h-5 text-orange-500" />}
+          <FormSection title={businessType === 'company' ? '担当者の本人確認書類' : '本人確認書類'} icon={<BadgeCheck className="w-5 h-5 text-orange-500" />}
             stripeStatus={getGroupStatus('document')}>
             <p className="text-sm text-gray-500 -mt-1 mb-3">
               {businessType === 'company'
-                ? '代表者（法人代表）の運転免許証・マイナンバーカード・パスポートなど。'
+                ? '上で入力した担当者ご本人の運転免許証・マイナンバーカード・パスポートなど（名前を完全に一致させてください）。'
                 : '運転免許証・マイナンバーカード・パスポートなど。'}
               <span className="text-red-500 font-medium">表面・裏面ともに必須</span>です。
             </p>

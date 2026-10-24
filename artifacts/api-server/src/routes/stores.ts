@@ -3139,8 +3139,17 @@ router.put("/stores/:storeId/connect/kyc", requireAuth, requireStoreOwner, async
     // ── 法人代表者を Persons API で登録/更新（accounts.update では設定不可）──
     if (resolvedBusinessType === 'company' && repPersonPayload !== null) {
       try {
-        const kyc_existingPersons = await stripe.accounts.listPersons(store.stripeAccountId, { limit: 10 });
+        const kyc_existingPersons = await stripe.accounts.listPersons(store.stripeAccountId, { limit: 20 });
         const kyc_existing = kyc_existingPersons.data.find(p => p.relationship?.representative);
+        // 口座登録で「担当者は取締役ではない」として取締役を別に登録したお店は、
+        //   再提出で担当者を取締役・オーナーに戻さない（役職だけ更新する）。
+        const hasSeparateDirector = kyc_existingPersons.data.some(p => p.relationship?.director && !p.relationship?.representative);
+        if (hasSeparateDirector && repPersonPayload.relationship) {
+          repPersonPayload.relationship = {
+            representative: true,
+            title: (repPersonPayload.relationship as any).title,
+          };
+        }
         if (kyc_existing) {
           await stripe.accounts.updatePerson(store.stripeAccountId, kyc_existing.id, repPersonPayload as any);
           console.log(`[KYC] Persons.update done — ${kyc_existing.id}`);
@@ -3452,6 +3461,13 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       companyNameLatin?: string; companyTaxId?: string;
       companyStructure?: string;
       representativeTitle?: string;
+      // 法人で、手続きをする担当者が取締役ではない場合 false（未指定=従来どおり担当者=取締役）
+      representativeIsDirector?: boolean;
+      director?: {
+        firstNameKanji?: string; lastNameKanji?: string;
+        firstNameKana?: string;  lastNameKana?: string;
+        dobYear?: number | string; dobMonth?: number | string; dobDay?: number | string;
+      };
     };
     docFrontBase64: string; docFrontMime: string;
     docBackBase64?: string; docBackMime?: string;
@@ -3463,6 +3479,16 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
   if (!tosTimestamp || !kycData || !docFrontBase64 || !docFrontMime) {
     res.status(400).json({ error: "bad_request", message: "tosTimestamp, kycData, docFrontBase64, docFrontMime は必須です" });
     return;
+  }
+  // 法人で担当者が取締役ではない場合、 本物の取締役の氏名と生年月日が要る（Stripe JP: directors は氏名＋生年月日）
+  if (businessType === "company" && kycData.representativeIsDirector === false) {
+    const d = kycData.director ?? {};
+    const ok = [d.lastNameKanji, d.firstNameKanji, d.lastNameKana, d.firstNameKana].every((v) => typeof v === "string" && v.trim())
+      && [d.dobYear, d.dobMonth, d.dobDay].every((v) => Number(v) > 0);
+    if (!ok) {
+      res.status(400).json({ error: "bad_request", message: "取締役（社長など）の氏名（漢字・カナ）と生年月日を入力してください" });
+      return;
+    }
   }
 
   const stripeKey = process.env["STRIPE_SECRET_KEY"];
@@ -3882,14 +3908,26 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       }
       if (k.phone?.trim())  repPayload.phone = toE164Japan(k.phone);
       if (ownerEmail)       repPayload.email = ownerEmail;
-      repPayload.relationship = {
-        representative:    true,
-        director:          true,
-        executive:         true,
-        owner:             true,
-        percent_ownership: 100,
-        title:             k.representativeTitle?.trim() || "代表取締役",
-      };
+      // 担当者が取締役（社長・役員）なら従来どおり。 取締役ではない担当者（店長など）は
+      //   取締役・オーナーとして送らない（事実と違う申告になり、登記との照合で止まるため）。
+      //   その場合の取締役は下の STEP4b-1 で別の Person として送る。
+      const repIsDirector = k.representativeIsDirector !== false;
+      repPayload.relationship = repIsDirector
+        ? {
+            representative:    true,
+            director:          true,
+            executive:         true,
+            owner:             true,
+            percent_ownership: 100,
+            title:             k.representativeTitle?.trim() || "代表取締役",
+          }
+        : {
+            representative: true,
+            director:       false,
+            executive:      false,
+            owner:          false,
+            title:          k.representativeTitle?.trim() || "担当者",
+          };
       // Stripe JP: 代表者の政治的関与を明示（未設定だと KYC pending になる場合がある）
       repPayload.political_exposure = "none";
 
@@ -3959,9 +3997,46 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       }
     }
 
+    // ── STEP 4b-1: 担当者が取締役ではない場合、 本物の取締役を別の Person として登録/更新 ──
+    //   Stripe JP の directors は氏名(漢字・カナ)＋生年月日だけ。 本人確認書類は不要。
+    let directorOk = true;
+    if (businessType === "company" && syncPersonId && k.representativeIsDirector === false) {
+      directorOk = false;
+      const d = k.director ?? {};
+      const dirPayload: Record<string, any> = {
+        first_name_kanji: String(d.firstNameKanji ?? "").trim(),
+        last_name_kanji:  String(d.lastNameKanji ?? "").trim(),
+        first_name_kana:  toFullWidthKana(String(d.firstNameKana ?? "").trim()),
+        last_name_kana:   toFullWidthKana(String(d.lastNameKana ?? "").trim()),
+        dob: { day: Number(d.dobDay), month: Number(d.dobMonth), year: Number(d.dobYear) },
+        relationship: { director: true, representative: false, title: "取締役" },
+      };
+      try {
+        const ppl = await stripeCall(stripe.accounts.listPersons(accountId!, { limit: 20 }), "persons.list-director", 10000) as any;
+        const existingDir = (ppl?.data ?? []).find((p: any) => p.relationship?.director === true && p.relationship?.representative !== true);
+        if (existingDir) {
+          await stripeCall(stripe.accounts.updatePerson(accountId!, existingDir.id, dirPayload as any), "persons.update-director", 30000);
+          console.log(`✅ [bank-setup] STEP4b-1 取締役 Persons.update OK id=${existingDir.id}`);
+        } else {
+          const createdDir = await stripeCall(stripe.accounts.createPerson(accountId!, dirPayload as any), "persons.create-director", 30000) as any;
+          console.log(`✅ [bank-setup] STEP4b-1 取締役 Persons.create OK id=${createdDir?.id}`);
+        }
+        directorOk = true;
+      } catch (dErr: any) {
+        // 取締役が登録できないと後日「取締役を指定してください」で止まる。 店主の画面に必ず出す。
+        const dMsg = dErr?.raw?.message ?? dErr?.message ?? "";
+        console.warn(`⚠️  [bank-setup] STEP4b-1 取締役の登録に失敗: ${dMsg}`);
+        kycWarning = true;
+        if (!kycErrorMessage) kycErrorMessage = `取締役情報の登録に失敗しました: ${dMsg}`;
+        try {
+          await db.update(storesTable).set({ status: 'pending' }).where(eq(storesTable.id, storeId));
+        } catch (_) {}
+      }
+    }
+
     // ── STEP 4b-2: directors_provided: true を送信（全取締役の情報が揃ったことを Stripe に通知）──
     // persons.create の後に設定しないと Stripe が受け付けない
-    if (businessType === "company" && syncPersonId) {
+    if (businessType === "company" && syncPersonId && directorOk) {
       try {
         await stripeCall(
           stripe.accounts.update(accountId!, { company: { directors_provided: true } } as any),
