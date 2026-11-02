@@ -282,12 +282,16 @@ export default function Login() {
                     {forgotSent ? (
                       <div className="flex flex-col items-center gap-2 py-1">
                         <CheckCircle className="w-8 h-8 text-green-500" />
-                        <p className="text-sm font-black text-foreground text-center">メールを送信しました！</p>
+                        <p className="text-sm font-black text-foreground text-center">受け付けました</p>
                         <p className="text-[12px] text-muted-foreground text-center leading-relaxed">
-                          {forgotEmail} にパスワード再設定のリンクを送りました。<br/>メールをご確認ください。
+                          {forgotEmail} がおすそわけに登録されていれば、<br/>数分以内にパスワード再設定のリンクが届きます。
                         </p>
-                        <p className="text-[11px] text-muted-foreground text-center leading-relaxed bg-yellow-50 border border-yellow-200 rounded-xl px-3 py-2">
-                          ※メールが届かない場合は、迷惑メールフォルダやゴミ箱を確認してください。
+                        {/* 未登録のアドレスでも同じ表示にしている（登録の有無を他人に知られないため）。
+                            届かない時は「登録したアドレスが違う」ことが多いので、ここで気づけるようにする */}
+                        <p className="text-[11px] text-muted-foreground text-left leading-relaxed bg-yellow-50 border border-yellow-200 rounded-xl px-3 py-2">
+                          メールが届かない場合は<br/>
+                          ・迷惑メールフォルダやゴミ箱を確認してください<br/>
+                          ・アカウントを作ったときのメールアドレスと違う可能性があります。別のアドレスでもお試しください
                         </p>
                         <button
                           type="button"

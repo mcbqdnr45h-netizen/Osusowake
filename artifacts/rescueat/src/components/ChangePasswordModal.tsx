@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { X, Lock, Eye, EyeOff, Check, AlertCircle, Loader2 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
+import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
 
 interface ChangePasswordModalProps {
@@ -12,6 +13,7 @@ interface ChangePasswordModalProps {
 const MIN_LEN = 8;
 
 export function ChangePasswordModal({ email, onClose }: ChangePasswordModalProps) {
+  const { resetPasswordForEmail } = useAuth();
   const { toast } = useToast();
 
   const [currentPw, setCurrentPw] = useState('');
@@ -82,13 +84,11 @@ export function ChangePasswordModal({ email, onClose }: ChangePasswordModalProps
     setForgotSending(true);
     setForgotError(null);
     try {
-      const redirectTo =
-        typeof window !== 'undefined'
-          ? `${window.location.origin}/reset-password`
-          : undefined;
-      const { error: err } = await supabase.auth.resetPasswordForEmail(email, { redirectTo });
+      // ログイン画面の「パスワードを忘れた方」と同じ経路（サーバーからおすそわけ名義で送信）。
+      //   Supabase 標準メールは届く相手や回数に制限があり、 iPhone アプリでは戻り先URLも capacitor:// になって使えない
+      const { error: err } = await resetPasswordForEmail(email);
       if (err) {
-        setForgotError('メール送信に失敗しました。時間をおいて再試行してください。');
+        setForgotError(err);
       } else {
         setForgotSent(true);
       }
