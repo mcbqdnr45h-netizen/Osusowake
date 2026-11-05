@@ -231,6 +231,17 @@ function stripDobPad(v: string): string {
   return Number.isFinite(n) ? String(n) : '';
 }
 
+// 法人の会社の住所（登記上の本店）。 担当者の住所とは別に持つ
+type CompanyAddress = {
+  postalCode: string;
+  stateKanji: string; cityKanji: string; townKanji: string; line1Kanji: string;
+  stateKana: string;  cityKana: string;  townKana: string;  line1Kana: string;
+};
+const EMPTY_COMPANY_ADDRESS: CompanyAddress = {
+  postalCode: '', stateKanji: '', cityKanji: '', townKanji: '', line1Kanji: '',
+  stateKana: '', cityKana: '', townKana: '', line1Kana: '',
+};
+
 type DraftState = {
   lastNameKanji: string; firstNameKanji: string;
   lastNameKana: string;  firstNameKana: string;
@@ -250,6 +261,8 @@ type DraftState = {
   directorLastNameKanji?: string; directorFirstNameKanji?: string;
   directorLastNameKana?: string;  directorFirstNameKana?: string;
   directorDobYear?: string; directorDobMonth?: string; directorDobDay?: string;
+  coAddrSameAsRep?: boolean;
+  coAddr?: CompanyAddress;
 };
 function draftKey(storeId: number) { return `${DRAFT_KEY_PREFIX}${storeId}`; }
 function saveDraft(storeId: number, d: DraftState) {
@@ -471,6 +484,11 @@ export default function StripeBankSetup() {
   const [directorDobYear, setDirectorDobYear]   = useState('');
   const [directorDobMonth, setDirectorDobMonth] = useState('');
   const [directorDobDay, setDirectorDobDay]     = useState('');
+  // 法人: 会社の住所（登記上の本店）。 担当者の住所と同じならチェックだけでよい
+  const [coAddrSameAsRep, setCoAddrSameAsRep] = useState(false);
+  const [coAddr, setCoAddr] = useState<CompanyAddress>(EMPTY_COMPANY_ADDRESS);
+  const [coZipLoading, setCoZipLoading] = useState(false);
+  const setCo = (key: keyof CompanyAddress, v: string) => setCoAddr(prev => ({ ...prev, [key]: v }));
 
   // ── KYC: 代表者氏名 ──
   const [lastNameKanji, setLastNameKanji]   = useState('');
@@ -517,6 +535,8 @@ export default function StripeBankSetup() {
     if (d.companyTaxId)       setCompanyTaxId(d.companyTaxId);
     if (d.representativeTitle) setRepresentativeTitle(d.representativeTitle);
     if (typeof d.repIsDirector === 'boolean') setRepIsDirector(d.repIsDirector);
+    if (typeof d.coAddrSameAsRep === 'boolean') setCoAddrSameAsRep(d.coAddrSameAsRep);
+    if (d.coAddr) setCoAddr({ ...EMPTY_COMPANY_ADDRESS, ...d.coAddr });
     if (d.directorLastNameKanji)  setDirectorLastNameKanji(d.directorLastNameKanji);
     if (d.directorFirstNameKanji) setDirectorFirstNameKanji(d.directorFirstNameKanji);
     if (d.directorLastNameKana)   setDirectorLastNameKana(d.directorLastNameKana);
@@ -681,6 +701,7 @@ export default function StripeBankSetup() {
     companyNameKanji, companyNameKana, companyNameLatin, companyTaxId, representativeTitle,
     repIsDirector, directorLastNameKanji, directorFirstNameKanji, directorLastNameKana, directorFirstNameKana,
     directorDobYear, directorDobMonth, directorDobDay,
+    coAddrSameAsRep, coAddr,
   });
   useEffect(() => {
     draftStateRef.current = {
@@ -693,6 +714,7 @@ export default function StripeBankSetup() {
       companyNameKanji, companyNameKana, companyNameLatin, companyTaxId, representativeTitle,
       repIsDirector, directorLastNameKanji, directorFirstNameKanji, directorLastNameKana, directorFirstNameKana,
       directorDobYear, directorDobMonth, directorDobDay,
+      coAddrSameAsRep, coAddr,
     };
     if (store?.id) {
       const t = setTimeout(() => saveDraft(store.id, draftStateRef.current), 2000);
@@ -707,7 +729,8 @@ export default function StripeBankSetup() {
       bankName, bankCode, branchCode, accountNumber, holderName,
       companyNameKanji, companyNameKana, companyNameLatin, companyTaxId, representativeTitle,
       repIsDirector, directorLastNameKanji, directorFirstNameKanji, directorLastNameKana, directorFirstNameKana,
-      directorDobYear, directorDobMonth, directorDobDay]);
+      directorDobYear, directorDobMonth, directorDobDay,
+      coAddrSameAsRep, coAddr]);
 
   // 30秒おきにも保存
   useEffect(() => {
@@ -751,6 +774,31 @@ export default function StripeBankSetup() {
       .slice(0, 7);
     setPostalCode(clean);
     if (clean.length === 7) lookupZip(clean);
+  };
+
+  const handleCompanyPostalCodeChange = async (v: string) => {
+    const clean = v
+      .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+      .replace(/\D/g, '')
+      .slice(0, 7);
+    setCo('postalCode', clean);
+    if (clean.length !== 7) return;
+    setCoZipLoading(true);
+    try {
+      const res = await fetch(`https://zipcloud.ibsnet.co.jp/api/search?zipcode=${clean}`);
+      const data = await res.json();
+      const addr = data?.results?.[0];
+      if (addr) {
+        const prefIdx = PREFECTURES_KANJI.indexOf(addr.address1);
+        setCoAddr(prev => ({
+          ...prev,
+          ...(prefIdx >= 0 ? { stateKanji: PREFECTURES_KANJI[prefIdx], stateKana: PREFECTURES_KANA[prefIdx] } : {}),
+          cityKanji: addr.address2 ?? '', townKanji: addr.address3 ?? '',
+          cityKana: addr.kana2 ?? '', townKana: addr.kana3 ?? '',
+        }));
+      }
+    } catch (_) {}
+    finally { setCoZipLoading(false); }
   };
 
   const handlePrefectureChange = (idx: string) => {
@@ -818,6 +866,13 @@ export default function StripeBankSetup() {
   if (!lastNameKana.trim()   || !firstNameKana.trim())  missingFields.push(`${personLabel}氏名（カタカナ）`);
   if (businessType === 'company' && !representativeTitle.trim()) missingFields.push('担当者の役職');
   if (businessType === 'company' && repIsDirector === null) missingFields.push('担当者が取締役かどうか（はい／いいえ）');
+  const needCoAddr = businessType === 'company' && !coAddrSameAsRep;
+  if (needCoAddr && coAddr.postalCode.length !== 7)                              missingFields.push('会社の住所：郵便番号（7桁）');
+  if (needCoAddr && !coAddr.stateKanji)                                           missingFields.push('会社の住所：都道府県');
+  if (needCoAddr && (!coAddr.cityKanji.trim() || !coAddr.townKanji.trim()))      missingFields.push('会社の住所：市区町村・町名（漢字）');
+  if (needCoAddr && !coAddr.line1Kanji.trim())                                    missingFields.push('会社の住所：番地・建物名（漢字）');
+  if (needCoAddr && (!coAddr.cityKana.trim() || !coAddr.townKana.trim()))        missingFields.push('会社の住所：市区町村・町名（カナ）');
+  if (needCoAddr && !coAddr.line1Kana.trim())                                     missingFields.push('会社の住所：番地・建物名（カナ）');
   const needDirector = businessType === 'company' && repIsDirector === false;
   if (needDirector && (!directorLastNameKanji.trim() || !directorFirstNameKanji.trim())) missingFields.push('取締役の氏名（漢字）');
   if (needDirector && (!directorLastNameKana.trim()  || !directorFirstNameKana.trim()))  missingFields.push('取締役の氏名（カタカナ）');
@@ -945,6 +1000,15 @@ export default function StripeBankSetup() {
               companyStructure:     companyStructure                     || undefined,
               representativeTitle:  representativeTitle.trim()           || '代表取締役',
               representativeIsDirector: repIsDirector !== false,
+              ...(!coAddrSameAsRep ? {
+                companyAddress: {
+                  postalCode: coAddr.postalCode,
+                  stateKanji: coAddr.stateKanji, cityKanji: coAddr.cityKanji.trim(), townKanji: coAddr.townKanji.trim(),
+                  line1Kanji: coAddr.line1Kanji.trim(),
+                  stateKana:  coAddr.stateKana,  cityKana:  coAddr.cityKana.trim(),  townKana:  coAddr.townKana.trim(),
+                  line1Kana:  coAddr.line1Kana.trim(),
+                },
+              } : {}),
               ...(repIsDirector === false ? {
                 director: {
                   lastNameKanji:  directorLastNameKanji.trim(),
@@ -1471,6 +1535,73 @@ export default function StripeBankSetup() {
                   return <p className="text-xs text-gray-400 mt-1">{d.length} / 13 桁</p>;
                 })()}
               </Field>
+            </FormSection>
+          )}
+
+          {/* ── ①-c 会社の住所（登記上の本店・法人のみ）── */}
+          {businessType === 'company' && (
+            <FormSection title="会社の住所（登記上の本店）" icon={<MapPin className="w-5 h-5 text-orange-500" />}>
+              <p className="text-xs text-gray-500 leading-relaxed">
+                登記簿に載っている会社の本店の住所です。国税庁の「法人番号公表サイト」で会社名を検索すると確認できます。決済会社が、この住所で事業をしているかを確認します。
+              </p>
+              <label className="flex items-start gap-2.5 rounded-xl border border-gray-200 bg-white px-3 py-2.5 cursor-pointer">
+                <input type="checkbox" checked={coAddrSameAsRep} onChange={e => setCoAddrSameAsRep(e.target.checked)}
+                  className="mt-0.5 w-4 h-4 accent-orange-500" />
+                <span className="text-sm text-gray-700 leading-snug">下で入力する、手続きをする方（担当者）の住所と同じ</span>
+              </label>
+              {!coAddrSameAsRep && (
+                <>
+                  <Field label="郵便番号（ハイフンなし7桁）" required>
+                    <div className="relative">
+                      <input type="text" value={coAddr.postalCode} onChange={e => handleCompanyPostalCodeChange(e.target.value)}
+                        placeholder="5690000" maxLength={7} inputMode="numeric" autoComplete="off" className={inputClass} />
+                      {coZipLoading && <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-orange-400 animate-spin" />}
+                    </div>
+                    <p className="text-xs text-gray-400 mt-1.5">7桁入力で住所を自動補完します</p>
+                  </Field>
+                  <Field label="都道府県" required>
+                    <select value={PREFECTURES_KANJI.indexOf(coAddr.stateKanji).toString()} autoComplete="off"
+                      onChange={e => {
+                        const i = parseInt(e.target.value);
+                        setCoAddr(prev => ({ ...prev, stateKanji: PREFECTURES_KANJI[i] ?? '', stateKana: PREFECTURES_KANA[i] ?? '' }));
+                      }} className={selectClass}>
+                      <option value="-1">選択してください</option>
+                      {PREFECTURES_KANJI.map((p, i) => <option key={p} value={i}>{p}</option>)}
+                    </select>
+                  </Field>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label="市区町村（漢字）" required>
+                      <input type="text" value={coAddr.cityKanji} onChange={e => setCo('cityKanji', e.target.value)}
+                        placeholder="高槻市" autoComplete="off" className={inputClass} />
+                    </Field>
+                    <Field label="町名（漢字）" required hint="番地は次の欄に入力してください">
+                      <input type="text" value={coAddr.townKanji} onChange={e => setCo('townKanji', e.target.value)}
+                        placeholder="城北町" autoComplete="off" className={inputClass} />
+                    </Field>
+                  </div>
+                  <Field label="番地・建物名（漢字）" required hint="例：1-2-3 ○○ビル1階">
+                    <input type="text" value={coAddr.line1Kanji} onChange={e => setCo('line1Kanji', e.target.value)}
+                      placeholder="1-2-3 ○○ビル1階" autoComplete="off" className={inputClass} />
+                  </Field>
+                  <div className="pt-2 border-t border-gray-100">
+                    <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">会社の住所（カタカナ）</p>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="市区町村（カナ）" required>
+                        <input type="text" value={coAddr.cityKana} onChange={e => setCo('cityKana', e.target.value)}
+                          placeholder="タカツキシ" autoComplete="off" className={inputClass} />
+                      </Field>
+                      <Field label="町名（カナ）" required hint="全角カタカナ・番地は次の欄へ">
+                        <input type="text" value={coAddr.townKana} onChange={e => setCo('townKana', e.target.value)}
+                          placeholder="ジョウホクチョウ" autoComplete="off" className={inputClass} />
+                      </Field>
+                    </div>
+                    <Field label="番地・建物名（カナ）" required hint="例：1-2-3 ○○ビル1カイ">
+                      <input type="text" value={coAddr.line1Kana} onChange={e => setCo('line1Kana', e.target.value)}
+                        placeholder="1-2-3 ○○ビル1カイ" autoComplete="off" className={inputClass} />
+                    </Field>
+                  </div>
+                </>
+              )}
             </FormSection>
           )}
 

@@ -2996,8 +2996,10 @@ router.put("/stores/:storeId/connect/kyc", requireAuth, requireStoreOwner, async
     // フォームの businessType と Stripe 側が食い違う場合は Stripe 側を優先する
     // （フォームが company でも Stripe が individual なら individual パスで送る）
     let resolvedBusinessType: "individual" | "company" = businessType;
+    let existingCompanyAddr: { postal_code?: string | null; town?: string | null; line1?: string | null } | null = null;
     try {
       const existingAcc = await stripe.accounts.retrieve(store.stripeAccountId);
+      existingCompanyAddr = (existingAcc as any).company?.address_kanji ?? null;
       const stripeActualType = existingAcc.business_type as "individual" | "company" | undefined;
       if (stripeActualType && stripeActualType !== businessType) {
         console.warn(
@@ -3088,7 +3090,20 @@ router.put("/stores/:storeId/connect/kyc", requireAuth, requireStoreOwner, async
       if (companyNameKana?.trim())  companyObj.name_kana  = toFullWidthKana(companyNameKana.trim());
       // ⚠️ JP では company.structure を送ると全値エラーになるため送らない
       // JP では address（標準）は送らず address_kana / address_kanji のみ
-      if (representative.postalCode?.trim()) {
+      // ★ 口座登録で会社の住所（登記上の本店）を担当者とは別に入れた店は、 この画面の担当者の住所で上書きしない。
+      //   従来どおり会社の住所＝担当者の住所で登録している店だけ、 担当者の住所に合わせて更新する。
+      let companyHasOwnAddress = false;
+      if (existingCompanyAddr?.postal_code) {
+        try {
+          const ppl = await stripe.accounts.listPersons(store.stripeAccountId, { limit: 20 });
+          const repAddr = (ppl.data.find((p) => p.relationship?.representative) as any)?.address_kanji;
+          companyHasOwnAddress = !!repAddr?.postal_code && (
+            repAddr.postal_code !== existingCompanyAddr.postal_code ||
+            (repAddr.town ?? '') !== (existingCompanyAddr.town ?? '') ||
+            (repAddr.line1 ?? '') !== (existingCompanyAddr.line1 ?? ''));
+        } catch (_) { /* 取れなければ従来どおり */ }
+      }
+      if (representative.postalCode?.trim() && !companyHasOwnAddress) {
         companyObj.address_kanji = addressKanji;
         companyObj.address_kana  = addressKana;
       }
@@ -3471,6 +3486,12 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
         firstNameKana?: string;  lastNameKana?: string;
         dobYear?: number | string; dobMonth?: number | string; dobDay?: number | string;
       };
+      // 法人の会社の住所（登記上の本店）。 未指定=従来どおり担当者の住所を会社の住所として送る
+      companyAddress?: {
+        postalCode?: string;
+        stateKanji?: string; cityKanji?: string; townKanji?: string; line1Kanji?: string;
+        stateKana?: string;  cityKana?: string;  townKana?: string;  line1Kana?: string;
+      };
     };
     docFrontBase64: string; docFrontMime: string;
     docBackBase64?: string; docBackMime?: string;
@@ -3490,6 +3511,15 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       && [d.dobYear, d.dobMonth, d.dobDay].every((v) => Number(v) > 0);
     if (!ok) {
       res.status(400).json({ error: "bad_request", message: "取締役（社長など）の氏名（漢字・カナ）と生年月日を入力してください" });
+      return;
+    }
+  }
+  if (businessType === "company" && kycData.companyAddress) {
+    const a = kycData.companyAddress;
+    const zip = String(a.postalCode ?? "").replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0)).replace(/\D/g, "");
+    const ok = zip.length === 7 && [a.stateKanji, a.cityKanji, a.townKanji, a.line1Kanji, a.cityKana, a.townKana, a.line1Kana].every((v) => typeof v === "string" && v.trim());
+    if (!ok) {
+      res.status(400).json({ error: "bad_request", message: "会社の住所（郵便番号・住所の漢字とカナ）を入力してください" });
       return;
     }
   }
@@ -3752,7 +3782,18 @@ router.post("/stores/:storeId/connect/bank-setup", requireAuth, requireStoreOwne
       };
       // company.name（ラテン文字社名）は Stripe JP で必須。未入力時はテストモードのみフォールバック
       companyObj.name = k.companyNameLatin?.trim() || (isTestKeyStep4 ? "Kabushiki Gaisha Test" : undefined);
-      if (k.postalCode?.trim()) {
+      // 会社の住所は登記上の本店（Stripe は「この住所で事業をしているか」を確認する）。
+      //   画面で会社の住所が入っていなければ、従来どおり担当者の住所を使う（古い画面・「担当者と同じ」）。
+      if (k.companyAddress?.postalCode?.trim()) {
+        const ca = k.companyAddress;
+        const coAddr = buildJpAddress({
+          postalCode: ca.postalCode ?? '',
+          stateKanji: ca.stateKanji ?? '', cityKanji: ca.cityKanji ?? '', townKanji: ca.townKanji ?? '', line1Kanji: ca.line1Kanji ?? '',
+          stateKana:  ca.stateKana  ?? '', cityKana:  ca.cityKana  ?? '', townKana:  ca.townKana  ?? '', line1Kana:  ca.line1Kana  ?? '',
+        });
+        companyObj.address_kanji = coAddr.address_kanji;
+        companyObj.address_kana  = coAddr.address_kana;
+      } else if (k.postalCode?.trim()) {
         companyObj.address_kanji = jpAddr.address_kanji;
         companyObj.address_kana  = jpAddr.address_kana;
       }
